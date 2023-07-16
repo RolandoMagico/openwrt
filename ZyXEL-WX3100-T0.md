@@ -46,3 +46,10 @@ The oem flash images contain a header. Until now, the following data are known:
 
 ## Useful links
 [ramips: mt7621: Add support for ZyXEL NR7101](https://git.freifunk-franken.de/mirror/openwrt/commit/2449a632084b29632605e5a79ce5d73028eb15dd): Maybe it contains useful information how to use the bootloader, even if it's a different device
+
+[Multiple Critical Vulnerabilities in multiple Zyxel devices](https://sec-consult.com/vulnerability-lab/advisory/multiple-critical-vulnerabilities-in-multiple-zyxel-devices/): Vulnerabilities wich may also apply to this device
+
+[Unauthenticated remote root buffer overflow in Zyxel devices](https://youtu.be/hbF3LEljxSA): A YouTube video showing how to get shell access to the device using Metasploit framework
+
+
+
