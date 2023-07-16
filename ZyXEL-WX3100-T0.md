@@ -7,7 +7,7 @@
 
 ## OpenWrt Support
 The CPU is currently not supported by OpenWrt.
-- Similar device (same CPU): [ZyXEL VMG8623-T50B](Zyxel https://openwrt.org/toh/zyxel/vmg8623-t50b)
+- Similar device (same CPU): [ZyXEL VMG8623-T50B](https://openwrt.org/toh/zyxel/vmg8623-t50b)
 
 ## UART Interface
 The pins for UART are populated by default, pin assignment:
