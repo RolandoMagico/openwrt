@@ -107,5 +107,4 @@ Code: 00003021  3c09afbf  3c0a3c1c <8ca20000> 00512024  10930022  00000000  1089
 
 [Unauthenticated remote root buffer overflow in Zyxel devices](https://youtu.be/hbF3LEljxSA): A YouTube video showing how to get shell access to the device using Metasploit framework
 
-
-
+[Multiple vulnerabilities in Zyxel zysh](https://github.com/hnsecurity/vulns/blob/main/HNS-2022-02-zyxel-zysh.txt)
