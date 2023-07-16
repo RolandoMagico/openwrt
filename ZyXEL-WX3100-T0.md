@@ -1,8 +1,9 @@
 # ZyXEL-WX3100-T0
 ## Hardware Specs
-CPU: ECONET EN7516GT
-
-Wifi: MEDIATEK MT7975DN and MEDIATEK MT7905DEN
+- CPU: ECONET EN7516GT
+- RAM: 256MB
+- FLAHS: 128MB W25N01G
+- Wifi: MEDIATEK MT7975DN and MEDIATEK MT7905DEN
 
 ## OpenWrt Support
 The CPU is currently not supported by OpenWrt.
@@ -10,16 +11,11 @@ The CPU is currently not supported by OpenWrt.
 
 ## UART Interface
 The pins for UART are populated by default, pin assignment:
-
-o GND
-
-x not populated
-
-o RXD
-
-o TXD
-
-o VCC
+- GND
+- not populated
+- RXD
+- TXD
+- VCC
 
 ## OEM flash image
 The oem flash image can be downloaded via bootloader using the command
