@@ -108,3 +108,14 @@ Code: 00003021  3c09afbf  3c0a3c1c <8ca20000> 00512024  10930022  00000000  1089
 [Unauthenticated remote root buffer overflow in Zyxel devices](https://youtu.be/hbF3LEljxSA): A YouTube video showing how to get shell access to the device using Metasploit framework
 
 [Multiple vulnerabilities in Zyxel zysh](https://github.com/hnsecurity/vulns/blob/main/HNS-2022-02-zyxel-zysh.txt)
+
+[OpenWrt forum thread to a (probably) similar device](https://forum.openwrt.org/t/openwrt-support-for-zyxel-pmg5617ga-first-gpon-support/144231)
+
+[Information about Zyxel bootloader, not sure if it also applies to WX3100](http://www.ixo.de/info/zyxel_uclinux/)
+
+https://github.com/chear/SWNote/blob/master/ZyXEL.md
+
+https://github.com/cjdelisle/openwrt/tree/feature-tc3262-support
+
+
+
