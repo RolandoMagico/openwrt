@@ -60,13 +60,56 @@
 
 		partition@0 {
 			label = "boot";
-			reg = <0x0 0x30000>;
+			reg = <0x0 0x00020000>;
+			read-only;
+		};
+
+		partition@20000 {
+			label = "MAC";
+			reg = <0x00020000 0x00010000>;
 			read-only;
 		};
 
 		partition@30000 {
-			label = "firmware";
-			reg = <0x30000 0x7C0000>;
+			label = "config";
+			reg = <0x00030000 0x00010000>;
+			read-only;
 		};
+
+		partition@40000 {
+			label = "kernel";
+			reg = <0x00040000 0x00260000>;
+			read-only;
+		};
+
+		partition@2A0000 {
+			label = "rootfs";
+			reg = <0x002A0000 0x00A60000>;
+			read-only;
+		};
+
+//		partition@40000 {
+//			label = "Linux";
+//			reg = <0x00040000 0x00CC0000>;
+//			read-only;
+//		};
+
+		partition@D00000 {
+			label = "rwdata";
+			reg = <0x00D00000 0x00100000>;
+			read-only;
+		};
+
+		partition@E00000 {
+			label = "mydlink";
+			reg = <0x00E00000 0x00200000>;
+			read-only;
+		};
+
+//		partition@0 {
+//			label = "ALL";
+//			reg = <0x0 0x01000000>;
+//			read-only;
+//		};
 	};
 };
