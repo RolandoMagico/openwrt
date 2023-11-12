@@ -1,0 +1,73 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+/dts-v1/;
+#include "mt7622-dlink-eagle-pro-ai-ax3200-a1.dtsi"
+
+/ {
+	model = "D-Link EAGLE PRO AI R32 A1";
+	compatible = "dlink,eagle-pro-ai-r32-a1", "mediatek,mt7622";
+
+	aliases {
+		led-boot = &power_orange;
+		led-failsafe = &power_orange;
+		led-running = &power_white;
+		led-upgrade = &power_orange;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		power_orange: power_orange {
+			label = "orange:power";
+			gpios = <&pio 20 GPIO_ACTIVE_HIGH>;
+		};
+
+		power_white: power_white {
+			label = "white:power";
+			gpios = <&pio 85 GPIO_ACTIVE_LOW>;
+		};
+
+		internet_orange: internet_orange {
+			label = "orange:internet";
+			gpios = <&pio 5 GPIO_ACTIVE_HIGH>;
+		};
+
+		internet_white: internet_white {
+			label = "white:internet";
+			gpios = <&pio 17 GPIO_ACTIVE_LOW>;
+		};
+	};
+};
+
+&switch {
+	ports {
+		port@0 {
+			reg = <0>;
+			label = "lan4";
+		};
+
+		port@1 {
+			reg = <1>;
+			label = "lan3";
+		};
+
+		port@2 {
+			reg = <2>;
+			label = "lan2";
+		};
+
+		port@3 {
+			reg = <3>;
+			label = "lan1";
+		};
+	};
+};
+
+&odm_partition {
+	macaddr_odm: macaddr@81 {
+		compatible = "mac-base";
+		reg = <0x81 0x6>;
+		#nvmem-cell-cells = <1>;
+	};
+};
+
