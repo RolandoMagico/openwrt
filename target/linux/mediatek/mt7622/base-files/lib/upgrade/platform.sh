@@ -34,6 +34,7 @@ platform_do_upgrade() {
 		fi
 		;;
 	dlink,eagle-pro-ai-m32-a1|\
+	dlink,eagle-pro-ai-r32-a1|\
 	elecom,wrc-x3200gst3|\
 	mediatek,mt7622-rfb1-ubi|\
 	netgear,wax206|\
@@ -71,7 +72,8 @@ platform_check_image() {
 	buffalo,wsr-2533dhp2)
 		buffalo_check_image "$board" "$magic" "$1" || return 1
 		;;
-  	dlink,eagle-pro-ai-m32-a1|\
+	dlink,eagle-pro-ai-m32-a1|\
+	dlink,eagle-pro-ai-r32-a1|\
 	elecom,wrc-x3200gst3|\
 	mediatek,mt7622-rfb1-ubi|\
 	netgear,wax206|\
