@@ -8,6 +8,27 @@ ramips_setup_interfaces()
 	local board="$1"
 
 	case $board in
+	alfa-network,ax1800rm|\
+	ampedwireless,ally-r1900k|\
+	asus,rt-ax53u|\
+	gehua,ghl-r-001|\
+	h3c,tx1800-plus|\
+	h3c,tx1801-plus|\
+	h3c,tx1806|\
+	haier,har-20s2u1|\
+	hiwifi,hc5962|\
+	mercusys,mr70x-v1|\
+	netgear,wax202|\
+	sim,simax1800t|\
+	xiaomi,mi-router-3-pro|\
+	xiaomi,mi-router-ac2100|\
+	xiaomi,mi-router-cr6606|\
+	xiaomi,mi-router-cr6608|\
+	xiaomi,mi-router-cr6609|\
+	xiaomi,redmi-router-ac2100|\
+	zyxel,wsm20)
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+		;;
 	arcadyan,we420223-99)
 		ucidef_set_interface_lan "swp0 swp1"
 		;;
@@ -16,6 +37,7 @@ ramips_setup_interfaces()
 	asus,rp-ac87|\
 	dlink,dap-1620-b1|\
 	dlink,dap-x1860-a1|\
+	dlink,dra-1360-a1|\
 	edimax,re23s|\
 	linksys,re7000|\
 	mikrotik,ltap-2hnd|\
@@ -34,28 +56,10 @@ ramips_setup_interfaces()
 	ubnt,unifi-flexhd|\
 	ubnt,unifi-nanohd|\
 	yuncore,fap690|\
+	wavlink,wl-wn573hx1|\
 	zyxel,nwa50ax|\
 	zyxel,nwa55axe)
 		ucidef_set_interface_lan "lan"
-		;;
-	ampedwireless,ally-r1900k|\
-	asus,rt-ax53u|\
-	gehua,ghl-r-001|\
-	h3c,tx1800-plus|\
-	h3c,tx1801-plus|\
-	h3c,tx1806|\
-	haier,har-20s2u1|\
-	hiwifi,hc5962|\
-	netgear,wax202|\
-	sim,simax1800t|\
-	xiaomi,mi-router-3-pro|\
-	xiaomi,mi-router-ac2100|\
-	xiaomi,mi-router-cr6606|\
-	xiaomi,mi-router-cr6608|\
-	xiaomi,mi-router-cr6609|\
-	xiaomi,redmi-router-ac2100|\
-	zyxel,wsm20)
-		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
 		;;
 	asiarf,ap7621-001|\
 	humax,e10|\
@@ -67,6 +71,7 @@ ramips_setup_interfaces()
 	beeline,smartbox-flash|\
 	beeline,smartbox-giga|\
 	glinet,gl-mt1300|\
+	iodata,wn-deax1800gr|\
 	iptime,a3002mesh|\
 	jcg,q20|\
 	lenovo,newifi-d1|\
@@ -90,8 +95,11 @@ ramips_setup_interfaces()
 		;;
 	cudy,m1800|\
 	yuncore,ax820|\
-	zyxel,nt7101)
+	zyxel,nr7101)
 		ucidef_set_interfaces_lan_wan "lan" "wan"
+		;;
+	dlink,covr-x1860-a1)
+		ucidef_set_interfaces_lan_wan "ethernet" "internet"
 		;;
 	gnubee,gb-pc1)
 		ucidef_set_interface_lan "ethblack ethblue"
@@ -143,11 +151,17 @@ ramips_setup_interfaces()
 	ubnt,usw-flex)
 		ucidef_set_interface_lan "lan1 lan2 lan3 lan4 lan5"
 		;;
+	zyxel,lte5398-m904)
+		ucidef_set_interface_lan "lan1 lan2"
+		ucidef_set_interface "wan" device "/dev/cdc-wdm0" protocol "qmi"
+		;;
 	zyxel,wap6805)
 		ucidef_set_interface_lan "lan1 lan2 lan3 lan4"
 		ucidef_set_interface "qtn" ifname "eth1" protocol "static" ipaddr "1.1.1.1" netmask "255.255.255.0"
 		;;
-	comfast,cf-e390ax)
+	comfast,cf-e390ax|\
+	comfast,cf-ew72-v2|\
+	meig,slt866)
 		ucidef_set_interfaces_lan_wan "lan" "wan"
 		;;
 	*)
@@ -164,6 +178,16 @@ ramips_setup_macs()
 	local label_mac=""
 
 	case $board in
+	alfa-network,ax1800rm|\
+	jcg,y2|\
+	wavlink,wl-wn531a6|\
+	wavlink,wl-wn533a8|\
+	winstars,ws-wn583a6|\
+	zbtlink,zbt-we1326|\
+	zbtlink,zbt-wg3526-16m|\
+	zbtlink,zbt-wg3526-32m)
+		label_mac=$(mtd_get_mac_binary factory 0x4)
+		;;
 	ampedwireless,ally-00x19k)
 		lan_mac=$(mtd_get_mac_ascii hwconfig HW.LAN.MAC.Address)
 		label_mac=$lan_mac
@@ -197,6 +221,11 @@ ramips_setup_macs()
 		lan_mac=$(cat /sys/class/net/eth0/address)
 		label_mac=$lan_mac
 		wan_mac=$(macaddr_add "$lan_mac" 1)
+		;;
+	dlink,covr-x1860-a1)
+		label_mac=$(mtd_get_mac_ascii config2 factory_mac)
+		wan_mac=$(macaddr_add "$label_mac" 3)
+		lan_mac=$label_mac
 		;;
 	dlink,dir-860l-b1)
 		lan_mac=$(mtd_get_mac_ascii factory lanmac)
@@ -233,15 +262,6 @@ ramips_setup_macs()
 	iptime,t5004)
 		lan_mac=$(mtd_get_mac_ascii config ethaddr)
 		wan_mac=$(macaddr_add "$lan_mac" 1)
-		;;
-	jcg,y2|\
-	wavlink,wl-wn531a6|\
-	wavlink,wl-wn533a8|\
-	winstars,ws-wn583a6|\
-	zbtlink,zbt-we1326|\
-	zbtlink,zbt-wg3526-16m|\
-	zbtlink,zbt-wg3526-32m)
-		label_mac=$(mtd_get_mac_binary factory 0x4)
 		;;
 	linksys,e5600|\
 	linksys,ea6350-v4|\

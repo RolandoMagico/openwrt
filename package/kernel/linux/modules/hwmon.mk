@@ -77,6 +77,23 @@ endef
 $(eval $(call KernelPackage,hwmon-adt7475))
 
 
+define KernelPackage/hwmon-coretemp
+  TITLE:=Intel Core/Core2/Atom temperature sensor
+  KCONFIG:=CONFIG_SENSORS_CORETEMP
+  FILES:=$(LINUX_DIR)/drivers/hwmon/coretemp.ko
+  AUTOLOAD:=$(call AutoProbe,coretemp)
+  $(call AddDepends/hwmon,)
+endef
+
+define KernelPackage/hwmon-coretemp/description
+  Kernel module for Intel Core/Core2/Atom temperature monitoring support.
+  Most of the family 6 CPUs are supported.
+  Check Documentation/hwmon/coretemp.rst for details.
+endef
+
+$(eval $(call KernelPackage,hwmon-coretemp))
+
+
 define KernelPackage/hwmon-dme1737
   TITLE:=SMSC DME1737 and compatible monitoring support
   KCONFIG:=CONFIG_SENSORS_DME1737
@@ -417,9 +434,11 @@ $(eval $(call KernelPackage,hwmon-mcp3021))
 define KernelPackage/hwmon-nct6775
   TITLE:=NCT6106D/6775F/6776F/6779D/6791D/6792D/6793D and compatibles monitoring support
   KCONFIG:=CONFIG_SENSORS_NCT6775
-  FILES:=$(LINUX_DIR)/drivers/hwmon/nct6775.ko
+  FILES:= \
+	$(LINUX_DIR)/drivers/hwmon/nct6775.ko \
+	$(LINUX_DIR)/drivers/hwmon/nct6775-core.ko@ge5.19
   AUTOLOAD:=$(call AutoProbe,nct6775)
-  $(call AddDepends/hwmon,@PCI_SUPPORT @TARGET_x86 +kmod-hwmon-vid)
+  $(call AddDepends/hwmon,@PCI_SUPPORT @TARGET_x86 +kmod-hwmon-vid +LINUX_6_1:kmod-regmap-core)
 endef
 
 define KernelPackage/hwmon-nct6775/description
