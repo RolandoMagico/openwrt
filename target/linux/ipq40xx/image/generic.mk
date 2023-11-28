@@ -710,8 +710,8 @@ define Device/linksys_mr6350
 	DEVICE_VENDOR := Linksys
 	DEVICE_MODEL := MR6350
 	SOC := qcom-ipq4019
-	KERNEL_SIZE := 3072k
-	IMAGE_SIZE := 87040k
+	KERNEL_SIZE := 5120k
+	IMAGE_SIZE := 84992k
 	BLOCKSIZE := 128k
 	PAGESIZE := 2048
 	UBINIZE_OPTS := -E 5    # EOD marks to "hide" factory sig at EOF
