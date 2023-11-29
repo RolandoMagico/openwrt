@@ -114,3 +114,21 @@
 	status = "okay";
 	qcom,ath10k-calibration-variant = "linksys-mr6350-fcc";
 };
+
+&gmac {
+	status = "okay";
+};
+
+&switch {
+	status = "okay";
+};
+
+&swport4 {
+	status = "okay";
+	label = "eth1";
+};
+
+&swport5 {
+	status = "okay";
+	label = "eth2";
+};
