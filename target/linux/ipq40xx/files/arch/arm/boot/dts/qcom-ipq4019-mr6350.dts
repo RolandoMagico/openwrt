@@ -117,20 +117,20 @@
 
 &swport1 {
 	label = "wan";
-}
+};
 
 &swport2 {
 	label = "lan1";
-}
+};
 
 &swport3 {
 	label = "lan2";
-}
+};
 
 &swport4 {
 	label = "lan3";
-}
+};
 
 &swport5 {
 	label = "lan4";
-}
+};
