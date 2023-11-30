@@ -707,6 +707,7 @@ TARGET_DEVICES += linksys_ea8300
 
 define Device/linksys_mr6350
 	$(call Device/FitzImage)
+	$(call Device/kernel-size-6350-8300)
 	DEVICE_VENDOR := Linksys
 	DEVICE_MODEL := MR6350
 	SOC := qcom-ipq4019
