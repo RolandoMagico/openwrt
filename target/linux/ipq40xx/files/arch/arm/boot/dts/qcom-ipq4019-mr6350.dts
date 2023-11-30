@@ -115,20 +115,22 @@
 	qcom,ath10k-calibration-variant = "linksys-mr6350-fcc";
 };
 
-&gmac {
-	status = "okay";
-};
+&swport1 {
+	label = "wan";
+}
 
-&switch {
-	status = "okay";
-};
+&swport2 {
+	label = "lan1";
+}
+
+&swport3 {
+	label = "lan2";
+}
 
 &swport4 {
-	status = "okay";
-	label = "eth1";
-};
+	label = "lan3";
+}
 
 &swport5 {
-	status = "okay";
-	label = "eth2";
-};
+	label = "lan4";
+}
