@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
 
 #include "qcom-ipq4019-xx8300.dtsi"
+#include <dt-bindings/leds/common.h>
 
 / {
 	model = "Linksys MR6350";
@@ -35,30 +36,35 @@
 	leds {
 		compatible = "gpio-leds";
 		
-		led_blue: blue {
-			label = "blue:panel";
+		led_blue: led-blue {
+			label = "blue:status";             // Can be removed as soon as https://github.com/openwrt/openwrt/pull/13837 is merged
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_STATUS;
 			gpios = <&tlmm 46 GPIO_ACTIVE_LOW>;
 		};
 
-		led_red: red {
-			label = "red:panel";
+		led_red: led-red {
+			label = "red:status";              // Can be removed as soon as https://github.com/openwrt/openwrt/pull/13837 is merged
+			color = <LED_COLOR_ID_RED>;
+			function = LED_FUNCTION_STATUS;
 			gpios = <&tlmm 47 GPIO_ACTIVE_HIGH>;
 			panic-indicator;
 		};
 
-		led_green: green {
-			label = "green:panel";
+		led_green: led-green {
+			label = "green:status";            // Can be removed as soon as https://github.com/openwrt/openwrt/pull/13837 is merged
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
 			gpios = <&tlmm 49 GPIO_ACTIVE_HIGH>;
 		};
 
-
 		// On back panel, above USB socket
 
-		led_usb: usb {
-			label = "green:usb";
+		led-usb {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_USB;
 			gpios = <&tlmm 61 GPIO_ACTIVE_LOW>;
-			trigger-sources = <&usb3_port1>, <&usb3_port2>,
-					  <&usb2_port1>;
+			trigger-sources = <&usb3_port1>, <&usb3_port2>, <&usb2_port1>;
 			linux,default-trigger = "usbport";
 		};
 	};
@@ -66,13 +72,13 @@
 	keys {
 		compatible = "gpio-keys";
 
-		reset {
+		button-reset {
 			label = "reset";
 			linux,code = <KEY_RESTART>;
 			gpios = <&tlmm 50 GPIO_ACTIVE_LOW>;
 		};
 
-		wps {
+		button-wps {
 			label = "wps";
 			linux,code = <KEY_WPS_BUTTON>;
 			gpios = <&tlmm 18 GPIO_ACTIVE_LOW>;
