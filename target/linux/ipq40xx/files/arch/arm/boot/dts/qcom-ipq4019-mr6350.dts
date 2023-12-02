@@ -3,7 +3,7 @@
 #include "qcom-ipq4019-xx8300.dtsi"
 
 / {
-	model = "Linksys MR6350 (WiFi AP router based on Qualcomm AP DK07.1-c1)";
+	model = "Linksys MR6350";
 	compatible = "linksys,mr6350", "qcom,ipq4019";
 
 /*
