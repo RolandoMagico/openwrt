@@ -7,23 +7,6 @@
 	model = "Linksys MR6350";
 	compatible = "linksys,mr6350", "qcom,ipq4019";
 
-/*
-	reserved-memory {
-		#address-cells = <1>;
-		#size-cells = <1>;
-		ranges;
-
-		ramoops@87500000 {
-			compatible = "ramoops";
-			reg = <0x87500000 0x600000>;
-			console-size = <0x200000>;
-			pmsg-size    = <0x200000>;
-			record-size  = <0x200000>;
-			ecc-size = <16>;
-		};
-	};
-*/
-	
 	aliases {
 		led-boot = &led_blue;
 		led-failsafe = &led_red;
@@ -56,16 +39,6 @@
 			color = <LED_COLOR_ID_GREEN>;
 			function = LED_FUNCTION_STATUS;
 			gpios = <&tlmm 49 GPIO_ACTIVE_HIGH>;
-		};
-
-		// On back panel, above USB socket
-
-		led-usb {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_USB;
-			gpios = <&tlmm 61 GPIO_ACTIVE_LOW>;
-			trigger-sources = <&usb3_port1>, <&usb3_port2>, <&usb2_port1>;
-			linux,default-trigger = "usbport";
 		};
 	};
 
