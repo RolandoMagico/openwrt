@@ -92,8 +92,8 @@
 		reg = <0>;
 		phy-mode = "2500base-x";
 
-		nvmem-cell-names = "mac-address";
-		nvmem-cells = <&macaddr_bdinfo_de00 0>;
+//		nvmem-cell-names = "mac-address";
+//		nvmem-cells = <&macaddr_bdinfo_de00 0>;
 
 		fixed-link {
 			speed = <2500>;
@@ -124,32 +124,32 @@
 			reg = <0>;
 			label = "lan0";
 
-			nvmem-cell-names = "mac-address";
-			nvmem-cells = <&macaddr_bdinfo_de00 1>;
+//			nvmem-cell-names = "mac-address";
+//			nvmem-cells = <&macaddr_bdinfo_de00 1>;
 		};
 
 		lan1: port@1 {
 			reg = <1>;
 			label = "lan1";
 
-			nvmem-cell-names = "mac-address";
-			nvmem-cells = <&macaddr_bdinfo_de00 0>;
+//			nvmem-cell-names = "mac-address";
+//			nvmem-cells = <&macaddr_bdinfo_de00 0>;
 		};
 
 		port@2 {
 			reg = <2>;
 			label = "lan2";
 
-			nvmem-cell-names = "mac-address";
-			nvmem-cells = <&macaddr_bdinfo_de00 0>;
+//			nvmem-cell-names = "mac-address";
+//			nvmem-cells = <&macaddr_bdinfo_de00 0>;
 		};
 
 		port@3 {
 			reg = <3>;
 			label = "lan3";
 
-			nvmem-cell-names = "mac-address";
-			nvmem-cells = <&macaddr_bdinfo_de00 0>;
+//			nvmem-cell-names = "mac-address";
+//			nvmem-cells = <&macaddr_bdinfo_de00 0>;
 		};
 
 		port@6 {
@@ -170,51 +170,41 @@
 &spi0 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&spi0_flash_pins>;
-	status = "disabled";
-};
-
-&spi2 {
-	pinctrl-names = "default";
-	pinctrl-0 = <&spi2_flash_pins>;
 	status = "okay";
 
-	flash@0 {
+	spi_nand@0 {
+		compatible = "spi-nand";
 		#address-cells = <1>;
 		#size-cells = <1>;
-
-		compatible = "jedec,spi-nor";
 		reg = <0>;
 
-		spi-max-frequency = <25000000>;
+		spi-max-frequency = <52000000>;
 		spi-tx-bus-width = <4>;
 		spi-rx-bus-width = <4>;
+
+		mediatek,nmbm;
+		mediatek,bmt-max-ratio = <1>;
+		mediatek,bmt-max-reserved-blocks = <64>;
 
 		partitions {
 			compatible = "fixed-partitions";
 			#address-cells = <1>;
 			#size-cells = <1>;
 
-			partition@00000 {
+			partition@0 {
 				label = "BL2";
-				reg = <0x00000 0x40000>;
+				reg = <0x00 0x100000>;
 				read-only;
 			};
 
-			partition@40000 {
+			partition@100000 {
 				label = "u-boot-env";
-				reg = <0x40000 0x10000>;
-				read-only;
+				reg = <0x100000 0x80000>;
 			};
 
-			factory: partition@50000 {
+			factory: partition@180000 {
 				label = "Factory";
-				reg = <0x50000 0x10000>;
-				read-only;
-			};
-
-			bdinfo: partition@60000 {
-				label = "bdinfo";
-				reg = <0x60000 0x10000>;
+				reg = <0x180000 0x200000>;
 				read-only;
 
 				nvmem-layout {
@@ -222,24 +212,49 @@
 					#address-cells = <1>;
 					#size-cells = <1>;
 
-					macaddr_bdinfo_de00: macaddr@de00 {
-						compatible = "mac-base";
-						reg = <0xde00 0x6>;
-						#nvmem-cell-cells = <1>;
+					macaddr_art_0: macaddr@0 {
+						reg = <0x0 0x6>;
 					};
 				};
 			};
 
-			partition@70000 {
+			partition@380000 {
 				label = "FIP";
-				reg = <0x70000 0x80000>;
+				reg = <0x380000 0x200000>;
 				read-only;
 			};
 
-			partition@f0000 {
-				compatible = "denx,fit";
-				label = "firmware";
-				reg = <0xf0000 0xf10000>;
+			partition@580000 {
+				label = "ubi";
+				reg = <0x580000 0x3200000>;
+			};
+
+			partition@3780000 {
+				label = "ubi1";
+				reg = <0x3780000 0x3200000>;
+			};
+
+			partition@6980000 {
+				label = "Odm";
+				reg = <0x6980000 0x40000>;
+				read-only;
+			};
+
+			partition@69C0000 {
+				label = "Config1";
+				reg = <0x69C0000 0x80000>;
+				read-only;
+			};
+
+			partition@6A40000 {
+				label = "Config2";
+				reg = <0x6A40000 0x80000>;
+				read-only;
+			};
+
+			partition@6AC0000 {
+				label = "Storage";
+				reg = <0x6AC0000 0xA00000>;
 			};
 		};
 	};
@@ -251,24 +266,17 @@
 			function = "spi";
 			groups = "spi0", "spi0_wp_hold";
 		};
-	};
-
-	spi2_flash_pins: spi2-pins {
-		mux {
-			function = "spi";
-			groups = "spi2", "spi2_wp_hold";
-		};
 
 		conf-pu {
-			pins = "SPI2_CS", "SPI2_HOLD", "SPI2_WP";
-			drive-strength = <8>;
-			bias-pull-up = <103>;
+			pins = "SPI0_CS", "SPI0_HOLD", "SPI0_WP";
+			drive-strength = <MTK_DRIVE_8mA>;
+			bias-pull-down = <MTK_PUPD_SET_R1R0_00>;
 		};
 
 		conf-pd {
-			pins = "SPI2_CLK", "SPI2_MOSI", "SPI2_MISO";
-			drive-strength = <8>;
-			bias-pull-down = <103>;
+			pins = "SPI0_CLK", "SPI0_MOSI", "SPI0_MISO";
+			drive-strength = <MTK_DRIVE_8mA>;
+			bias-pull-down = <MTK_PUPD_SET_R1R0_00>;
 		};
 	};
 };
