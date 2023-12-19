@@ -91,7 +91,7 @@
 		reg = <0>;
 		phy-mode = "2500base-x";
 
-		nvmem-cells = <&macaddr_wan 1>;
+		nvmem-cells = <&macaddr_odm 1>;
 		nvmem-cell-names = "mac-address";
 
 		fixed-link {
@@ -108,7 +108,7 @@
 		phy-handle = <&int_gbe_phy>;
 		label = "internet";
 
-		nvmem-cells = <&macaddr_wan 0>;
+		nvmem-cells = <&macaddr_odm 0>;
 		nvmem-cell-names = "mac-address";
 	};
 };
@@ -228,7 +228,7 @@
 					#address-cells = <1>;
 					#size-cells = <1>;
 
-					macaddr_wan: macaddr@81 {
+					macaddr_odm: macaddr@81 {
 						compatible = "mac-base";
 						reg = <0x81 0x6>;
 						#nvmem-cell-cells = <1>;
@@ -280,5 +280,7 @@
 
 &wifi {
 	status = "okay";
+	nvmem-cells = <&macaddr_odm 2>;
+	nvmem-cell-names = "mac-address";
 	mediatek,mtd-eeprom = <&factory 0x0>;
 };
