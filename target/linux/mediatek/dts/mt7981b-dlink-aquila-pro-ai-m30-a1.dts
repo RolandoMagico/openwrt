@@ -252,6 +252,7 @@
 			partition@6AC0000 {
 				label = "Storage";
 				reg = <0x6AC0000 0xA00000>;
+				read-only;
 			};
 		};
 	};
