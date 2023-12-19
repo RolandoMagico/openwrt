@@ -498,7 +498,6 @@ define Device/dlink_aquila-pro-ai-m30-a1
   DEVICE_DTS := mt7981b-dlink-aquila-pro-ai-m30-a1
   DEVICE_DTS_DIR := ../dts
   DEVICE_PACKAGES := kmod-mt7981-firmware
-#  DEVICE_DTS_LOADADDR := 0x47000000
   IMAGES := sysupgrade.bin
   IMAGE_SIZE := 15424k
 #  SUPPORTED_DEVICES += R31

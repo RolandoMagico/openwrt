@@ -115,7 +115,9 @@
 		reg = <31>;
 		reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
 	};
+};
 
+&switch {
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
