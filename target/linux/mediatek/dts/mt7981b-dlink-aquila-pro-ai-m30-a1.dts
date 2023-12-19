@@ -91,8 +91,8 @@
 		reg = <0>;
 		phy-mode = "2500base-x";
 
-//		nvmem-cell-names = "mac-address";
-//		nvmem-cells = <&macaddr_bdinfo_de00 0>;
+		nvmem-cells = <&macaddr_wan 1>;
+		nvmem-cell-names = "mac-address";
 
 		fixed-link {
 			speed = <2500>;
@@ -107,6 +107,9 @@
 		phy-mode = "gmii";
 		phy-handle = <&int_gbe_phy>;
 		label = "internet";
+
+		nvmem-cells = <&macaddr_wan 0>;
+		nvmem-cell-names = "mac-address";
 	};
 };
 
@@ -197,16 +200,6 @@
 				label = "Factory";
 				reg = <0x180000 0x200000>;
 				read-only;
-
-				nvmem-layout {
-					compatible = "fixed-layout";
-					#address-cells = <1>;
-					#size-cells = <1>;
-
-					macaddr_art_0: macaddr@0 {
-						reg = <0x0 0x6>;
-					};
-				};
 			};
 
 			partition@380000 {
@@ -229,6 +222,19 @@
 				label = "Odm";
 				reg = <0x6980000 0x40000>;
 				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr_wan: macaddr@81 {
+						compatible = "mac-base";
+						reg = <0x81 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+				};
+				
 			};
 
 			partition@69C0000 {
