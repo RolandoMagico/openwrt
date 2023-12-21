@@ -21,12 +21,13 @@
 struct gca230718_led
 {
 	u8 used;
+	enum led_brightness brightness;
+	struct i2c_client *client;
 	struct led_classdev ledClassDev;
 };
 
 struct gca230718_private
 {
-	struct i2c_client *client;
 	struct mutex lock;
 	struct gca230718_led leds[GCA230718_MAX_LEDS];
 	u8 txData[15];
@@ -34,7 +35,52 @@ struct gca230718_private
 
 static int gca230718_set_brightness(struct led_classdev *led_cdev, enum led_brightness value)
 {
+	u8 ledIndex;
+	u8 resetCommand[2];
+	u8 controlCommand[13];
+	struct gca230718_led* led;
+	struct i2c_client* client;
+	struct gca230718_private* data;
+
 	pr_info("Enter gca230718_set_brightness\n");
+	led = container_of(led_cdev, struct gca230718_led, ledClassDev);
+	client = led->client;
+	data = i2c_get_clientdata(client);
+
+	if (led->used == 1)
+	{
+		led->brightness = value;
+		pr_info("Setting brighness to %u\n", (u32)value);
+	}
+
+	resetCommand[0] = 0x81;
+	resetCommand[1] = 0xE4;
+
+	controlCommand[0] = 0x0C;
+	controlCommand[2] = 0x01;
+	controlCommand[7] = 0x01; /* Frequency */
+	controlCommand[12] = 0x87;
+
+	for (ledIndex = 0; ledIndex < GCA230718_MAX_LEDS; ledIndex++)
+	{
+		controlCommand[3 + ledIndex] = data->leds[ledIndex].brightness;
+		controlCommand[8 + ledIndex] = data->leds[ledIndex].brightness;
+	}
+
+	mutex_lock(&data->lock);
+	controlCommand[1] = 0x02;
+	i2c_smbus_write_block_data(client, 0x00, sizeof(resetCommand), resetCommand);
+	i2c_smbus_write_block_data(client, 0x03, sizeof(controlCommand), controlCommand);
+
+	controlCommand[1] = 0x01;
+	i2c_smbus_write_block_data(client, 0x00, sizeof(resetCommand), resetCommand);
+	i2c_smbus_write_block_data(client, 0x03, sizeof(controlCommand), controlCommand);
+
+	controlCommand[1] = 0x03;
+	i2c_smbus_write_block_data(client, 0x00, sizeof(resetCommand), resetCommand);
+	i2c_smbus_write_block_data(client, 0x03, sizeof(controlCommand), controlCommand);
+	mutex_unlock(&data->lock);
+
 	pr_info("Exit gca230718_set_brightness\n");
 
 	return 0;
@@ -47,7 +93,7 @@ static int gca230718_probe(struct i2c_client *client, const struct i2c_device_id
 	struct device_node* ledNode;
 	struct gca230718_private* gca230718_privateData;
 
-	pr_info("Enter gca230718_probe\n");
+	pr_info("Enter gca230718_probe for device address %u\n", client->addr);
 	gca230718_privateData = devm_kzalloc(&(client->dev), sizeof(struct gca230718_private), GFP_KERNEL);
 
 	if (gca230718_privateData == NULL)
@@ -81,6 +127,9 @@ static int gca230718_probe(struct i2c_client *client, const struct i2c_device_id
 			{
 				struct led_classdev* ledClassDev = &(gca230718_privateData->leds[regValue].ledClassDev);
 				struct led_init_data init_data = {};
+
+				gca230718_privateData->leds[regValue].used = 1;
+				gca230718_privateData->leds[regValue].client = client;
 				init_data.fwnode = of_fwnode_handle(ledNode);
 
 				pr_info("Creating LED for node %s: reg=%u\n", ledNode->name, regValue); 
@@ -103,8 +152,6 @@ static int gca230718_probe(struct i2c_client *client, const struct i2c_device_id
 				{
 
 				}
-				
-				
 			}
 		}
 	}
