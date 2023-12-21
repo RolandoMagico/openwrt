@@ -353,14 +353,9 @@ define Device/dlink_aquila-pro-ai-m30-a1
   DEVICE_VARIANT := A1
   DEVICE_DTS := mt7981b-dlink-aquila-pro-ai-m30-a1
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-mt7981-firmware
+  DEVICE_PACKAGES := i2c-tools kmod-mt7981-firmware
   IMAGES := sysupgrade.bin
-  IMAGE_SIZE := 15424k
-#  SUPPORTED_DEVICES += R31
-#  KERNEL := kernel-bin | lzma | \
-#	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
-#  KERNEL_INITRAMFS := kernel-bin | lzma | \
-#	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k
+  IMAGE_SIZE := 51200k
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
 TARGET_DEVICES += dlink_aquila-pro-ai-m30-a1
