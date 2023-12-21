@@ -10,10 +10,10 @@
 
 	aliases {
 		label-mac-device = &gmac0;
-		led-boot = &led_power_green;
-		led-failsafe = &led_power_red;
-		led-running = &led_power_green;
-		led-upgrade = &led_power_red;
+		led-boot = &led_status_white;
+		led-failsafe = &led_status_red;
+		led-running = &led_status_white;
+		led-upgrade = &led_status_blue;
 		serial0 = &uart0;
 	};
 
@@ -40,34 +40,6 @@
 			label = "leds-on-off";
 			linux,code = <KEY_LIGHTS_TOGGLE>;
 			gpios = <&pio 4 GPIO_ACTIVE_LOW>;
-		};
-	};
-
-	leds {
-		compatible = "gpio-leds";
-
-		led_power_green: led-power-green {
-			color = <LED_COLOR_ID_GREEN>;
-			function = LED_FUNCTION_POWER;
-			gpios = <&pio 7 GPIO_ACTIVE_LOW>;
-		};
-
-		led_power_red: led-power-red {
-			color = <LED_COLOR_ID_RED>;
-			function = LED_FUNCTION_POWER;
-			gpios = <&pio 5 GPIO_ACTIVE_LOW>;
-		};
-
-		led-wifi-2g-red {
-			color = <LED_COLOR_ID_RED>;
-			function = LED_FUNCTION_WLAN;
-			gpios = <&pio 34 GPIO_ACTIVE_LOW>;
-		};
-
-		led-wifi-5g-red {
-			color = <LED_COLOR_ID_RED>;
-			function = LED_FUNCTION_WLAN;
-			gpios = <&pio 35 GPIO_ACTIVE_LOW>;
 		};
 	};
 };
@@ -297,4 +269,33 @@
 	status = "okay";
 	pinctrl-names = "default";
 	pinctrl-0 = <&i2c_pins_g0>;
+
+	gca230718@40 {
+		compatible = "unknown,gca230718";
+		reg = <0x40>;
+
+		led_status_red: led-status-red@0 {
+			color = <LED_COLOR_ID_RED>;
+			function = LED_FUNCTION_STATUS;
+			reg = <0>;
+		};
+
+		led_status_green: led-status-green@1 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_STATUS;
+			reg = <1>;
+		};
+
+		led_status_blue: led-status-blue@2 {
+			color = <LED_COLOR_ID_BLUE>;
+			function = LED_FUNCTION_STATUS;
+			reg = <2>;
+		};
+
+		led_status_white: led-status-white@3 {
+			color = <LED_COLOR_ID_WHITE>;
+			function = LED_FUNCTION_STATUS;
+			reg = <3>;
+		};
+	};
 };
