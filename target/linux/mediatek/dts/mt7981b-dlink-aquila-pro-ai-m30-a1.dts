@@ -277,6 +277,13 @@
 			bias-pull-down = <MTK_PUPD_SET_R1R0_00>;
 		};
 	};
+
+	i2c_pins_g0: i2c-pins-g0 {
+		mux {
+			function = "i2c";
+			groups = "i2c0_1";
+		};
+	};
 };
 
 &wifi {
@@ -284,4 +291,10 @@
 	nvmem-cells = <&macaddr_odm 2>;
 	nvmem-cell-names = "mac-address";
 	mediatek,mtd-eeprom = <&factory 0x0>;
+};
+
+&i2c0 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c_pins_g0>;
 };
