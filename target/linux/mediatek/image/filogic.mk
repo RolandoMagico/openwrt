@@ -497,7 +497,7 @@ define Device/dlink_aquila-pro-ai-m30-a1
   DEVICE_VARIANT := A1
   DEVICE_DTS := mt7981b-dlink-aquila-pro-ai-m30-a1
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := i2c-tools kmod-mt7981-firmware
+  DEVICE_PACKAGES := kmod-leds-gca230718 kmod-mt7981-firmware
   IMAGES := sysupgrade.bin
   IMAGE_SIZE := 51200k
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata

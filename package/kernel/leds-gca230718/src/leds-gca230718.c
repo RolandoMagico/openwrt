@@ -16,8 +16,101 @@
 #include <linux/mutex.h>
 #include <linux/version.h>
 
+#define GCA230718_MAX_LEDS				(4u)
+
+struct gca230718_led
+{
+	u8 used;
+	struct led_classdev ledClassDev;
+};
+
+struct gca230718_private
+{
+	struct i2c_client *client;
+	struct mutex lock;
+	struct gca230718_led leds[GCA230718_MAX_LEDS];
+	u8 txData[15];
+};
+
+static int gca230718_set_brightness(struct led_classdev *led_cdev, enum led_brightness value)
+{
+	pr_info("Enter gca230718_set_brightness\n");
+	pr_info("Exit gca230718_set_brightness\n");
+
+	return 0;
+}
+
 static int gca230718_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
+	int status;
+	struct device_node* gca230718;
+	struct device_node* ledNode;
+	struct gca230718_private* gca230718_privateData;
+
+	pr_info("Enter gca230718_probe\n");
+	gca230718_privateData = devm_kzalloc(&(client->dev), sizeof(struct gca230718_private), GFP_KERNEL);
+
+	if (gca230718_privateData == NULL)
+	{
+		pr_info("Error during allocating memory for private data\n");
+		status = -ENOMEM;
+	}
+	else
+	{
+		mutex_init(&gca230718_privateData->lock);
+		i2c_set_clientdata(client, gca230718_privateData);
+
+		gca230718 = client->dev.of_node;
+
+		for_each_child_of_node(gca230718, ledNode)
+		{
+			u32 regValue = 0;
+			if (of_property_read_u32(ledNode, "reg", &regValue) != 0)
+			{
+				pr_info("Missing entry \"reg\" in node %s\n", ledNode->name); 
+			}
+			else if (regValue >= GCA230718_MAX_LEDS)
+			{
+				pr_info("Invalid entry \"reg\" in node %s (%u)\n", ledNode->name, regValue);
+			}
+			else if (gca230718_privateData->leds[regValue].used == 1)
+			{
+				pr_info("Duplicate \"reg\" in node %s (%u)\n", ledNode->name, regValue);
+			}
+			else
+			{
+				struct led_classdev* ledClassDev = &(gca230718_privateData->leds[regValue].ledClassDev);
+				struct led_init_data init_data = {};
+				init_data.fwnode = of_fwnode_handle(ledNode);
+
+				pr_info("Creating LED for node %s: reg=%u\n", ledNode->name, regValue); 
+
+				ledClassDev->name = of_get_property(ledNode, "label", NULL);
+				if (ledClassDev->name == NULL)
+				{
+					ledClassDev->name = ledNode->name;
+				}
+
+				ledClassDev->brightness = LED_OFF;
+				ledClassDev->max_brightness = LED_FULL;
+				ledClassDev->brightness_set_blocking = gca230718_set_brightness;
+	
+				if (devm_led_classdev_register_ext(&(client->dev), ledClassDev, &init_data) != 0)
+				{
+					pr_info("Error during call of devm_led_classdev_register_ext");
+				}
+				else
+				{
+
+				}
+				
+				
+			}
+		}
+	}
+
+	pr_info("Exit gca230718_probe\n");
+
 	return 0;
 }
 
@@ -27,6 +120,15 @@ static void gca230718_remove(struct i2c_client *client)
 static int gca230718_remove(struct i2c_client *client)
 #endif
 {
+	struct gca230718_private* gca230718_privateData;
+	
+	pr_info("Enter gca230718_remove\n"); 
+
+	gca230718_privateData = i2c_get_clientdata(client);
+	mutex_destroy(&gca230718_privateData->lock);
+
+	pr_info("Exit gca230718_remove\n"); 
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5,18,0)
 	return 0;
 #endif
