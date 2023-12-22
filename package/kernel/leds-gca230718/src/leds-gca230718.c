@@ -7,6 +7,7 @@
  * This driver can control RGBW LEDs which are connected to a GCA230718.
  */
 
+#include <linux/delay.h>
 #include <linux/led-class-multicolor.h>
 #include <linux/leds.h>
 #include <linux/module.h>
@@ -30,19 +31,19 @@ struct gca230718_private
 {
 	struct mutex lock;
 	struct gca230718_led leds[GCA230718_MAX_LEDS];
-	u8 txData[15];
 };
 
 static int gca230718_set_brightness(struct led_classdev *led_cdev, enum led_brightness value)
 {
 	u8 ledIndex;
+	u8 loopIndex;
 	u8 resetCommand[2];
 	u8 controlCommand[13];
 	struct gca230718_led* led;
 	struct i2c_client* client;
 	struct gca230718_private* data;
+	const u8 controlCommandByte1Sequence[3] = { 0x02, 0x01, 0x03 };
 
-	pr_info("Enter gca230718_set_brightness\n");
 	led = container_of(led_cdev, struct gca230718_led, ledClassDev);
 	client = led->client;
 	data = i2c_get_clientdata(client);
@@ -50,7 +51,6 @@ static int gca230718_set_brightness(struct led_classdev *led_cdev, enum led_brig
 	if (led->used == 1)
 	{
 		led->brightness = value;
-		pr_info("Setting brighness to %u\n", (u32)value);
 	}
 
 	resetCommand[0] = 0x81;
@@ -68,27 +68,29 @@ static int gca230718_set_brightness(struct led_classdev *led_cdev, enum led_brig
 	}
 
 	mutex_lock(&data->lock);
-	controlCommand[1] = 0x02;
-	i2c_smbus_write_block_data(client, 0x00, sizeof(resetCommand), resetCommand);
-	i2c_smbus_write_block_data(client, 0x03, sizeof(controlCommand), controlCommand);
 
-	controlCommand[1] = 0x01;
-	i2c_smbus_write_block_data(client, 0x00, sizeof(resetCommand), resetCommand);
-	i2c_smbus_write_block_data(client, 0x03, sizeof(controlCommand), controlCommand);
+	for (loopIndex = 0; loopIndex < 3; loopIndex++)
+	{
+		int status = 0;
+		controlCommand[1] = controlCommandByte1Sequence[loopIndex];
+		if ((status = i2c_smbus_write_i2c_block_data(client, 0x00, sizeof(resetCommand), resetCommand)) != 0)
+		{
+			pr_info("Error %i during call of i2c_smbus_write_i2c_block_data for reset command in loop sequence %i\n", status, loopIndex);
+		}
+		else if ((status = i2c_smbus_write_i2c_block_data(client, 0x03, sizeof(controlCommand), controlCommand)) != 0)
+		{
+			pr_info("Error %i during call of i2c_smbus_write_i2c_block_data for control command in loop sequence %i\n", status, loopIndex);
+		}
+	}
 
-	controlCommand[1] = 0x03;
-	i2c_smbus_write_block_data(client, 0x00, sizeof(resetCommand), resetCommand);
-	i2c_smbus_write_block_data(client, 0x03, sizeof(controlCommand), controlCommand);
 	mutex_unlock(&data->lock);
-
-	pr_info("Exit gca230718_set_brightness\n");
 
 	return 0;
 }
 
 static int gca230718_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
-	int status;
+	int status = 0;
 	struct device_node* gca230718;
 	struct device_node* ledNode;
 	struct gca230718_private* gca230718_privateData;
@@ -156,9 +158,7 @@ static int gca230718_probe(struct i2c_client *client, const struct i2c_device_id
 		}
 	}
 
-	pr_info("Exit gca230718_probe\n");
-
-	return 0;
+	return status;
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,18,0)
