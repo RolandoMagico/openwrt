@@ -6,6 +6,29 @@ define Image/Prepare
 	echo -ne '\xde\xad\xc0\xde' > $(KDIR)/ubi_mark
 endef
 
+# Append header to a D-Link M30
+define Build/m30-recovery-header
+	$(eval header_start=$(word 1,$(1)))
+# create $@.header without the checksum
+	echo -en "$(header_start)\x00\x00\xC8\x62" > "$@.header"
+	echo -en "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x6A\x28\xEE\x0B" >> "$@.header"
+# Byte 0-3: Erase Start 0x002C0000
+# Byte 4-7: Erase Length 0x02D00000
+# Byte 8-11: Data offset: 0x002C0000
+# Byte 12-15: Data Length: 0x02D00000
+	echo -en "\x00\x00\x2C\x00\x00\x00\xD0\x02\x00\x00\x2C\x00\x00\x00\xD0\x02" >> "$@.header"
+# Only zeros
+	echo -en "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" >> "$@.header"
+# Last 16 bytes, but without checksum
+	echo -en "\x42\x48\x02\x00\x00\x00\x08\x00\x00\x00\x00\x00\x61\x6E" >> "$@.header"
+# Calculate and append checksum: The checksum must be set so that the 2byte-sum of the whole header is 0.
+# Every overflow during the checksum calculation must increment the current checksum value by 1.
+	od -v -w2 -tu2 -An --endian little "$@.header" | awk '{s+=65535-$$1;}END{s%=65535;printf "%c%c",s%256,s/256;}' > "$@.header.checksum"
+	cat "$@.header" "$@.header.checksum" "$@" > "$@.new"
+	mv "$@.new" "$@"
+	rm "$@.header" "$@.header.checksum"
+endef
+
 define Build/mt7981-bl2
 	cat $(STAGING_DIR_IMAGE)/mt7981-$1-bl2.img >> $@
 endef
@@ -354,9 +377,17 @@ define Device/dlink_aquila-pro-ai-m30-a1
   DEVICE_DTS := mt7981b-dlink-aquila-pro-ai-m30-a1
   DEVICE_DTS_DIR := ../dts
   DEVICE_PACKAGES := kmod-leds-gca230718 kmod-mt7981-firmware
+#  BOARD_NAME := mt7981-spim-nand-rfb
+#  KERNEL_SIZE := 8192k
+#  BLOCKSIZE := 128k
+#  PAGESIZE := 2048
+#  UBINIZE_OPTS := -E 5
   IMAGES := sysupgrade.bin
+  IMAGES += recovery.bin
   IMAGE_SIZE := 51200k
+  RECOVERY_IMAGE_SIZE := 46080k
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  IMAGE/recovery.bin := sysupgrade-tar | append-metadata | pad-to $$(RECOVERY_IMAGE_SIZE) | m30-recovery-header DLK6E6110001
 endef
 TARGET_DEVICES += dlink_aquila-pro-ai-m30-a1
 
