@@ -41,7 +41,11 @@ endef
 define Build/m32-r32-recovery-header-kernel1
 	$(eval header_start=$(word 1,$(1)))
 # create $@.header without the checksum
-	echo -en "$(header_start)\x00\x00\xCF\x33" > "$@.header"
+	echo -en "$(header_start)\x00\x00" > "$@.header"
+# Calculate checksum over data area ($@) and append it to the header.
+# The checksum is the 2byte-sum over the whole data area.
+# Every overflow during the checksum calculation must increment the current checksum value by 1.
+	od -v -w2 -tu2 -An --endian little "$@" | awk '{ s+=$$1; } END { s%=65535; printf "%c%c",s%256,s/256; }' >> "$@.header"
 	echo -en "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x8D\x57\x30\x0B" >> "$@.header"
 # Byte 0-3: Erase Start 0x002C0000
 # Byte 4-7: Erase Length 0x02D00000
@@ -54,10 +58,10 @@ define Build/m32-r32-recovery-header-kernel1
 	echo -en "\x42\x48\x02\x00\x00\x00\x08\x00\x00\x00\x00\x00\x60\x6E" >> "$@.header"
 # Calculate and append checksum: The checksum must be set so that the 2byte-sum of the whole header is 0.
 # Every overflow during the checksum calculation must increment the current checksum value by 1.
-	od -v -w2 -tu2 -An --endian little "$@.header" | awk '{s+=65535-$$1;}END{s%=65535;printf "%c%c",s%256,s/256;}' > "$@.header.checksum"
-	cat "$@.header" "$@.header.checksum" "$@" > "$@.new"
+	od -v -w2 -tu2 -An --endian little "$@.header" | awk '{s+=65535-$$1;}END{s%=65535;printf "%c%c",s%256,s/256;}' >> "$@.header"
+	cat "$@.header" "$@" > "$@.new"
 	mv "$@.new" "$@"
-	rm "$@.header" "$@.header.checksum"
+	rm "$@.header"
 endef
 
 define Build/mt7622-gpt
@@ -177,7 +181,7 @@ define Device/dlink_eagle-pro-ai-ax3200-a1
   DEVICE_VENDOR := D-Link
   DEVICE_VARIANT := A1
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-mt7915-firmware
+  DEVICE_PACKAGES := kmod-mt7915-firmware uboot-envtools
   KERNEL_SIZE := 8192k
   BLOCKSIZE := 128k
   PAGESIZE := 2048

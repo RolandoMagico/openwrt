@@ -4,6 +4,9 @@ START=99
 
 boot() {
 	case $(board_name) in
+	dlink,eagle-pro-ai-m32-a1|\
+	dlink,eagle-pro-ai-r32-a1)
+		;;
 	linksys,e8450)
 		mtd erase senv || true
 		;;
