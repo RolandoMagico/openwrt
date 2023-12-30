@@ -6,6 +6,14 @@ boot() {
 	case $(board_name) in
 	dlink,eagle-pro-ai-m32-a1|\
 	dlink,eagle-pro-ai-r32-a1)
+		fw_setenv sw_tryactive 2
+		if grep -q boot_part=Kernel1 /proc/cmdline; then
+			fw_setenv boot_part 1
+			fw_setenv sw_active 1
+		else
+			fw_setenv boot_part 2
+			fw_setenv sw_active 2
+		fi
 		;;
 	linksys,e8450)
 		mtd erase senv || true

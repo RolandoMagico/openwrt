@@ -259,7 +259,6 @@
 			partition@140000 {
 				label = "BootConfig";
 				reg = <0x00140000 0x00040000>;
-				read-only;
 			};
 
 			partition@180000 {
