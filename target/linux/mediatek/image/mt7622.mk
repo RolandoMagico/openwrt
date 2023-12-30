@@ -186,7 +186,7 @@ define Device/dlink_eagle-pro-ai-ax3200-a1
   BLOCKSIZE := 128k
   PAGESIZE := 2048
   UBINIZE_OPTS := -E 5
-  IMAGES += tftp.bin recovery.bin
+  IMAGES += tftp.bin recovery.bin factory.bin
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
   IMAGE/tftp.bin := append-kernel | pad-to $$(KERNEL_SIZE) | append-ubi | check-size
 endef
@@ -195,6 +195,7 @@ define Device/dlink_eagle-pro-ai-m32-a1
   $(Device/dlink_eagle-pro-ai-ax3200-a1)
   DEVICE_MODEL := EAGLE PRO AI M32
   DEVICE_DTS := mt7622-dlink-eagle-pro-ai-m32-a1
+  IMAGE/factory.bin := append-kernel | pad-to $$(KERNEL_SIZE) | append-ubi | pad-to $$(IMAGE_SIZE) | m32-r32-recovery-header-kernel1 DLK6E6010001 | dlink-ai-firmware-tool M32 -c
   IMAGE/recovery.bin := append-kernel | pad-to $$(KERNEL_SIZE) | append-ubi | pad-to $$(IMAGE_SIZE) | m32-r32-recovery-header-kernel1 DLK6E6010001
 endef
 TARGET_DEVICES += dlink_eagle-pro-ai-m32-a1
@@ -203,6 +204,7 @@ define Device/dlink_eagle-pro-ai-r32-a1
   $(Device/dlink_eagle-pro-ai-ax3200-a1)
   DEVICE_MODEL := EAGLE PRO AI R32
   DEVICE_DTS := mt7622-dlink-eagle-pro-ai-r32-a1
+  IMAGE/factory.bin := append-kernel | pad-to $$(KERNEL_SIZE) | append-ubi | pad-to $$(IMAGE_SIZE) | m32-r32-recovery-header-kernel1 DLK6E6015001 | dlink-ai-firmware-tool R32 -c
   IMAGE/recovery.bin := append-kernel | pad-to $$(KERNEL_SIZE) | append-ubi | pad-to $$(IMAGE_SIZE) | m32-r32-recovery-header-kernel1 DLK6E6015001
 endef
 TARGET_DEVICES += dlink_eagle-pro-ai-r32-a1

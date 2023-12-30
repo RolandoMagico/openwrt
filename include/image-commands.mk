@@ -230,6 +230,13 @@ define Build/copy-file
 	cat "$(1)" > "$@"
 endef
 
+define Build/dlink-ai-firmware-tool
+	$(eval product=$(word 1,$(1)))
+	$(eval operation=$(word 2,$(1)))
+	$(STAGING_DIR_HOST)/bin/dlink-ai-firmware-tool $(product) $(operation) $@ $@.tmp
+	mv $@.tmp $@
+endef
+
 define Build/dlink-sge-image
 	$(STAGING_DIR_HOST)/bin/dlink-sge-image $(1) $@ $@.enc
 	mv $@.enc $@
