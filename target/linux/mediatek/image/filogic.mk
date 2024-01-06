@@ -391,9 +391,10 @@ define Device/dlink_aquila-pro-ai-m30-a1
   DEVICE_DTS := mt7981b-dlink-aquila-pro-ai-m30-a1
   DEVICE_DTS_DIR := ../dts
   DEVICE_PACKAGES := kmod-leds-gca230718 kmod-mt7981-firmware mt7981-wo-firmware
-  IMAGES += recovery.bin
+  IMAGES += factory.bin recovery.bin
   IMAGE_SIZE := 51200k
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  IMAGE/factory.bin := sysupgrade-tar | m30-recovery-header DLK6E6110001 | dlink-ai-firmware-tool M30 -u | dlink-ai-firmware-tool M30 -c
   IMAGE/recovery.bin := sysupgrade-tar | pad-to $$(IMAGE_SIZE) | m30-recovery-header DLK6E6110001
 endef
 TARGET_DEVICES += dlink_aquila-pro-ai-m30-a1
