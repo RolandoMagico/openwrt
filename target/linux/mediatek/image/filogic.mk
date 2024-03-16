@@ -6,7 +6,7 @@ define Image/Prepare
 	echo -ne '\xde\xad\xc0\xde' > $(KDIR)/ubi_mark
 endef
 
-# Append header to a D-Link M30
+# Create a header for a D-Link AQUILA PRO AI M30 recovery image and add it at the beginning of the image.
 define Build/m30-recovery-header
 	$(eval header_start=$(word 1,$(1)))
 # create $@.header without the checksum
@@ -524,8 +524,8 @@ define Device/dlink_aquila-pro-ai-m30-a1
   DEVICE_VARIANT := A1
   DEVICE_DTS := mt7981b-dlink-aquila-pro-ai-m30-a1
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-leds-gca230718 kmod-mt7981-firmware
-  IMAGES := sysupgrade.bin
+  DEVICE_PACKAGES := kmod-leds-gca230718 kmod-mt7981-firmware mt7981-wo-firmware
+  KERNEL_IN_UBI := 1
   IMAGES += recovery.bin
   IMAGE_SIZE := 51200k
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
