@@ -208,6 +208,13 @@
 	};
 };
 
+<<<<<<< HEAD
+=======
+&usb_phy {
+	status = "okay";
+};
+
+>>>>>>> a5d8767034 (Added changes from https://github.com/yogo1212/openwrt/commit/5ecdefdd49f669d0fee0722a9e852c8292743ec2)
 &wifi {
 	status = "okay";
 	mediatek,mtd-eeprom = <&factory 0x0>;
