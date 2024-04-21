@@ -590,7 +590,7 @@ define Device/dlink_aquila-pro-ai-e30-a1
   DEVICE_VARIANT := A1
   DEVICE_DTS := mt7981b-dlink-aquila-pro-ai-e30-a1
   DEVICE_DTS_DIR := ../dts
-  DEVICE_PACKAGES := kmod-leds-gca230718 kmod-mt7981-firmware mt7981-wo-firmware
+  DEVICE_PACKAGES := kmod-leds-gca230718 kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware
   KERNEL_IN_UBI := 1
   IMAGES += recovery.bin
   IMAGE_SIZE := 51200k
