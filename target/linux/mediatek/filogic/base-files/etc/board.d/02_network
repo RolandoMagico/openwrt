@@ -55,6 +55,12 @@ mediatek_setup_interfaces()
 	comfast,cf-e393ax)
 		ucidef_set_interfaces_lan_wan "lan1" eth1
 		;;
+	dlink,aquila-pro-ai-e30-a1)
+		ucidef_set_interfaces_lan "gmac0 gmac1"
+		;;
+	dlink,aquila-pro-ai-m30-a1)
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" internet
+		;;
 	cudy,m3000-v1|\
 	cudy,tr3000-v1|\
 	glinet,gl-mt2500|\
