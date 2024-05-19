@@ -1,0 +1,209 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+
+#include "mt7621.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	compatible = "tplink,hc220-g5-v1", "mediatek,mt7621-soc";
+	model = "TP-Link HC220-G5 v1";
+
+	aliases {
+		label-mac-device = &gmac0;
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
+	};
+
+	chosen {
+		bootargs = "console=ttyS0,115200n8";
+	};
+
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
+
+		reset {
+			label = "reset";
+			gpios = <&gpio 18 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		rssi {
+			label = "green:rssi";
+			gpios = <&gpio 5 GPIO_ACTIVE_LOW>;
+		};
+
+		lan {
+			function = LED_FUNCTION_LAN;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&gpio 9 GPIO_ACTIVE_LOW>;
+		};
+
+		sys {
+			label = "green:sys";
+			gpios = <&gpio 10 GPIO_ACTIVE_LOW>;
+		};
+
+		wifi2g {
+			label = "green:wifi2g";
+			gpios = <&gpio 12 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "phy0tpt";
+		};
+
+		logo_red {
+			label = "red:logo";
+			gpios = <&gpio 14 GPIO_ACTIVE_LOW>;
+			/* match usage in v1 and v2 */
+			linux,default-trigger = "phy0tpt";
+		};
+
+		logo_blue {
+			label = "blue:logo";
+			gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
+			/* match usage in v1 and v2 */
+			linux,default-trigger = "phy1tpt";
+
+		};
+
+		led_power: logo_green {
+			label = "green:logo";
+			gpios = <&gpio 13 GPIO_ACTIVE_LOW>;
+			/* match usage in v1 and v2 */
+			default_state = "on";
+		};
+	};
+};
+
+&state_default {
+	gpio {
+		groups = "i2c", "uart2", "uart3", "jtag", "wdt";
+		function = "gpio";
+	};
+};
+
+&nand {
+	status = "okay";
+
+	mediatek,nmbm;
+	/* rsvd = Remapping Range / NAND Erase-Size */
+	/* rsvd = 0x800000 / 0x20000 */
+	mediatek,bmt-max-reserved-blocks = <64>;
+	/* Remapping should include raw-nand we operate upon without UBI layer. */
+	/* This includes (at least) the kernel which has to be loaded by U-Boot.*/
+	mediatek,bmt-remap-range =
+		<0x0 0x980000>;
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		partition@0 {
+			label = "boot";
+			reg = <0x0 0x80000>;
+			read-only;
+		};
+
+		partition@80000 {
+			label = "boot_env";
+			reg = <0x80000 0x80000>;
+		};
+
+		partition@100000 {
+			label = "misc_ro";
+			reg = <0x100000 0x600000>;
+		};
+
+		partition@700000 {
+			label = "misc_rw";
+			reg = <0x700000 0x600000>;
+		};
+
+		partition@d00000 {
+			label = "firmware1";
+			reg = <0xd00000 0x1600000>;
+		};
+
+		partition@2300000 {
+			label = "firmware2";
+			reg = <0x2300000 0x1600000>;
+		};
+
+		partition@3900000 {
+			label = "bflag";
+			reg = <0x3900000 0x600000>;
+		};
+
+		partition@3f00000 {
+			label = "misc_rw_bak";
+			reg = <0x3f00000 0x600000>;
+		};
+
+		partition@4500000 {
+			label = "misc_isp";
+			reg = <0x4500000 0x600000>;
+		};
+
+		partition@w {
+			label = "whole";
+			reg = <0x00 0x7800000>;
+		};
+	};
+};
+
+&ethernet {
+	pinctrl-names = "default";
+	pinctrl-0 = <&rgmii1_pins &mdio_pins>;
+};
+
+&gmac0 {
+	/* nvmem-cells = <&macaddr_config_8>; */
+	/* nvmem-cell-names = "mac-address"; */
+	label = "dsa";
+};
+
+&switch0 {
+	ports {
+		port@0 {
+			status = "okay";
+			label = "eth0";
+		};
+
+		port@1 {
+			status = "okay";
+			label = "eth1";
+		};
+	};
+};
+
+&pcie {
+	status = "okay";
+};
+
+&pcie0 {
+	wifi@0,0 {
+		compatible = "mediatek,mt76";
+		reg = <0x0000 0 0 0 0>;
+		/* nvmem-cells = <&eeprom_radio_0>; */
+		/* nvmem-cell-names = "eeprom"; */
+		ieee80211-freq-limit = <2400000 2500000>;
+	};
+};
+
+&pcie1 {
+	wifi@0,0 {
+		compatible = "mediatek,mt76";
+		reg = <0x0000 0 0 0 0>;
+		/* nvmem-cells = <&eeprom_radio_8000>; */
+		/* vmem-cell-names = "eeprom"; */
+		ieee80211-freq-limit = <5000000 6000000>;
+	};
+};
