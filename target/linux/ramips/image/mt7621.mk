@@ -2758,6 +2758,19 @@ define Device/tplink_ex220-v1
 endef
 TARGET_DEVICES += tplink_ex220-v1
 
+define Device/tplink_hc220-g5-v1
+  $(Device/dsa-migration)
+  $(Device/tplink-safeloader)
+  DEVICE_MODEL := HC220-G5
+  DEVICE_VARIANT := v1
+  DEVICE_PACKAGES := kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap \
+	-uboot-envtools
+  KERNEL := $(KERNEL_DTB) | uImage lzma
+  TPLINK_BOARD_ID := DECO-HC220-G5
+  IMAGE_SIZE := 15744k
+endef
+TARGET_DEVICES += tplink_hc220-g5-v1
+
 define Device/tplink_mr600-v2-eu
   $(Device/dsa-migration)
   $(Device/tplink-v2)
