@@ -150,6 +150,9 @@ ramips_setup_interfaces()
 	tplink,er605-v2)
 		ucidef_set_interfaces_lan_wan "eth1 eth2 eth3 eth4" "eth0"
 		;;
+	tplink,hc220-g5-v1)
+		ucidef_set_interfaces_lan_wan "lan1 lan2" "wan"
+		;;
 	tplink,tl-wpa8631p-v3)
 		ucidef_set_interface_lan "lan1 lan2 lan3 plc0"
 		;;
