@@ -2464,10 +2464,8 @@ define Device/tplink_hc220-g5-v1
   $(Device/nand)
   DEVICE_MODEL := HC220-G5
   DEVICE_VARIANT := v1
-  DEVICE_PACKAGES := kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap \
-	-uboot-envtools
-  KERNEL_INITRAMFS := kernel-bin | append-dtb | lzma | loader-kernel | \
-	uImage none
+  DEVICE_PACKAGES := kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap uboot-envtools
+  KERNEL_INITRAMFS := kernel-bin | append-dtb | lzma | loader-kernel | uImage none
   KERNEL_LOADADDR := 0x80010000
   TPLINK_BOARD_ID := DECO-HC220-G5
   IMAGE_SIZE := 22528k
