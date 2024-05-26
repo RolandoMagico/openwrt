@@ -120,11 +120,33 @@
 		partition@100000 {
 			label = "misc_ro";
 			reg = <0x100000 0x600000>;
+			read-only;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				macaddr_misc_ro_5c70bc: macaddr@5c70bc {
+					compatible = "mac-base";
+					reg = <0x5c70bc 0x6>;
+					#nvmem-cell-cells = <1>;
+				};
+
+				eeprom_radio_180000: eeprom@180000{
+					reg = <0x180000 0x20000>;
+				};
+
+				eeprom_radio_1A0000: eeprom@1A0000{
+					reg = <0x1A0000 0x20000>;
+				};
+			};
 		};
 
 		partition@700000 {
 			label = "misc_rw";
 			reg = <0x700000 0x600000>;
+			read-only;
 		};
 
 		partition@d00000 {
@@ -140,21 +162,25 @@
 		partition@3900000 {
 			label = "bflag";
 			reg = <0x3900000 0x600000>;
+			read-only;
 		};
 
 		partition@3f00000 {
 			label = "misc_rw_bak";
 			reg = <0x3f00000 0x600000>;
+			read-only;
 		};
 
 		partition@4500000 {
 			label = "misc_isp";
 			reg = <0x4500000 0x600000>;
+			read-only;
 		};
 
 		partition@w {
 			label = "whole";
 			reg = <0x00 0x7800000>;
+			read-only;
 		};
 	};
 };
@@ -162,11 +188,13 @@
 &ethernet {
 	pinctrl-names = "default";
 	pinctrl-0 = <&rgmii1_pins &mdio_pins>;
+	nvmem-cells = <&macaddr_misc_ro_5c70bc>;
+	nvmem-cell-names = "mac-address";
 };
 
 &gmac0 {
-	/* nvmem-cells = <&macaddr_config_8>; */
-	/* nvmem-cell-names = "mac-address"; */
+	nvmem-cells = <&macaddr_misc_ro_5c70bc 1>;
+	nvmem-cell-names = "mac-address";
 	label = "dsa";
 };
 
@@ -197,8 +225,8 @@
 	wifi@0,0 {
 		compatible = "mediatek,mt76";
 		reg = <0x0000 0 0 0 0>;
-		/* nvmem-cells = <&eeprom_radio_0>; */
-		/* nvmem-cell-names = "eeprom"; */
+		nvmem-cells = <&eeprom_radio_180000>, <&macaddr_misc_ro_5c70bc 0>;
+		nvmem-cell-names = "eeprom", "mac-address";
 		ieee80211-freq-limit = <2400000 2500000>;
 	};
 };
@@ -207,8 +235,8 @@
 	wifi@0,0 {
 		compatible = "mediatek,mt76";
 		reg = <0x0000 0 0 0 0>;
-		/* nvmem-cells = <&eeprom_radio_8000>; */
-		/* vmem-cell-names = "eeprom"; */
+		nvmem-cells = <&eeprom_radio_1A0000>, <&macaddr_misc_ro_5c70bc 2>;
+		nvmem-cell-names = "eeprom", "mac-address";
 		ieee80211-freq-limit = <5000000 6000000>;
 	};
 };
