@@ -154,6 +154,16 @@ platform_do_upgrade() {
 		CI_KERNPART="kernel"
 		nand_do_upgrade "$1"
 		;;
+	tplink,hc220-g5-v1)
+		# Set fw1_version to fw2_version + 1
+		fw_setenv fw1_version $(($(fw_printenv -n fw2_version) + 1))
+		# Delete fw1_length and fw1_checksum to skip bootloader verification
+		fw_setenv fw1_length
+		fw_setenv fw1_checksum
+		fw_setenv fw1_status 0
+		fw_setenv fw2_status 2
+		nand_do_upgrade "$1"
+		;;
 	ubnt,edgerouter-x|\
 	ubnt,edgerouter-x-sfp)
 		platform_upgrade_ubnt_erx "$1"

@@ -133,6 +133,20 @@
 		partition@d00000 {
 			label = "firmware1";
 			reg = <0xd00000 0x1600000>;
+
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "kernel";
+				reg = <0x0 0x800000>;
+			};
+
+			partition@800000 {
+				label = "rootfs";
+				reg = <0x800000 0xE00000>;
+			};
 		};
 
 		partition@2300000 {
