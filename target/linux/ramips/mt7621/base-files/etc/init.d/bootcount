@@ -32,9 +32,15 @@ boot() {
 	samknows,whitebox-v8)
 		fw_setenv bootcount 0
 		;;
+<<<<<<< HEAD
 	dna,valokuitu-plus-ex400)
 		fw_setenv boot_cnt_primary 0
 		fw_setenv boot_cnt_alt 0
+=======
+	tplink,hc220-g5-v1)
+		fw_setenv fw_index 1
+		fw_setenv fw1_status 1
+>>>>>>> de04f0cffe (Prepared for update process)
 		;;
 	zyxel,lte3301-plus)
 		[ $(printf %d $(fw_printenv -n DebugFlag)) -gt 0 ] || fw_setenv DebugFlag 1
