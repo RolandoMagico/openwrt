@@ -2768,7 +2768,7 @@ define Device/tplink_hc220-g5-v1
   KERNEL_SIZE := 8192k
   KERNEL := kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb | pad-to 64k
   KERNEL_INITRAMFS := kernel-bin | append-dtb | lzma | loader-kernel | uImage none
-  KERNEL_LOADADDR := 0x80010000
+  KERNEL_LOADADDR := 0x81001000
   TPLINK_BOARD_ID := HC220-G5V1
   IMAGE_SIZE := 22528k
 endef
