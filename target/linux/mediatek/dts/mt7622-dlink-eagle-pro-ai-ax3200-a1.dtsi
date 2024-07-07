@@ -281,7 +281,7 @@
 
 			partition@2C0000 {
 				label = "Kernel1";
-				reg = <0x002C0000 0x02D00000>;
+				reg = <0x002C0000 0x05A00000>;
 
 				compatible = "denx,fit";
 				openwrt,cmdline-match = "boot_part=Kernel1";
@@ -292,24 +292,7 @@
 
 				partition@800000 {
 					label = "ubi";
-					reg = <0x00800000 0x02500000>;
-				};
-			};
-
-			partition@2FC0000 {
-				label = "Kernel2";
-				reg = <0x02FC0000 0x02D00000>;
-
-				compatible = "denx,fit";
-				openwrt,cmdline-match = "boot_part=Kernel2";
-				partition@0 {
-					label = "kernel";
-					reg = <0x00000000 0x00800000>;
-				};
-
-				partition@800000 {
-					label = "ubi";
-					reg = <0x00800000 0x02500000>;
+					reg = <0x00800000 0x05200000>;
 				};
 			};
 
