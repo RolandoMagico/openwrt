@@ -104,6 +104,11 @@ platform_do_upgrade() {
 	yuncore,ax835)
 		default_do_upgrade "$1"
 		;;
+	dlink,aquila-pro-ai-m30-a1)
+		fw_setenv sw_tryactive 0
+		CI_UBIPART="ubi0"
+		nand_do_upgrade "$1"
+		;;
 	glinet,gl-mt2500|\
 	glinet,gl-mt6000|\
 	glinet,gl-x3000|\
