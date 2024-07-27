@@ -202,7 +202,6 @@
 			partition@6980000 {
 				label = "Odm";
 				reg = <0x6980000 0x40000>;
-				read-only;
 
 				nvmem-layout {
 					compatible = "fixed-layout";
