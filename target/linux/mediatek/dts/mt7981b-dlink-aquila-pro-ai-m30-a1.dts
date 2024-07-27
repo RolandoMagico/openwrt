@@ -189,14 +189,13 @@
 			};
 
 			partition@580000 {
-				label = "ubi";
+				label = "ubi0";
 				reg = <0x580000 0x3200000>;
 			};
 
 			partition@3780000 {
-				label = "ubi1";
+				label = "ubi";
 				reg = <0x3780000 0x3200000>;
-				read-only;
 			};
 
 			partition@6980000 {
