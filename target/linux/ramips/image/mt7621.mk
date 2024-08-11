@@ -2762,6 +2762,7 @@ TARGET_DEVICES += tplink_ex220-v1
 
 define Device/tplink_hc220-g5-v1
   $(Device/nand)
+  DEVICE_VENDOR := TP-Link
   DEVICE_MODEL := HC220-G5
   DEVICE_VARIANT := v1
   DEVICE_PACKAGES := kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap uboot-envtools
