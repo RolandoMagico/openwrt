@@ -699,6 +699,17 @@ define Device/confiabits_mt7621-v1
 endef
 TARGET_DEVICES += confiabits_mt7621-v1
 
+define Device/cudy_m1300-v2
+  $(Device/dsa-migration)
+  IMAGE_SIZE := 15872k
+  DEVICE_VENDOR := Cudy
+  DEVICE_MODEL := M1300
+  DEVICE_VARIANT := v2
+  DEVICE_PACKAGES := kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap \
+	-uboot-envtools
+endef
+TARGET_DEVICES += cudy_m1300-v2
+
 define Device/cudy_m1800
   $(Device/dsa-migration)
   DEVICE_VENDOR := Cudy
