@@ -105,6 +105,7 @@ ramips_setup_interfaces()
 		uci add_list firewall.@zone[1].network='eth_data'
 		uci add_list firewall.@zone[1].network='eth_om'
 		;;
+	cudy,m1300-v2|\
 	cudy,m1800|\
 	yuncore,ax820|\
 	zyxel,nr7101)
