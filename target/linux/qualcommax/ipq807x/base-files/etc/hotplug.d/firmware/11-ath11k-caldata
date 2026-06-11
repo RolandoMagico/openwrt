@@ -28,6 +28,7 @@ case "$FIRMWARE" in
 	edgecore,eap102|\
 	edimax,cax1800|\
 	linksys,mx5300|\
+	meraki,mr44|\
 	netgear,wax218|\
 	qnap,301w|\
 	redmi,ax6|\

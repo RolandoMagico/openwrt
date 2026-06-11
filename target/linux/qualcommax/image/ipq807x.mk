@@ -266,6 +266,20 @@ define Device/linksys_mx8500
 endef
 TARGET_DEVICES += linksys_mx8500
 
+define Device/meraki_mr44
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := Meraki
+	DEVICE_MODEL := MR44
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	DEVICE_DTS_CONFIG := config@ac02
+	SOC := ipq8071
+	DEVICE_PACKAGES := ipq-wifi-meraki_mr44
+	IMAGE/factory.ubi := append-ubi | qsdk-ipq-factory-nand
+endef
+TARGET_DEVICES += meraki_mr44
+
 define Device/netgear_rax120v2
 	$(call Device/FitImage)
 	$(call Device/UbiFit)
