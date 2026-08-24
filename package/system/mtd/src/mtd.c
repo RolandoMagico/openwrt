@@ -873,6 +873,7 @@ static void do_reboot(void)
 int main (int argc, char **argv)
 {
 	int ch, i, boot, imagefd = 0, force, unlocked;
+	int ret = 0;
 	char *erase[MAX_ARGS], *device = NULL;
 	char *fis_layout = NULL;
 	size_t offset = 0, data_size = 0, part_offset = 0, dump_len = 0;
@@ -1078,7 +1079,7 @@ int main (int argc, char **argv)
 				mtd_unlock(device);
 			break;
 		case CMD_VERIFY:
-			mtd_verify(device, imagefile);
+			ret = mtd_verify(device, imagefile);
 			break;
 		case CMD_DUMP:
 			mtd_dump(device, offset, dump_len);
@@ -1091,7 +1092,7 @@ int main (int argc, char **argv)
 		case CMD_WRITE:
 			if (!unlocked)
 				mtd_unlock(device);
-			mtd_write(imagefd, device, fis_layout, part_offset);
+			ret = mtd_write(imagefd, device, fis_layout, part_offset);
 			break;
 		case CMD_JFFS2WRITE:
 			if (!unlocked)
@@ -1127,5 +1128,6 @@ int main (int argc, char **argv)
 	if (boot)
 		do_reboot();
 
-	return 0;
+	/* Normalise to a shell-usable exit status. */
+	return ret ? 1 : 0;
 }
