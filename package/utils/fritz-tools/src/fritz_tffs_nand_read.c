@@ -38,6 +38,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <endian.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -53,12 +54,18 @@
 
 #define TFFS_BLOCK_HEADER_MAGIC	0x41564d5f54464653ULL
 #define TFFS_VERSION		0x0003
+#define TFFS_TYPE_MTDNAND	0x0002
+#define TFFS_MAX_BAD_PAGES	0x0004
 #define TFFS_ENTRY_HEADER_SIZE	0x18
 #define TFFS_MAXIMUM_SEGMENT_SIZE	(0x800 - TFFS_ENTRY_HEADER_SIZE)
 
 #define TFFS_SECTOR_SIZE 0x0800
 #define TFFS_SECTOR_OOB_SIZE 0x0040
-#define TFFS_SECTORS_PER_PAGE 2
+
+/* {id, len, rev}, mirrored from the sector header into the spare area */
+#define TFFS_MIRROR_SIZE 0x000c
+/* where that mirror sits in the raw spare area of a contiguous layout */
+#define TFFS_MIRROR_RAW_OFF 0x0002
 
 #define TFFS_SEGMENT_CLEARED 0xffffffff
 
@@ -71,8 +78,13 @@ static bool read_oob_sector_health = false;
 static bool swap_bytes = false;
 static uint8_t readbuf[TFFS_SECTOR_SIZE];
 static uint8_t oobbuf[TFFS_SECTOR_OOB_SIZE];
+static uint8_t mirrorbuf[TFFS_MIRROR_SIZE];
 static uint32_t blocksize;
+static uint32_t writesize;
 static int mtdfd;
+#ifdef MEMREAD
+static bool have_memread = true;
+#endif
 static uint32_t num_sectors;
 static uint8_t *sectors;
 static uint32_t *sector_ids;
@@ -156,6 +168,57 @@ static int read_sectoroob(off_t pos)
 	return 0;
 }
 
+/*
+ * Read the {id, len, rev} mirror of the sector at pos into mirrorbuf.
+ *
+ * AVM writes one mirror per nand page, at free-byte offset 0 of the spare
+ * area. Which physical spare bytes those are is a property of the chip's
+ * oob layout: on a chip that frees one contiguous range starting at byte 2
+ * they are the 12 bytes at TFFS_MIRROR_RAW_OFF, but on a chip whose free
+ * ranges are split around the ecc bytes they are scattered. So ask mtd for
+ * the free bytes (MTD_OPS_AUTO_OOB) instead of naming raw offsets, and only
+ * fall back to the raw view where MEMREAD is missing (kernel < 6.1).
+ */
+static int read_sectormirror(off_t pos)
+{
+	if (pos % writesize) {
+		/* continuation of the previous page: it carries no mirror */
+		return -1;
+	}
+
+#ifdef MEMREAD
+	if (have_memread) {
+		struct mtd_read_req req = {
+			.start = pos,
+			.len = 0,
+			.ooblen = TFFS_MIRROR_SIZE,
+			.usr_data = 0,
+			.usr_oob = (uintptr_t)mirrorbuf,
+			.mode = MTD_OPS_AUTO_OOB
+		};
+
+		/* EUCLEAN reports bitflips the ecc has already corrected */
+		if (ioctl(mtdfd, MEMREAD, &req) == 0 || errno == EUCLEAN) {
+			return 0;
+		}
+
+		if (errno != ENOTTY && errno != EOPNOTSUPP) {
+			return -1;
+		}
+
+		have_memread = false;
+	}
+#endif
+
+	if (read_sectoroob(pos)) {
+		return -1;
+	}
+
+	memcpy(mirrorbuf, oobbuf + TFFS_MIRROR_RAW_OFF, TFFS_MIRROR_SIZE);
+
+	return 0;
+}
+
 static inline uint32_t get_walk_size(uint32_t entry_len)
 {
 	return (entry_len + 3) & ~0x03;
@@ -200,9 +263,14 @@ static int find_entry(uint32_t id, struct tffs_entry *entry)
 			uint32_t read_len = read_uint32(readbuf, 0x04);
 			uint32_t read_rev = read_uint32(readbuf, 0x0c);
 			if (read_oob_sector_health) {
-				uint32_t oob_id = read_uint32(oobbuf, 0x02);
-				uint32_t oob_len = read_uint32(oobbuf, 0x06);
-				uint32_t oob_rev = read_uint32(oobbuf, 0x0a);
+				if (read_sectormirror(pos)) {
+					fprintf(stderr, "Warning: sector has no readable metadata mirror\n");
+					continue;
+				}
+
+				uint32_t oob_id = read_uint32(mirrorbuf, 0x00);
+				uint32_t oob_len = read_uint32(mirrorbuf, 0x04);
+				uint32_t oob_rev = read_uint32(mirrorbuf, 0x08);
 
 				if (oob_id != read_id || oob_len != read_len || oob_rev != read_rev) {
 					fprintf(stderr, "Warning: sector has inconsistent metadata\n");
@@ -403,15 +471,29 @@ static int check_block(off_t pos, uint32_t sector)
 		fprintf(stderr, "Warning: block without magic header. Skipping block\n");
 		return 0;
 	}
-	if (read_uint32(readbuf, 0x0c) != TFFS_SECTORS_PER_PAGE) {
-		fprintf(stderr, "Warning: block with wrong number of sectors per page. Skipping block\n");
+	if (read_uint32(readbuf, 0x0c) != TFFS_TYPE_MTDNAND) {
+		fprintf(stderr, "Warning: block is not a nand block. Skipping block\n");
 		return 0;
 	}
 
-	uint32_t num_hdr_bad = read_uint32(readbuf, 0x0c);
+	uint32_t num_hdr_bad = read_uint32(readbuf, 0x1c);
+	if (num_hdr_bad > TFFS_MAX_BAD_PAGES) {
+		fprintf(stderr, "Warning: block header lists too many bad pages. Skipping block\n");
+		return 0;
+	}
+
 	for (uint32_t i = 0; i < num_hdr_bad; i++) {
-		uint32_t bad = sector + read_uint64(readbuf, 0x1c + sizeof(uint64_t)*i);
-		sector_mark_bad(bad);
+		/*
+		 * The list holds page offsets into the block. A page the loader
+		 * had already marked bad is recorded with its address moved
+		 * outside its block, which keeps the loader from marking it
+		 * again. Undo that move here.
+		 */
+		uint64_t bad = read_uint64(readbuf, 0x20 + sizeof(uint64_t)*i) % blocksize;
+
+		for (uint64_t off = bad; off < bad + writesize; off += TFFS_SECTOR_SIZE) {
+			sector_mark_bad(sector + off / TFFS_SECTOR_SIZE);
+		}
 	}
 
 	return 1;
@@ -426,6 +508,8 @@ static int scan_mtd(void)
 	}
 
 	blocksize = info.erasesize;
+	/* a device that reports no page size has no partially covered pages */
+	writesize = info.writesize ? info.writesize : TFFS_SECTOR_SIZE;
 
 	num_sectors = info.size / TFFS_SECTOR_SIZE;
 	sectors = malloc((num_sectors + 7) / 8);
