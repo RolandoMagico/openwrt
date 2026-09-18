@@ -57,9 +57,10 @@
 #define TFFS_TYPE_MTDNAND	0x0002
 #define TFFS_MAX_BAD_PAGES	0x0004
 #define TFFS_ENTRY_HEADER_SIZE	0x18
-#define TFFS_MAXIMUM_SEGMENT_SIZE	(0x800 - TFFS_ENTRY_HEADER_SIZE)
+#define TFFS_BLOCK_HEADER_SIZE	0x40
 
-#define TFFS_SECTOR_SIZE 0x0800
+/* the page size to assume for a device that does not report one */
+#define TFFS_DEFAULT_WRITESIZE 0x0800
 #define TFFS_SECTOR_OOB_SIZE 0x0040
 
 /* {id, len, rev}, mirrored from the sector header into the spare area */
@@ -76,11 +77,12 @@ static bool show_all = false;
 static bool print_all_key_names = false;
 static bool read_oob_sector_health = false;
 static bool swap_bytes = false;
-static uint8_t readbuf[TFFS_SECTOR_SIZE];
+static uint8_t *readbuf;
 static uint8_t oobbuf[TFFS_SECTOR_OOB_SIZE];
 static uint8_t mirrorbuf[TFFS_MIRROR_SIZE];
 static uint32_t blocksize;
 static uint32_t writesize;
+static uint32_t sector_size;
 static int mtdfd;
 #ifdef MEMREAD
 static bool have_memread = true;
@@ -144,11 +146,11 @@ static inline uint64_t read_uint64(void *buf, ptrdiff_t off)
 
 static int read_sector(off_t pos)
 {
-	if (pread(mtdfd, readbuf, TFFS_SECTOR_SIZE, pos) != TFFS_SECTOR_SIZE) {
+	if (pread(mtdfd, readbuf, sector_size, pos) != (ssize_t)sector_size) {
 		return -1;
 	}
 
-	sector_ids[pos / TFFS_SECTOR_SIZE] = read_uint32(readbuf, 0x00);
+	sector_ids[pos / sector_size] = read_uint32(readbuf, 0x00);
 
 	return 0;
 }
@@ -238,7 +240,7 @@ static int find_entry(uint32_t id, struct tffs_entry *entry)
 
 	off_t pos = 0;
 	uint8_t block_end = 0;
-	for (uint32_t sector = 0; sector < num_sectors; sector++, pos += TFFS_SECTOR_SIZE) {
+	for (uint32_t sector = 0; sector < num_sectors; sector++, pos += sector_size) {
 		if (block_end) {
 			if (pos % blocksize == 0) {
 				block_end = 0;
@@ -255,7 +257,7 @@ static int find_entry(uint32_t id, struct tffs_entry *entry)
 					continue;
 			}
 
-			if (read_sectoroob(pos) || read_sector(pos)) {
+			if (read_sector(pos)) {
 				fprintf(stderr, "ERROR: sector isn't readable, but has been previously!\n");
 				exit(EXIT_FAILURE);
 			}
@@ -282,7 +284,7 @@ static int find_entry(uint32_t id, struct tffs_entry *entry)
 				block_end = 1;
 				continue;
 			}
-			if (read_len > TFFS_MAXIMUM_SEGMENT_SIZE) {
+			if (read_len > sector_size - TFFS_ENTRY_HEADER_SIZE) {
 				fprintf(stderr, "Warning: segment is longer than possible\n");
 				continue;
 			}
@@ -475,6 +477,10 @@ static int check_block(off_t pos, uint32_t sector)
 		fprintf(stderr, "Warning: block is not a nand block. Skipping block\n");
 		return 0;
 	}
+	if (read_uint32(readbuf, 0x18) != writesize / sector_size) {
+		fprintf(stderr, "Warning: block has an incompatible sector layout. Skipping block\n");
+		return 0;
+	}
 
 	uint32_t num_hdr_bad = read_uint32(readbuf, 0x1c);
 	if (num_hdr_bad > TFFS_MAX_BAD_PAGES) {
@@ -491,12 +497,46 @@ static int check_block(off_t pos, uint32_t sector)
 		 */
 		uint64_t bad = read_uint64(readbuf, 0x20 + sizeof(uint64_t)*i) % blocksize;
 
-		for (uint64_t off = bad; off < bad + writesize; off += TFFS_SECTOR_SIZE) {
-			sector_mark_bad(sector + off / TFFS_SECTOR_SIZE);
+		for (uint64_t off = bad; off < bad + writesize; off += sector_size) {
+			sector_mark_bad(sector + off / sector_size);
 		}
 	}
 
 	return 1;
+}
+
+/*
+ * A TFFS sector is not a fixed 0x800 bytes: AVM's driver divides every nand
+ * page into sect_per_pg of them, so a sector is writesize / sect_per_pg bytes
+ * and its size is a property of the flash. Every AVM release caps sect_per_pg
+ * at 1 (MAX_SUBPAGE_NUM in their tffs nand driver) and refuses a block whose
+ * header disagrees with the geometry it derived, which makes a sector exactly
+ * one page: 0x800 on the 2 KiB-page parts this tool was written against, but
+ * 0x1000 on a 4 KiB-page one. Take the divisor from the first block header that
+ * has it rather than assuming either size.
+ */
+static uint32_t probe_sector_size(uint32_t size, uint32_t erasesize)
+{
+	uint8_t buf[TFFS_BLOCK_HEADER_SIZE];
+
+	for (off_t pos = 0; pos < size; pos += erasesize) {
+		if (pread(mtdfd, buf, sizeof(buf), pos) != (ssize_t)sizeof(buf)) {
+			continue;
+		}
+		if (read_uint64(buf, 0x00) != TFFS_BLOCK_HEADER_MAGIC) {
+			continue;
+		}
+
+		uint32_t sect_per_pg = read_uint32(buf, 0x18);
+
+		if (!sect_per_pg || writesize % sect_per_pg) {
+			continue;
+		}
+
+		return writesize / sect_per_pg;
+	}
+
+	return 0;
 }
 
 static int scan_mtd(void)
@@ -509,12 +549,23 @@ static int scan_mtd(void)
 
 	blocksize = info.erasesize;
 	/* a device that reports no page size has no partially covered pages */
-	writesize = info.writesize ? info.writesize : TFFS_SECTOR_SIZE;
+	writesize = info.writesize ? info.writesize : TFFS_DEFAULT_WRITESIZE;
 
-	num_sectors = info.size / TFFS_SECTOR_SIZE;
+	sector_size = probe_sector_size(info.size, info.erasesize);
+	if (!sector_size) {
+		/*
+		 * Nothing here carries a usable header. Assume the one sector
+		 * per page every AVM release writes, so that the scan below
+		 * still reports what it did find.
+		 */
+		sector_size = writesize;
+	}
+
+	num_sectors = info.size / sector_size;
+	readbuf = malloc(sector_size);
 	sectors = malloc((num_sectors + 7) / 8);
 	sector_ids = calloc(num_sectors, sizeof(uint32_t));
-	if (!sectors || !sector_ids) {
+	if (!readbuf || !sectors || !sector_ids) {
 		fprintf(stderr, "ERROR: memory allocation failed!\n");
 		exit(EXIT_FAILURE);
 	}
@@ -522,7 +573,7 @@ static int scan_mtd(void)
 
 	uint32_t sector = 0, valid_blocks = 0;
 	uint8_t block_ok = 0;
-	for (off_t pos = 0; pos < info.size; sector++, pos += TFFS_SECTOR_SIZE) {
+	for (off_t pos = 0; pos < info.size; sector++, pos += sector_size) {
 		if (pos % info.erasesize == 0) {
 			block_ok = check_block(pos, sector);
 			/* first sector of the block contains metadata
@@ -664,6 +715,7 @@ out_free_entry:
 out_free_sectors:
 	free(sector_ids);
 	free(sectors);
+	free(readbuf);
 out_close:
 	close(mtdfd);
 out:
