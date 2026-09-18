@@ -1,0 +1,166 @@
+From: Grische <github@grische.xyz>
+Date: Sat, 29 Aug 2026 09:26:05 +0200
+Subject: ath10k: keep the firmware regdomain when the calibration declares none
+
+Devices which ship calibration data with a zeroed regulatory domain field
+report it in the WMI SERVICE_READY event as "eeprom_rd 0x0" and leave the
+choice of the firmware regulatory domain to the driver. ath10k derives it
+from ath_common, so as soon as a country is configured the shared ath regd
+code maps that country onto a regional SKU and ath10k hands the firmware
+its conformance test limit (CTL) selection along with it:
+
+  wmi pdev regdomain rd 37 rd2g 37 rd5g 37 ctl2g 30 ctl5g 30 dfs_region 2
+
+ctl2g 0x30 (CTL_ETSI) directs the firmware to apply the ETSI 2.4 GHz CTL
+table from the board data file. On the AVM FRITZ!Box 7590 (two QCA9984,
+firmware 10.4-3.9.0.2) that table is not usable and the firmware applies
+it without validation: the 2.4 GHz gain state ends up corrupted, the per
+chain noise floor lands 13-33 dB hot and asymmetric, energy detect asserts
+on an idle channel for ~99.9% of the airtime, the transmitter never keys
+and the firmware cycles DEV_TX_TIMEOUT -> DEV_RESET every 0.7 s forever.
+The state survives interface bounces, firmware redownload and cold boots,
+because the same regdomain is reprogrammed at every firmware start. Three
+different board data files including the vendor's own behave identically,
+so this is a property of the board data lineage, not of one file. The
+5 GHz radio of the same device takes ctl5g 0x30 without trouble; only the
+2.4 GHz table is broken.
+
+When the calibration data declares no regulatory domain, program the
+firmware with the regpair table's own "no regulatory domain" entry
+(NO_ENUMRD, CTL DEBUG_REG_DMN) rather than with whatever a country hint
+remapped ath_common to, on every regulatory update and across firmware
+restarts. Regulatory enforcement stays with cfg80211 and mac80211, which
+apply the configured country's channels and power limits host side.
+
+Programming a *world* SKU instead - for instance the FCC3_FCCA pair that
+ath/regd.c derives for rd 0 by way of its CTRY_UNITED_STATES fallback -
+cures the 2.4 GHz jam just as well, but is not a correct fix: this
+firmware validates the channel of every vdev start against the programmed
+regulatory domain, so under an 11 channel domain a device configured for
+an ETSI country loses channels 12 and 13 device side. The radio is then
+healthy, but starting an AP on channel 13 fails with
+"vdev-start-response reports status error: 1" (chan-invalid) and the
+interface never comes up. The no-regdomain entry does not constrain the
+channel set, which is what makes it the right thing to send.
+
+Regulatory enforcement itself does not change. cfg80211 and mac80211 keep
+applying the configured country's channel set and power limits host side
+(a device configured for DE keeps its 13 channels at the ETSI limits), and
+the DFS pattern detector keeps following the country as well. The
+dfs_region argument of WMI_PDEV_SET_REGDOMAIN is therefore deliberately
+left country driven: it selects the firmware's radar detection rules, not
+a board data power table, and pinning it would weaken DFS behaviour for no
+benefit.
+
+The change is scoped to devices that explicitly declare no regional
+binding: the pin is only armed when the calibration regdomain is zero and
+no regdomain was derived from elsewhere either, so devices with a real
+calibration regdomain and devices which got theirs from ACPI/WRDD keep the
+current behaviour.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+Forwarded: no
+
+--- a/drivers/net/wireless/ath/ath10k/core.h
++++ b/drivers/net/wireless/ath/ath10k/core.h
+@@ -1033,6 +1033,13 @@ struct ath10k {
+ 	u32 hw_min_tx_power;
+ 	u32 hw_max_tx_power;
+ 	u32 hw_eeprom_rd;
++
++	/* Regulatory pair the firmware is pinned to, set only on devices whose
++	 * calibration data declares no regulatory domain (hw_eeprom_rd == 0).
++	 * See ath10k_mac_get_fw_regpair().
++	 */
++	const struct reg_dmn_pair_mapping *cal_regpair;
++
+ 	u32 ht_cap_info;
+ 	u32 vht_cap_info;
+ 	u32 vht_supp_mcs;
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -3544,9 +3544,50 @@ ath10k_mac_get_dfs_region(enum nl80211_d
+ 	return WMI_UNINIT_DFS_DOMAIN;
+ }
+ 
++/* The "no regulatory domain" entry of the shared regpair table, spelled out
++ * here because that table (regd_common.h) is private to ath/regd.c and defines
++ * static data, so it cannot be included from ath10k:
++ *
++ *	regDomainPairs[0] = { NO_ENUMRD, DEBUG_REG_DMN, DEBUG_REG_DMN }
++ *
++ * ath/regd.c never hands this entry out - ath_get_regpair() returns NULL for
++ * NO_ENUMRD, and for calibration data that declares no domain __ath_regd_init()
++ * substitutes the United States regpair instead.
++ */
++static const struct reg_dmn_pair_mapping ath10k_regpair_no_enumrd = {
++	.reg_domain	= 0x0000,	/* NO_ENUMRD */
++	.reg_5ghz_ctl	= 0x01ff,	/* DEBUG_REG_DMN */
++	.reg_2ghz_ctl	= 0x01ff,	/* DEBUG_REG_DMN */
++};
++
++/* Pick the regulatory pair the firmware is programmed with.
++ *
++ * Devices whose calibration data declares no regulatory domain must not be
++ * handed a country derived regional domain, see ath10k_mac_register(). For
++ * those the no-regdomain pair is programmed instead of the pair the country
++ * hint remapped ath_common to. Only what the firmware is told is pinned this
++ * way, the channel list and the power limits keep coming from cfg80211 and are
++ * unaffected.
++ */
++static const struct reg_dmn_pair_mapping *ath10k_mac_get_fw_regpair(struct ath10k *ar)
++{
++	const struct reg_dmn_pair_mapping *regpair = ar->ath_common.regulatory.regpair;
++
++	if (!ar->cal_regpair || ar->cal_regpair == regpair)
++		return regpair;
++
++	ath10k_info(ar, "calibration declares no regdomain, pinning fw regdomain 0x%02x (ctl2g 0x%02x ctl5g 0x%02x) instead of 0x%02x, host regulatory stays in force\n",
++		    ar->cal_regpair->reg_domain,
++		    ar->cal_regpair->reg_2ghz_ctl,
++		    ar->cal_regpair->reg_5ghz_ctl,
++		    regpair ? regpair->reg_domain : 0);
++
++	return ar->cal_regpair;
++}
++
+ static void ath10k_regd_update(struct ath10k *ar)
+ {
+-	struct reg_dmn_pair_mapping *regpair;
++	const struct reg_dmn_pair_mapping *regpair;
+ 	int ret;
+ 	enum wmi_dfs_region wmi_dfs_reg;
+ 	enum nl80211_dfs_regions nl_dfs_reg;
+@@ -3557,7 +3598,11 @@ static void ath10k_regd_update(struct at
+ 	if (ret)
+ 		ath10k_warn(ar, "failed to update channel list: %d\n", ret);
+ 
+-	regpair = ar->ath_common.regulatory.regpair;
++	regpair = ath10k_mac_get_fw_regpair(ar);
++	if (!regpair) {
++		ath10k_warn(ar, "failed to set pdev regdomain: no regulatory pair\n");
++		return;
++	}
+ 
+ 	if (IS_ENABLED(CPTCFG_ATH10K_DFS_CERTIFIED) && ar->dfs_detector) {
+ 		nl_dfs_reg = ar->dfs_detector->region;
+@@ -10361,6 +10406,17 @@ int ath10k_mac_register(struct ath10k *a
+ 		goto err_dfs_detector_exit;
+ 	}
+ 
++	/* Calibration data which declares no regulatory domain states that the
++	 * device is not bound to a region, and the board data of such devices is
++	 * not guaranteed to carry usable CTL tables. Pass that statement on to
++	 * the firmware unchanged instead of letting a configured country select a
++	 * regional domain for it. Regulatory enforcement is not affected,
++	 * cfg80211 keeps applying the country's channel and power limits host
++	 * side.
++	 */
++	if (ar->hw_eeprom_rd == 0 && ar->ath_common.regulatory.current_rd == 0)
++		ar->cal_regpair = &ath10k_regpair_no_enumrd;
++
+ 	if (test_bit(WMI_SERVICE_SPOOF_MAC_SUPPORT, ar->wmi.svc_map)) {
+ 		ar->hw->wiphy->features |=
+ 			NL80211_FEATURE_SCAN_RANDOM_MAC_ADDR;
