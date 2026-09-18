@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 17:09:36 +0200
+Subject: PCI: intel-gw: pass the chip-top byte-swap offset as a syscon
+ argument
+
+The two PHY drivers that share the chip-top syscon with this controller
+reach their registers as
+
+	intel,syscon = <&chiptop 0x120>;
+
+while the three root complexes name the same block with no argument and
+keep the offset of the register they write to themselves, as
+PCIE_CHIPTOP_ENDIAN. One provider addressed in two different ways from
+one device tree is the first thing a reader asks about, and only one of
+the two forms says where the driver is going to write.
+
+The root complexes were left out when the PHY halves were converted
+because the lookup here has to tolerate the property being absent
+altogether: intel,lgm-pcie has no chip-top byte swapper and no
+intel,syscon, so syscon_regmap_lookup_by_phandle_args() would have turned
+that SoC's normal state into a probe failure, and the optional variant
+that tolerates absence could not carry an argument. The preceding commit
+adds the combination that can do both.
+
+Absence keeps behaving as before -- NULL regmap, endian setup skipped,
+offset never read. What changes is that a device tree which does name the
+syscon now has to say where in it, because the property is parsed with a
+fixed argument count: the old zero-argument form is rejected by
+of_parse_phandle_with_fixed_args() and fails the probe rather than
+quietly configuring register 0x4c on a chip whose swappers are elsewhere.
+Mixed arity on one provider is fine and is already the situation -- the
+count is the caller's, so &chiptop still needs no #syscon-cells.
+
+Every use of the offset moves together: the read-modify-write, the
+read-back and the line it logs. Converting only the lookup compiles,
+boots and behaves exactly as before while silently ignoring the argument
+the device tree now supplies, which is the way this change is easiest to
+get wrong. The define is deleted so there is nothing left to fall back
+to.
+
+intel,inbound-shift and intel,outbound-shift stay separate properties.
+They are bit positions inside the word, not offsets into the syscon, and
+one of them may yet turn out to live in a different word on a future
+member of the family; folding all three into one property would make it
+mean two unrelated things and would have to be undone.
+
+The comment about not being able to tell an absent property from a failed
+lookup goes away with it. That was true of
+syscon_regmap_lookup_by_phandle_optional(), which reports both as NULL;
+the _args() form this now builds on reports an absent property as -ENOENT
+and an unresolvable phandle as -ENODEV, and only the first becomes NULL.
+
+The DT half has to move in the same commit: the blob is built into the
+kernel image on this platform, so a driver that reads one form and a dtsi
+that spells the other never coexist in a bootable image. Board files are
+unaffected; the property is set once per instance at SoC level. Doing it
+before the node is documented is close to free, and stops being free the
+moment the zero-argument form is published as a binding.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index fc41a0668e7b..ca9ee9de2c6b 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -321,7 +321,7 @@ pcie0: pcie@18900000 {
+ 		phys = <&pcie_phy0>;
+ 		phy-names = "pcie";
+ 
+-		intel,syscon = <&chiptop>;
++		intel,syscon = <&chiptop 0x4c>;
+ 		intel,inbound-shift = <5>;
+ 		intel,outbound-shift = <4>;
+ 		status = "disabled";
+@@ -356,7 +356,7 @@ pcie1: pcie@18400000 {
+ 		phys = <&pcie_phy1>;
+ 		phy-names = "pcie";
+ 
+-		intel,syscon = <&chiptop>;
++		intel,syscon = <&chiptop 0x4c>;
+ 		intel,inbound-shift = <9>;
+ 		intel,outbound-shift = <8>;
+ 		status = "disabled";
+@@ -391,7 +391,7 @@ pcie2: pcie@18e00000 {
+ 		phys = <&pcie_phy2>;
+ 		phy-names = "pcie";
+ 
+-		intel,syscon = <&chiptop>;
++		intel,syscon = <&chiptop 0x4c>;
+ 		intel,inbound-shift = <13>;
+ 		intel,outbound-shift = <12>;
+ 		status = "disabled";
+diff --git a/drivers/pci/controller/dwc/pcie-intel-gw.c b/drivers/pci/controller/dwc/pcie-intel-gw.c
+index 9be70d5fc536..26f7761cc85d 100644
+--- a/drivers/pci/controller/dwc/pcie-intel-gw.c
++++ b/drivers/pci/controller/dwc/pcie-intel-gw.c
+@@ -62,14 +62,6 @@
+ 	PCIE_APP_IRN_BW_MGT | PCIE_APP_IRN_LINK_AUTO_BW_STAT | \
+ 	PCIE_APP_IRN_INTX)
+ 
+-/*
+- * Byte-swap control for the three xRX500 root complexes, in the chiptop
+- * syscon rather than in the controller itself. One bit per direction per
+- * RC; which bits belong to which RC is described by "intel,inbound-shift"
+- * and "intel,outbound-shift" in the devicetree.
+- */
+-#define PCIE_CHIPTOP_ENDIAN		0x4c
+-
+ /* xRX500 decodes its 8 MiB config window with only three bits of bus number */
+ #define PCIE_XRX500_CFG_BUS(x)		(((x) & 0x7) << 20)
+ #define PCIE_XRX500_CFG_DEV(x)		(((x) & 0x1f) << 15)
+@@ -107,6 +99,7 @@ struct intel_pcie {
+ 	struct reset_control	*core_rst;
+ 	struct phy		*phy;
+ 	struct regmap		*syscon;
++	unsigned int		endian_off;
+ 	u32			inbound_shift;
+ 	u32			outbound_shift;
+ 	u32			inbound_swap;
+@@ -250,6 +243,12 @@ static struct pci_ops intel_pcie_xrx500_child_ops = {
+ 	.write		= pci_generic_config_write32,
+ };
+ 
++/*
++ * Byte-swap control for the xRX500 root complexes lives in the chiptop syscon
++ * rather than in the controller itself: one bit per direction per RC in a word
++ * that "intel,syscon" gives the offset of, at the bit positions
++ * "intel,inbound-shift" and "intel,outbound-shift" name.
++ */
+ static void intel_pcie_endian_setup(struct intel_pcie *pcie)
+ {
+ 	struct device *dev = pcie->pci.dev;
+@@ -273,11 +272,11 @@ static void intel_pcie_endian_setup(struct intel_pcie *pcie)
+ 			val |= BIT(pcie->outbound_shift);
+ 	}
+ 
+-	regmap_update_bits(pcie->syscon, PCIE_CHIPTOP_ENDIAN, mask, val);
++	regmap_update_bits(pcie->syscon, pcie->endian_off, mask, val);
+ 
+-	if (!regmap_read(pcie->syscon, PCIE_CHIPTOP_ENDIAN, &val))
++	if (!regmap_read(pcie->syscon, pcie->endian_off, &val))
+ 		dev_info(dev, "chiptop endian %#04x: %#010x (in bit %u swap %u, out bit %u swap %u)\n",
+-			 PCIE_CHIPTOP_ENDIAN, val, pcie->inbound_shift,
++			 pcie->endian_off, val, pcie->inbound_shift,
+ 			 pcie->inbound_swap, pcie->outbound_shift,
+ 			 pcie->outbound_swap);
+ }
+@@ -421,17 +420,14 @@ static int intel_pcie_get_resources(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
+-	pcie->syscon = syscon_regmap_lookup_by_phandle_optional(dev->of_node,
+-								"intel,syscon");
++	pcie->syscon = syscon_regmap_lookup_by_phandle_optional_args(dev->of_node,
++								     "intel,syscon",
++								     1,
++								     &pcie->endian_off);
+ 	if (IS_ERR(pcie->syscon))
+ 		return dev_err_probe(dev, PTR_ERR(pcie->syscon),
+ 				     "Failed to look up \"intel,syscon\"\n");
+ 
+-	/*
+-	 * syscon_regmap_lookup_by_phandle_optional() returns NULL both when
+-	 * the property is absent and when the lookup fails, so the two cases
+-	 * have to be told apart by checking for the property first.
+-	 */
+ 	if (pcie->soc->needs_endian_syscon && !pcie->syscon)
+ 		return dev_err_probe(dev, -EINVAL,
+ 				     "\"intel,syscon\" is required on this SoC\n");

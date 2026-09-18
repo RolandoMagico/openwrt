@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 2 Sep 2026 12:17:09 +0200
+Subject: leds: lgm-sso: keep the blink engine off for an LED that starts off
+
+sso_led_hw_cfg() sets the SSO_CON2 blink enable for every hw_blink LED,
+before it has looked at the brightness the device tree asked for and
+independently of it. A lamp declared default-state = "off" therefore
+comes up blinking: SSO_CPU bit N and a non-zero duty hand the pin to the
+duty engine, SSO_CON2 bit N starts it toggling, and on an active-low pin
+"off" is precisely the duty of 0xFF the engine needs. The rate is
+whatever the pin's blink registers hold -- for a pin below 24, where the
+shared rate field is never programmed, the reset value's 2 Hz.
+
+The driver's own bookkeeping does not know. desc->blinking is left at 0,
+so brightness reads 0 on a blinking lamp, and writing 0 to brightness --
+the obvious way to stop it -- matches neither branch of
+sso_led_brightness_set(): the "stop" branch wants desc->blinking set and
+the "start" branch wants a non-zero brightness. The engine keeps
+running. It takes a non-zero brightness and then a zero to get the
+bookkeeping and the hardware back in step.
+
+Enable the engine only for an LED that is meant to be on, and record
+that in desc->blinking so both branches start from the truth.
+
+No device tree in tree sets intel,sso-hw-blink, which is why this has
+gone unnoticed.
+
+Fixes: c3987cd2bca3 ("leds: lgm: Add LED controller driver for LGM SoC")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index 71db8c56d88d..ede959c4dc94 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -369,8 +369,15 @@ static void sso_led_hw_cfg(struct sso_led_priv *priv, struct sso_led *led)
+ 	/* set freq */
+ 	if (desc->hw_blink) {
+ 		sso_led_freq_set(priv, desc->pin, desc->freq_idx);
++		/*
++		 * The engine has to start out off for an LED that is off:
++		 * running it would blink a lamp the device tree asked to be
++		 * dark. Keep desc->blinking in step with the bit -- both
++		 * branches of sso_led_brightness_set() are gated on it.
++		 */
++		desc->blinking = desc->brightness != LED_OFF;
+ 		regmap_update_bits(priv->mmap, SSO_CON2, BIT(desc->pin),
+-				   1 << desc->pin);
++				   desc->blinking ? BIT(desc->pin) : 0);
+ 	}
+ 
+ 	if (desc->hw_trig)

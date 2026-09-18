@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:00:41 +0000
+Subject: irqchip/mips-gic: fix local timer/perfctr/fdc on single-cluster
+ systems
+
+Commit d1cb1437b785 ("irqchip/mips-gic: Prevent indirect access to
+clusters without CPU cores") added early returns to
+gic_mask_local_irq_all_vpes() and gic_unmask_local_irq_all_vpes(), and
+an "if (multicluster)" guard around the vo_map iteration in
+gic_irq_domain_map(), so that single-cluster systems skip the
+multi-cluster redirect-block iteration.
+
+A single-cluster system still needs its local VPE's vl_smask, vl_rmask
+and vl_map programmed, and now nothing does it. gic_cpu_startup() runs
+before request_irq(), so cd->map and cd->mask are still zero when
+gic_all_vpes_irq_cpu_online() programs the boot VPE; after request_irq()
+the unmask path returns immediately and never touches the local smask.
+The interrupt stays masked for good. With the timer that means
+calibrate_delay() spins forever on a jiffy that never arrives.
+
+The precondition is that the local interrupt is routed through the GIC
+domain at all. gic_get_c0_compare_int() returns the plain CP0 interrupt
+when gic_local_irq_is_routable(GIC_LOCAL_INT_TIMER) is false, and that
+is the common case, which is why the regression has not been widely
+reported: only a single-cluster part whose GIC does route the local
+timer, performance counter or FDC reaches this code.
+
+Restore the local-VPE register writes on single-cluster systems while
+preserving the multi-cluster redirect-block path, and populate cd->map
+and cd->mask unconditionally so secondary VPEs pick the correct state up
+from gic_all_vpes_irq_cpu_online() on their later cpu-online transition.
+
+Fixes: d1cb1437b785 ("irqchip/mips-gic: Prevent indirect access to clusters without CPU cores")
+Assisted-by: Claude:claude-opus-4-7
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/irqchip/irq-mips-gic.c b/drivers/irqchip/irq-mips-gic.c
+index 19a57c5e2b2e..d9405c7dfff2 100644
+--- a/drivers/irqchip/irq-mips-gic.c
++++ b/drivers/irqchip/irq-mips-gic.c
+@@ -512,13 +512,22 @@ static void gic_mask_local_irq_all_vpes(struct irq_data *d)
+ 	struct gic_all_vpes_chip_data *cd;
+ 	int intr, cpu;
+ 
+-	if (!mips_cps_multicluster_cpus())
+-		return;
+-
+ 	intr = GIC_HWIRQ_TO_LOCAL(d->hwirq);
+ 	cd = irq_data_get_irq_chip_data(d);
+ 	cd->mask = false;
+ 
++	/*
++	 * Single-cluster systems must still mask the IRQ on the currently
++	 * executing VPE; secondary VPEs pick the new mask state up via
++	 * gic_all_vpes_irq_cpu_online() as they come online. Multi-cluster
++	 * systems iterate to push the mask to all online VPEs through the
++	 * GIC redirect block.
++	 */
++	if (!mips_cps_multicluster_cpus()) {
++		write_gic_vl_rmask(BIT(intr));
++		return;
++	}
++
+ 	for_each_online_cpu_gic(cpu, &gic_lock)
+ 		write_gic_vo_rmask(BIT(intr));
+ }
+@@ -528,13 +537,15 @@ static void gic_unmask_local_irq_all_vpes(struct irq_data *d)
+ 	struct gic_all_vpes_chip_data *cd;
+ 	int intr, cpu;
+ 
+-	if (!mips_cps_multicluster_cpus())
+-		return;
+-
+ 	intr = GIC_HWIRQ_TO_LOCAL(d->hwirq);
+ 	cd = irq_data_get_irq_chip_data(d);
+ 	cd->mask = true;
+ 
++	if (!mips_cps_multicluster_cpus()) {
++		write_gic_vl_smask(BIT(intr));
++		return;
++	}
++
+ 	for_each_online_cpu_gic(cpu, &gic_lock)
+ 		write_gic_vo_smask(BIT(intr));
+ }
+@@ -701,6 +712,13 @@ static int gic_irq_domain_map(struct irq_domain *d, unsigned int virq,
+ 	if (mips_cps_multicluster_cpus()) {
+ 		for_each_online_cpu_gic(cpu, &gic_lock)
+ 			write_gic_vo_map(mips_gic_vx_map_reg(intr), map);
++	} else {
++		/*
++		 * On single-cluster systems gic_cpu_startup() runs on the
++		 * boot CPU only, so a secondary released by firmware never
++		 * unmasks its own local interrupts.
++		 */
++		write_gic_vl_map(mips_gic_vx_map_reg(intr), map);
+ 	}
+ 
+ 	return 0;

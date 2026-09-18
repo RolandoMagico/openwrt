@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 30 Aug 2026 21:25:47 +0200
+Subject: leds: lgm-sso: set the GPTC clock rate before deriving the blink
+ table
+
+sso_init_freq() fills priv->freq[] from priv->fpid_clkrate and
+priv->gptc_clkrate, but probe assigns priv->gptc_clkrate only after
+calling it. The five GPTC-derived ranks are therefore computed against
+zero, and stay zero for the life of the device.
+
+priv->freq[] is what maps a requested blink rate onto a hardware rank:
+sso_get_blink_rate_idx() returns the first entry that is at least the
+requested rate, and a zero entry can never satisfy that. Any rate that
+should land on the GPTC or GPTC high-speed source falls through to the
+-1 return instead, both callers clamp that to the last rank -- whose
+frequency is one of the zeroes -- and delay_to_freq_idx() goes on to
+compute 1000 / priv->freq[freq_idx].
+
+Move the assignment ahead of the call.
+
+Fixes: c3987cd2bca3 ("leds: lgm: Add LED controller driver for LGM SoC")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index 25725a4a330f..f66b7366a816 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -879,9 +879,8 @@ static int intel_sso_led_probe(struct platform_device *pdev)
+ 	INIT_LIST_HEAD(&priv->led_list);
+ 
+ 	platform_set_drvdata(pdev, priv);
+-	sso_init_freq(priv);
+-
+ 	priv->gptc_clkrate = DEF_GPTC_CLK_RATE;
++	sso_init_freq(priv);
+ 
+ 	ret = sso_led_dt_parse(priv);
+ 	if (ret)

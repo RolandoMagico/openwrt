@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 26 Aug 2026 12:29:11 +0200
+Subject: MIPS: intel-mips: take the device tree from the boot loader
+
+This platform carried a "Built-in device tree" choice with one entry per
+board, each selecting BUILTIN_DTB, so the blob the kernel ran on was
+fixed at compile time and a kernel built for one board could not boot
+another. Nothing about the hardware requires that. The boot loader on
+these boards hands the kernel an image with the DTB concatenated onto
+it, which is what CONFIG_MIPS_RAW_APPENDED_DTB exists to consume, and it
+is how lantiq and ralink have always delivered a device tree on this
+bus. Drop the choice and let the appended blob be the source, so one
+kernel binary serves every board in the family and the board identity
+travels with the image instead of with the .config.
+
+The three dtb targets become unconditional. They are built either way now;
+what changed is that nothing links one of them into vmlinux.
+
+BUILTIN_DTB has to go with the choice rather than stay behind as a
+default, and not only because nothing would select it any more. config
+MIPS does "select BUILTIN_DTB_ALL if BUILTIN_DTB", so leaving it enabled
+while the dtb-y list is unconditional would embed all three blobs at
+once. __dtb_start resolves to the first of them, easy350_anywan, and
+get_fdt() prefers a built-in blob over nothing -- so an FRITZ!Box 7560
+whose appended DTB failed to arrive would not fail, it would quietly
+come up believing it was an evaluation board. Removing the symbol
+removes that outcome.
+
+The remaining failure mode is the honest one. get_fdt() returns NULL
+when there is no appended blob and no UHI pointer, and
+plat_early_init_devtree() turns that into panic("no dtb found"). An
+image built without a DTB appended now says so.
+
+grx500_defconfig gains MIPS_RAW_APPENDED_DTB in place of its
+DTB_INTEL_MIPS_GRX500 line. Without it that defconfig would name no DTB
+source at all and would take the panic above -- before earlycon, so the
+board would look dead rather than diagnosed.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+index f30e986f42b7..9a0e2a6631a4 100644
+--- a/arch/mips/boot/dts/intel-mips/Makefile
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -1,4 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+-dtb-$(CONFIG_DTB_INTEL_MIPS_GRX500)	+= easy350_anywan.dtb
+-dtb-$(CONFIG_DTB_INTEL_MIPS_FRITZ7560)	+= seale_avm_fritz7560.dtb
+-dtb-$(CONFIG_DTB_INTEL_MIPS_FRITZ7590)	+= seale_avm_fritz7590.dtb
++dtb-y	+= easy350_anywan.dtb
++dtb-y	+= seale_avm_fritz7560.dtb
++dtb-y	+= seale_avm_fritz7590.dtb
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index c8777bb4bc31..6438d6a1b0f5 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -1,5 +1,5 @@
+ CONFIG_INTEL_MIPS=y
+-CONFIG_DTB_INTEL_MIPS_GRX500=y
++CONFIG_MIPS_RAW_APPENDED_DTB=y
+ CONFIG_CPU_MIPS32_R2=y
+ CONFIG_SCHED_SMT=y
+ # CONFIG_MIPS_MT_FPAFF is not set
+diff --git a/arch/mips/intel-mips/Kconfig b/arch/mips/intel-mips/Kconfig
+index f482e4458a81..dda06a35a790 100644
+--- a/arch/mips/intel-mips/Kconfig
++++ b/arch/mips/intel-mips/Kconfig
+@@ -22,28 +22,4 @@ config INTEL_MIPS_VMB_SMP
+ 	  Say Y unless you are booting this SoC from something other than the
+ 	  vendor boot chain.
+ 
+-choice
+-	prompt "Built-in device tree"
+-	help
+-	  Legacy bootloaders do not pass a DTB pointer to the kernel, so
+-	  if a "wrapper" is not being used, the kernel will need to include
+-	  a device tree that matches the target board.
+-
+-	  The builtin DTB will only be used if the firmware does not supply
+-	  a valid DTB.
+-
+-config DTB_INTEL_MIPS_GRX500
+-	bool "Intel MIPS GRX500 Board"
+-	select BUILTIN_DTB
+-
+-config DTB_INTEL_MIPS_FRITZ7560
+-	bool "AVM FRITZ!Box 7560"
+-	select BUILTIN_DTB
+-
+-config DTB_INTEL_MIPS_FRITZ7590
+-	bool "AVM FRITZ!Box 7590"
+-	select BUILTIN_DTB
+-
+-endchoice
+-
+ endif

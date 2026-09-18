@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:01:25 +0200
+Subject: MIPS: branch: read the branch instruction with a mode-aware accessor
+
+__compute_return_epc() fetches the branch whose delay slot faulted with a
+bare __get_user(). On an EVA kernel that expands to lwe, which performs the
+load with user access rights whatever mode the CPU is in, so it raises an
+address error for any kernel-range address. The only address this function
+ever hands it is regs->cp0_epc -- kernel text, whenever the fault being
+unwound came from the kernel.
+
+Every kernel-mode unaligned access in a branch delay slot is therefore
+fatal on EVA rather than emulated. do_ade() decodes the access and reaches
+compute_return_epc() to step past the branch; delay_slot() is set, so
+__compute_return_epc() runs and its lwe takes a nested AdEL on the very
+kernel text it was reading. The recursive do_ade() decodes that lwe as a
+spec3 lwe_op, and that arm of emulate_load_store_insn() exists only for a
+kernel accessing user memory, so it applies access_ok() unconditionally,
+rejects the kernel address and dies:
+
+  Unhandled kernel unaligned access[#1]:
+  epc   : 8050d1f4 __compute_return_epc+0x18/0x68
+  ra    : 80513b20 do_ade+0x410/0x854
+  Cause : 00800010 (ExcCode 04)
+  BadVA : 85f8b19c
+  Code: 30a20003  1440000c  00000000 <7ca5002f> 14400003  8fbf0014
+
+7ca5002f is "lwe a1,0(a1)", and BadVA is the cp0_epc of the outer fault --
+the branch this function had been asked to read. Captured on a MIPS
+interAptiv (GRX350) with CPU_MIPS32_3_5_EVA; the outer unaligned access was
+in module code and would have been emulated in silence on a non-EVA kernel.
+
+unaligned.c had the same problem and lost it in commit 45deb5faeb9e ("MIPS:
+uaccess: Remove get_fs/set_fs call sites"), which replaced the surrounding
+set_fs(KERNEL_DS) with the mode-aware helpers in access-helper.h; its own
+instruction fetch is now __get_inst32(&insn.word, pc, user). branch.c reads
+an instruction for the same reason from the same exception path and was not
+converted with it. Use the helper here as well, so a kernel-mode fetch goes
+through get_kernel_nofault() and only a user-mode fetch reaches the EVA
+accessors. The failure path is unchanged.
+
+The user-mode side does change slightly: __get_inst32() calls get_user()
+where this used to call __get_user(), so a user-mode cp0_epc now passes
+an access_ok() check before the fetch and returns -EFAULT rather than
+issuing an unchecked lwe if it is out of range. That matches what
+unaligned.c already does with the same helper, and cp0_epc is exception
+state rather than anything the caller vouched for, so the check is the
+right way round.
+
+Nothing changes for non-EVA builds beyond the pagefault_disable()
+pairing inside copy_from_kernel_nofault(): there user_lw() is
+kernel_lw() already, so both sides of __get_inst32() were emitting the
+same lw with the same exception-table fixup.
+
+Fixes: 45deb5faeb9e ("MIPS: uaccess: Remove get_fs/set_fs call sites")
+Cc: stable@vger.kernel.org
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/kernel/branch.c b/arch/mips/kernel/branch.c
+index 0216ff24c392..2a6ba5012e5a 100644
+--- a/arch/mips/kernel/branch.c
++++ b/arch/mips/kernel/branch.c
+@@ -20,6 +20,7 @@
+ #include <asm/ptrace.h>
+ #include <linux/uaccess.h>
+ 
++#include "access-helper.h"
+ #include "probes-common.h"
+ 
+ /*
+@@ -848,7 +849,6 @@ EXPORT_SYMBOL_GPL(__compute_return_epc_for_insn);
+ 
+ int __compute_return_epc(struct pt_regs *regs)
+ {
+-	unsigned int __user *addr;
+ 	long epc;
+ 	union mips_instruction insn;
+ 
+@@ -859,8 +859,7 @@ int __compute_return_epc(struct pt_regs *regs)
+ 	/*
+ 	 * Read the instruction
+ 	 */
+-	addr = (unsigned int __user *) epc;
+-	if (__get_user(insn.word, addr)) {
++	if (__get_inst32(&insn.word, (u32 *)epc, user_mode(regs))) {
+ 		force_sig(SIGSEGV);
+ 		return -EFAULT;
+ 	}

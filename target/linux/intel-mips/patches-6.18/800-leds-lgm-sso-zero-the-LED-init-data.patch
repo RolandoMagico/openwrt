@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 13:01:24 +0200
+Subject: leds: lgm-sso: zero the LED init data
+
+sso_create_led() declares struct led_init_data on the stack and then
+assigns three of its four fields. The fourth, the bool
+devname_mandatory, is left holding whatever was in that stack slot.
+
+led_compose_name() branches on it. For a child node that names a
+function and a colour rather than a label -- which is the only form
+that composes a name userspace can predict -- a false devname_mandatory
+gives "green:power" and a true one gives "lgm-sso:green:power". So the
+name a LED appears under in sysfs depends on stack contents at probe
+time, and can differ between two boots of the same image.
+
+That is not a cosmetic problem. OpenWrt's boot-progress plumbing
+composes the name it expects from the device tree alone, in
+get_dt_led(), and then writes to /sys/class/leds/<name>/... only if
+that path exists. A mismatch is silent: diag.sh runs, writes nothing
+and reports nothing.
+
+Zero the structure at declaration, as the sibling driver in this
+directory already does (leds-bcm63138.c). The false branch is then
+selected deterministically and the composed name is the DT's own
+colour and function.
+
+Fixes: c3987cd2bca3 ("leds: lgm: Add LED controller driver for LGM SoC")
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index 3d9ef9a54805..62a573637bd9 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -349,7 +349,7 @@ static int sso_create_led(struct sso_led_priv *priv, struct sso_led *led,
+ 			  struct fwnode_handle *child)
+ {
+ 	struct sso_led_desc *desc = &led->desc;
+-	struct led_init_data init_data;
++	struct led_init_data init_data = {};
+ 	int err;
+ 
+ 	init_data.fwnode = child;

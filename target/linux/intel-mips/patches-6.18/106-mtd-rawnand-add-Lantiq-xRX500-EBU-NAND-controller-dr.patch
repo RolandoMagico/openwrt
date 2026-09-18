@@ -1,0 +1,461 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:09:43 +0000
+Subject: mtd: rawnand: add Lantiq xRX500 EBU NAND controller driver
+
+Add a driver for the legacy External Bus Unit (EBU) NAND interface
+of the Lantiq / Intel xRX500 (GRX350 family) SoCs, as used e.g. by
+the AVM FRITZ!Box 7560.
+
+The driver is modeled on intel-nand-controller.c (the LGM HSNAND
+driver, which shares the EBU register block) with the high-speed
+NAND and DMA paths stripped: on xRX500 the EBU is a plain
+programmed-I/O NAND interface. Command/address/data dispatch is
+implemented through the modern exec_op API; CLE/ALE/CS are driven
+through address bits 2/3/4 of the chip-select-decoded NAND data
+window. The chip-select index and the data window base come from
+the device tree (the FRITZ!Box 7560 wires the flash to CS1 at
+physical 0x17c00000).
+
+Verified on FRITZ!Box 7560 hardware together with the Macronix
+on-die ECC support: identify, read, erase, program, readback.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/mtd/nand/raw/Kconfig b/drivers/mtd/nand/raw/Kconfig
+index 7408f34f0c68..ad1fa7321060 100644
+--- a/drivers/mtd/nand/raw/Kconfig
++++ b/drivers/mtd/nand/raw/Kconfig
+@@ -395,6 +395,15 @@ config MTD_NAND_INTEL_LGM
+ 	  Enables support for NAND Flash chips on Intel's LGM SoC.
+ 	  NAND flash controller interfaced through the External Bus Unit.
+ 
++config MTD_NAND_LANTIQ_XRX500
++	bool "Lantiq xRX500 (GRX350) EBU NAND controller"
++	depends on MIPS && OF && HAS_IOMEM
++	help
++	  Enables support for NAND Flash chips on the Lantiq / Intel xRX500
++	  (GRX350) family of SoCs, attached to the External Bus Unit (EBU)
++	  in legacy NAND mode. Used by the AVM FRITZ!Box 7560 and similar
++	  Lantiq-based boards. Uses the modern exec_op NAND API.
++
+ config MTD_NAND_ROCKCHIP
+ 	tristate "Rockchip NAND controller"
+ 	depends on ARCH_ROCKCHIP && HAS_IOMEM
+diff --git a/drivers/mtd/nand/raw/Makefile b/drivers/mtd/nand/raw/Makefile
+index 619760138d32..dbc471808e1e 100644
+--- a/drivers/mtd/nand/raw/Makefile
++++ b/drivers/mtd/nand/raw/Makefile
+@@ -54,6 +54,7 @@ obj-$(CONFIG_MTD_NAND_MESON)		+= meson_nand.o
+ obj-$(CONFIG_MTD_NAND_CADENCE)		+= cadence-nand-controller.o
+ obj-$(CONFIG_MTD_NAND_ARASAN)		+= arasan-nand-controller.o
+ obj-$(CONFIG_MTD_NAND_INTEL_LGM)	+= intel-nand-controller.o
++obj-$(CONFIG_MTD_NAND_LANTIQ_XRX500)	+= lantiq-xrx500-nand.o
+ obj-$(CONFIG_MTD_NAND_ROCKCHIP)		+= rockchip-nand-controller.o
+ obj-$(CONFIG_MTD_NAND_PL35X)		+= pl35x-nand-controller.o
+ obj-$(CONFIG_MTD_NAND_RENESAS)		+= renesas-nand-controller.o
+diff --git a/drivers/mtd/nand/raw/lantiq-xrx500-nand.c b/drivers/mtd/nand/raw/lantiq-xrx500-nand.c
+new file mode 100644
+index 000000000000..806addc29129
+--- /dev/null
++++ b/drivers/mtd/nand/raw/lantiq-xrx500-nand.c
+@@ -0,0 +1,398 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 Grische <github@grische.xyz>
++ *
++ * Lantiq / Intel xRX500 (GRX350 family) EBU NAND controller driver.
++ *
++ * Modeled on drivers/mtd/nand/raw/intel-nand-controller.c (LGM HSNAND) with
++ * the high-speed NAND (HSNAND) register block and DMA paths stripped out:
++ * the xRX500 EBU is the legacy External Bus Unit NAND interface, not the LGM
++ * HSNAND block. Command/address/data dispatch goes through the modern
++ * nand_controller_ops .exec_op API; signals (CLE/ALE/CS) are selected by
++ * driving address bits 2/3/4 of the CS-decoded NAND address window.
++ */
++
++#include <linux/bitops.h>
++#include <linux/err.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/types.h>
++
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/nand.h>
++#include <linux/mtd/rawnand.h>
++
++/* EBU register block ("ebunand" resource) - identical layout to LGM EBU. */
++#define EBU_CLC			0x000
++#define EBU_CLC_RST		0x00000000u
++
++#define EBU_ADDR_SEL(n)		(0x020 + (n) * 4)
++/* 5 bits 26:22 included for comparison in the ADDR_SELx */
++#define EBU_ADDR_MASK(x)	((x) << 4)
++#define EBU_ADDR_SEL_REGEN	0x1
++
++#define EBU_BUSCON(n)		(0x060 + (n) * 4)
++#define EBU_BUSCON_CMULT_V4	0x1
++#define EBU_BUSCON_RECOVC(n)	((n) << 2)
++#define EBU_BUSCON_HOLDC(n)	((n) << 4)
++#define EBU_BUSCON_WAITRDC(n)	((n) << 6)
++#define EBU_BUSCON_WAITWRC(n)	((n) << 8)
++#define EBU_BUSCON_BCGEN_CS	0x0
++#define EBU_BUSCON_BCGEN_RES	(0x3 << 12)
++#define EBU_BUSCON_SETUP_EN	BIT(22)
++/*
++ * Write-disable bit. If asserted by an earlier boot stage, the EBU
++ * silently drops subsequent writes to its own register window — the
++ * driver must clear it before programming BUSCON / ADDSEL.
++ */
++#define EBU_BUSCON_WRDIS	BIT(31)
++/*
++ * ALE-cycle count for the CS=0 path on xRX500: 2 cycles in BUSCON0
++ * bits 14-15. Matches the value used by the older xway_nand.c driver
++ * for the same EBU programming model on vr9/xrx200.
++ */
++#define EBU_BUSCON_ALEC		(2 << 14)
++
++#define EBU_CON			0x0B0
++#define EBU_CON_NANDM_EN	BIT(0)
++#define EBU_CON_NANDM_DIS	0x0
++#define EBU_CON_CSMUX_E_EN	BIT(1)
++#define EBU_CON_ALE_P_LOW	BIT(2)
++#define EBU_CON_CLE_P_LOW	BIT(3)
++#define EBU_CON_CS_P_LOW	BIT(4)
++#define EBU_CON_SE_P_LOW	BIT(5)
++#define EBU_CON_WP_P_LOW	BIT(6)
++#define EBU_CON_PRE_P_LOW	BIT(7)
++#define EBU_CON_IN_CS_S(n)	((n) << 8)
++#define EBU_CON_OUT_CS_S(n)	((n) << 10)
++#define EBU_CON_CE		BIT(20)
++
++#define EBU_WAIT		0x0B4
++#define EBU_WAIT_RDBY		BIT(0)
++#define EBU_WAIT_WR_C		BIT(3)
++
++/*
++ * CS-strobe address-bit constants. On the xRX500 EBU the NAND command/address/
++ * data lines are selected by the low-order bits of the address used to access
++ * the CS-decoded window: bit 2 = ALE, bit 3 = CLE, bit 4 = CS. These are EBU
++ * legacy address bits and intentionally NOT prefixed with HSNAND_ - the LGM
++ * HSNAND register block is not present on this controller.
++ */
++#define NAND_ALE_OFFS		BIT(2)
++#define NAND_CLE_OFFS		BIT(3)
++#define NAND_CS_OFFS		BIT(4)
++
++/*
++ * Conservative BUSCON1 timing word matching xway_nand.c's proven baseline.
++ * Tuning to the actual EBU clock can be added later via .setup_interface
++ * deriving from nand_get_sdr_timings.
++ */
++#define XRX500_BUSCON_DEFAULT	(EBU_BUSCON_SETUP_EN | \
++				 EBU_BUSCON_BCGEN_RES | \
++				 EBU_BUSCON_WAITWRC(2) | \
++				 EBU_BUSCON_WAITRDC(2) | \
++				 EBU_BUSCON_HOLDC(1) | \
++				 EBU_BUSCON_RECOVC(1) | \
++				 EBU_BUSCON_CMULT_V4)
++
++struct xrx500_nand_host {
++	struct nand_controller controller;
++	struct nand_chip chip;
++	struct device *dev;
++	void __iomem *ebu;		/* EBU register block */
++	void __iomem *chipaddr;		/* CS-decoded NAND address window */
++	u32 cs;
++};
++
++static inline struct xrx500_nand_host *nand_to_xrx500(struct nand_chip *chip)
++{
++	return container_of(chip, struct xrx500_nand_host, chip);
++}
++
++static int xrx500_nand_waitrdy(struct nand_chip *chip, u32 timeout_us)
++{
++	struct xrx500_nand_host *host = nand_to_xrx500(chip);
++	u32 status;
++
++	return readl_poll_timeout(host->ebu + EBU_WAIT, status,
++				  (status & EBU_WAIT_RDBY) ||
++				  (status & EBU_WAIT_WR_C),
++				  20, timeout_us);
++}
++
++static void xrx500_nand_writeb(struct nand_chip *chip, u32 offset, u8 value)
++{
++	struct xrx500_nand_host *host = nand_to_xrx500(chip);
++
++	writeb(value, host->chipaddr + offset);
++	/*
++	 * After every byte the EBU asserts WR_C (write/read complete) when it
++	 * has finished latching. Poll briefly so the next strobe doesn't race
++	 * the EBU state machine.
++	 */
++	xrx500_nand_waitrdy(chip, 1000);
++}
++
++static u8 xrx500_nand_readb(struct nand_chip *chip)
++{
++	struct xrx500_nand_host *host = nand_to_xrx500(chip);
++	u8 val;
++
++	val = readb(host->chipaddr + NAND_CS_OFFS);
++	xrx500_nand_waitrdy(chip, 1000);
++	return val;
++}
++
++static void xrx500_nand_read_buf(struct nand_chip *chip, u8 *buf,
++				 unsigned int len)
++{
++	unsigned int i;
++
++	for (i = 0; i < len; i++)
++		buf[i] = xrx500_nand_readb(chip);
++}
++
++static void xrx500_nand_write_buf(struct nand_chip *chip, const u8 *buf,
++				  unsigned int len)
++{
++	unsigned int i;
++
++	for (i = 0; i < len; i++)
++		xrx500_nand_writeb(chip, NAND_CS_OFFS, buf[i]);
++}
++
++static int xrx500_nand_attach_chip(struct nand_chip *chip)
++{
++	struct mtd_info *mtd = nand_to_mtd(chip);
++
++	/*
++	 * Leave chip->ecc.engine_type alone: the chip DT node declares
++	 * nand-ecc-engine = "on-die" for the MX30LF1GE8AB. We only install
++	 * a conservative large-page OOB layout if no other layer (manufacturer
++	 * ops, NAND core fallback, ...) has already provided one. An
++	 * unconditional override would clobber a manufacturer-installed
++	 * layout for the on-die-ECC case.
++	 */
++	if (!mtd->ooblayout)
++		mtd_set_ooblayout(mtd, nand_get_large_page_ooblayout());
++
++	return 0;
++}
++
++static int xrx500_nand_exec_op(struct nand_chip *chip,
++			       const struct nand_operation *op,
++			       bool check_only)
++{
++	const struct nand_op_instr *instr;
++	unsigned int op_id, i;
++	u32 timeout_us;
++	int ret = 0;
++
++	if (check_only)
++		return 0;
++
++	for (op_id = 0; op_id < op->ninstrs; op_id++) {
++		instr = &op->instrs[op_id];
++
++		switch (instr->type) {
++		case NAND_OP_CMD_INSTR:
++			xrx500_nand_writeb(chip,
++					   NAND_CLE_OFFS | NAND_CS_OFFS,
++					   instr->ctx.cmd.opcode);
++			break;
++
++		case NAND_OP_ADDR_INSTR:
++			for (i = 0; i < instr->ctx.addr.naddrs; i++)
++				xrx500_nand_writeb(chip,
++						   NAND_ALE_OFFS | NAND_CS_OFFS,
++						   instr->ctx.addr.addrs[i]);
++			break;
++
++		case NAND_OP_DATA_IN_INSTR:
++			xrx500_nand_read_buf(chip, instr->ctx.data.buf.in,
++					     instr->ctx.data.len);
++			break;
++
++		case NAND_OP_DATA_OUT_INSTR:
++			xrx500_nand_write_buf(chip, instr->ctx.data.buf.out,
++					      instr->ctx.data.len);
++			break;
++
++		case NAND_OP_WAITRDY_INSTR:
++			/*
++			 * readl_poll_timeout() takes its timeout in
++			 * microseconds; the WAITRDY instruction carries it in
++			 * milliseconds. Convert here. Forgetting this *1000
++			 * shaves three orders of magnitude off every erase /
++			 * program budget.
++			 */
++			timeout_us = instr->ctx.waitrdy.timeout_ms * 1000;
++			ret = xrx500_nand_waitrdy(chip, timeout_us);
++			break;
++
++		default:
++			return -EINVAL;
++		}
++
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++static const struct nand_controller_ops xrx500_nand_controller_ops = {
++	.attach_chip = xrx500_nand_attach_chip,
++	.exec_op = xrx500_nand_exec_op,
++};
++
++static int xrx500_nand_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct xrx500_nand_host *host;
++	struct device_node *chip_np;
++	struct resource *res;
++	struct mtd_info *mtd;
++	char *resname;
++	u32 cs = 0;
++	int ret;
++
++	host = devm_kzalloc(dev, sizeof(*host), GFP_KERNEL);
++	if (!host)
++		return -ENOMEM;
++
++	host->dev = dev;
++
++	/*
++	 * The "lantiq,cs" property selects which EBU chip-select the NAND is
++	 * wired to. Absent property defaults to CS0, matching xway_nand.c.
++	 */
++	of_property_read_u32(dev->of_node, "lantiq,cs", &cs);
++	host->cs = cs;
++
++	host->ebu = devm_platform_ioremap_resource_byname(pdev, "ebunand");
++	if (IS_ERR(host->ebu))
++		return PTR_ERR(host->ebu);
++
++	resname = devm_kasprintf(dev, GFP_KERNEL, "nand_cs%u", cs);
++	if (!resname)
++		return -ENOMEM;
++
++	host->chipaddr = devm_platform_ioremap_resource_byname(pdev, resname);
++	if (IS_ERR(host->chipaddr))
++		return PTR_ERR(host->chipaddr);
++
++	/*
++	 * Look up the physical base of the CS-decoded NAND window: ADDSEL
++	 * needs the bus address (not the virtual address ioremap returned).
++	 */
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, resname);
++	if (!res)
++		return -EINVAL;
++
++	chip_np = of_get_next_child(dev->of_node, NULL);
++	if (!chip_np)
++		return dev_err_probe(dev, -EINVAL,
++				     "missing NAND chip child node\n");
++
++	/*
++	 * Program the EBU into NAND mode for this chip-select. Order is
++	 * load-bearing: WRDIS clear (so subsequent writes actually land),
++	 * then ADDSEL (region map), then BUSCON (bus timing), then CON
++	 * (latch NAND signals). EBU_CON_CE is asserted unconditionally
++	 * because exec_op has no separate select_chip toggle — chip enable
++	 * must stay active while the NAND interface is bound.
++	 */
++	writel(readl(host->ebu + EBU_BUSCON(host->cs)) & ~EBU_BUSCON_WRDIS,
++	       host->ebu + EBU_BUSCON(host->cs));
++
++	if (host->cs == 0) {
++		writel(res->start | EBU_ADDR_MASK(1) | EBU_ADDR_SEL_REGEN,
++		       host->ebu + EBU_ADDR_SEL(0));
++		writel(XRX500_BUSCON_DEFAULT | EBU_BUSCON_ALEC,
++		       host->ebu + EBU_BUSCON(0));
++	} else {
++		writel(res->start | EBU_ADDR_MASK(5) | EBU_ADDR_SEL_REGEN,
++		       host->ebu + EBU_ADDR_SEL(host->cs));
++		writel(XRX500_BUSCON_DEFAULT,
++		       host->ebu + EBU_BUSCON(host->cs));
++	}
++
++	dev_dbg(dev, "EBU NAND configured: cs=%u nand_window=%pa\n",
++		host->cs, &res->start);
++
++	writel(EBU_CON_NANDM_EN | EBU_CON_CSMUX_E_EN |
++	       EBU_CON_CS_P_LOW | EBU_CON_SE_P_LOW |
++	       EBU_CON_WP_P_LOW | EBU_CON_PRE_P_LOW |
++	       EBU_CON_IN_CS_S(host->cs) | EBU_CON_OUT_CS_S(host->cs) |
++	       EBU_CON_CE,
++	       host->ebu + EBU_CON);
++
++	nand_controller_init(&host->controller);
++	host->controller.ops = &xrx500_nand_controller_ops;
++	host->chip.controller = &host->controller;
++
++	nand_set_flash_node(&host->chip, chip_np);
++	nand_set_controller_data(&host->chip, host);
++
++	mtd = nand_to_mtd(&host->chip);
++	mtd->dev.parent = dev;
++
++	platform_set_drvdata(pdev, host);
++
++	ret = nand_scan(&host->chip, 1);
++	if (ret)
++		goto err_put_node;
++
++	ret = mtd_device_register(mtd, NULL, 0);
++	if (ret)
++		goto err_cleanup_nand;
++
++	of_node_put(chip_np);
++	return 0;
++
++err_cleanup_nand:
++	nand_cleanup(&host->chip);
++err_put_node:
++	of_node_put(chip_np);
++	return ret;
++}
++
++static void xrx500_nand_remove(struct platform_device *pdev)
++{
++	struct xrx500_nand_host *host = platform_get_drvdata(pdev);
++	int ret;
++
++	ret = mtd_device_unregister(nand_to_mtd(&host->chip));
++	WARN_ON(ret);
++	nand_cleanup(&host->chip);
++
++	/* Disable EBU NAND mode so subsequent EBU users see a clean slate. */
++	writel(EBU_CON_NANDM_DIS, host->ebu + EBU_CON);
++}
++
++static const struct of_device_id xrx500_nand_match[] = {
++	{ .compatible = "lantiq,nand-xrx500" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, xrx500_nand_match);
++
++static struct platform_driver xrx500_nand_driver = {
++	.probe	= xrx500_nand_probe,
++	.remove	= xrx500_nand_remove,
++	.driver	= {
++		.name		= "lantiq-xrx500-nand",
++		.of_match_table	= xrx500_nand_match,
++	},
++};
++builtin_platform_driver(xrx500_nand_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Grische <github@grische.xyz>");
++MODULE_DESCRIPTION("Lantiq xRX500 (GRX350) EBU NAND controller driver");

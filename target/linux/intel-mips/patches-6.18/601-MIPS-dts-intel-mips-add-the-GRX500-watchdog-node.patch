@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 15 Aug 2026 08:42:53 +0200
+Subject: MIPS: dts: intel-mips: add the GRX500 watchdog node
+
+SoC-scope node for the new intel_grx500_wdt driver: the GIC local
+watchdog interrupt, the CPU clock the countdown runs at, and a phandle to
+the RCU syscon, which holds both the register that lets an expiry reach
+the chip reset and the bit that says the last reset came from one.
+
+No reg property. The timer's registers are the GIC's VP-local window,
+which the driver reaches through the CPS accessors; the vendor node's
+reg = <0 0> exists only because its driver called platform_get_resource()
+and threw the answer away.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 925890e8ee1e..df2d085f7358 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -108,6 +108,22 @@ reboot {
+ 		};
+ 	};
+ 
++	/*
++	 * There is no watchdog block on this SoC — the timer is the GIC's
++	 * per-VP watchdog — so this node carries no reg and no unit address.
++	 * The RCU phandle supplies the reset-enable bit and the reset-cause
++	 * word. The interrupt is per-VP and optional.
++	 */
++	watchdog {
++		compatible = "intel,grx500-wdt";
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_LOCAL 0 IRQ_TYPE_NONE>;
++		clocks = <&cgu CLK_CPU>;
++		intel,rcu-syscon = <&rcu>;
++		timeout-sec = <30>;
++	};
++
+ 	asc0: serial@16600000 {
+ 		compatible = "lantiq,asc";
+ 		reg = <0x16600000 0x100000>;

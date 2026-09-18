@@ -1,0 +1,463 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 16:34:23 +0200
+Subject: phy: intel: add GRX500 PCIe slim PHY driver
+
+Each of the three PCIe host bridges on the xRX500 (GRX350) sits behind a
+"slim" PHY that nothing in this tree programs. Until something does, the
+controllers never get a reference clock and link training cannot even be
+attempted, so PCIe support on this platform starts here.
+
+The driver is ported from the Intel/AVM 4.9 BSP,
+drivers/phy/intel/phy-intel-slim.c, and reaches three separate register
+spaces:
+
+ - The PHY's own PDI block, spanning 0xc004..0xc014, of which only CFG4
+   is ever written: bit 15 powers the PIPE interface down (1) and up
+   (0), each write followed by a millisecond of settling time. The
+   remaining CFG registers keep their reset values and are defined only
+   to document the window.
+
+ - The LCPLL and its spread-spectrum generator, which live in the CGU
+   rather than in the PHY and are reached through a syscon phandle. The
+   sequence -- the two CFG1 writes, the two CFG0 writes that walk bit 0
+   from 0 to 1, the lock poll, the eight fixed coefficients and the four
+   SSC_CTRL writes -- is reproduced from the vendor driver value for
+   value. No register-level documentation for this PLL exists outside
+   it, so none of those constants is safe to derive rather than copy.
+
+ - The chip-top interface mux, whose IFMUX_CFG at 0x120 carries the
+   per-instance reference clock gate at bit 22 + id. Its polarity is the
+   opposite of the obvious reading: 0 enables the clock, 1 disables it.
+
+The LCPLL is shared by all three PHY instances, so the sequence above
+has to run exactly once no matter how many of them come up. The vendor
+driver refcounts it with a bare atomic_t, which is not enough on its
+own: the test-then-set of the per-instance status flag, and the register
+sequence guarded by the count, both race against a sibling instance
+probing concurrently or being retried after -EPROBE_DEFER. A mutex
+covers the count, the flag and the programming together.
+
+Four things are deliberately different from the vendor source.
+
+The SSC flag is read as "intel,ssc-enable". The vendor driver reads
+"intel,ssc_enable" with an underscore while its own SoC dtsi writes the
+hyphenated spelling, so the SoC-level value was dead text and only the
+board files, which repeat the typo, had any effect. Both sides are ours
+here, so only the hyphenated name is accepted.
+
+The instance id comes from an explicit "intel,phy-id" property instead
+of of_alias_get_id(np, "pciephy"). That alias had exactly one user, and
+an alias is a poor home for a number that selects a hardware bit; the
+property keeps the id in the node that the bit belongs to.
+
+devm_ioremap_resource() is checked with IS_ERR(). It never returns NULL,
+so the vendor driver's !ptr test would have passed an error pointer
+straight into readl().
+
+Failures return the underlying error rather than a blanket -EINVAL, and
+the error path no longer calls regmap_exit(). That regmap belongs to the
+CGU syscon and not to this driver; tearing it down would take the clock
+controller with it. Returning the real error also matters because both
+syscon lookups and the reset get can legitimately return -EPROBE_DEFER,
+which -EINVAL would have turned into a permanent failure.
+
+The reset line is taken by index rather than by name, so the controller's
+cell count stays the device tree's business: ours is lantiq,xrx200-reset
+with #reset-cells = <2>, where the vendor's binding had one cell. No
+clock is consumed either -- the vendor driver includes linux/clk.h but
+never calls the clk API, and its PHY nodes carry no clocks property; the
+only gate this block needs is the IFMUX bit above, and GCLK_PCIEn
+belongs to the host bridge.
+
+The Kconfig entry selects the two frameworks the driver calls into,
+GENERIC_PHY and RESET_CONTROLLER, so that enabling it alone is enough.
+The RCU reset provider itself, RESET_LANTIQ, is not selected from here,
+because which driver backs the resets phandle is a platform decision.
+Nothing on this platform selects it until the USB PHY driver does, and
+until then the reset lookup of this PHY defers.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/phy/intel/Kconfig b/drivers/phy/intel/Kconfig
+index ac42bb2fb394..3dd146bc4ddd 100644
+--- a/drivers/phy/intel/Kconfig
++++ b/drivers/phy/intel/Kconfig
+@@ -2,6 +2,23 @@
+ #
+ # Phy drivers for Intel platforms
+ #
++config PHY_INTEL_GRX500_PCIE
++	tristate "Intel GRX500 PCIe slim PHY driver"
++	depends on INTEL_MIPS || COMPILE_TEST
++	depends on OF && HAS_IOMEM
++	select GENERIC_PHY
++	select MFD_SYSCON
++	select RESET_CONTROLLER
++	help
++	  Enable this to support the PCIe slim PHY that feeds the on-chip
++	  PCIe host bridges of the Intel MIPS (xRX500/GRX500) SoC family.
++	  Besides its own PDI register block the driver drives the shared
++	  LCPLL spread-spectrum generator in the CGU and the per-instance
++	  reference clock gate in the chip-top interface mux.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called phy-intel-grx500-pcie.ko.
++
+ config PHY_INTEL_KEEMBAY_EMMC
+ 	tristate "Intel Keem Bay EMMC PHY driver"
+ 	depends on ARCH_KEEMBAY || COMPILE_TEST
+diff --git a/drivers/phy/intel/Makefile b/drivers/phy/intel/Makefile
+index 14550981a707..1093ec293610 100644
+--- a/drivers/phy/intel/Makefile
++++ b/drivers/phy/intel/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_PHY_INTEL_GRX500_PCIE)	+= phy-intel-grx500-pcie.o
+ obj-$(CONFIG_PHY_INTEL_KEEMBAY_EMMC)	+= phy-intel-keembay-emmc.o
+ obj-$(CONFIG_PHY_INTEL_KEEMBAY_USB)	+= phy-intel-keembay-usb.o
+ obj-$(CONFIG_PHY_INTEL_LGM_COMBO)	+= phy-intel-lgm-combo.o
+diff --git a/drivers/phy/intel/phy-intel-grx500-pcie.c b/drivers/phy/intel/phy-intel-grx500-pcie.c
+new file mode 100644
+index 000000000000..c0f0a4a5fe31
+--- /dev/null
++++ b/drivers/phy/intel/phy-intel-grx500-pcie.c
+@@ -0,0 +1,337 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Intel GRX500 (xRX500) PCIe slim PHY driver
++ *
++ * Copyright (C) 2018 Intel Corporation.
++ */
++
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++#include <linux/string_choices.h>
++#include <linux/time64.h>
++
++/*
++ * PCIe 2.0 PDI PHY register definition. The block spans 0xc004..0xc014;
++ * only CFG4 is programmed here, the rest keep their reset values.
++ */
++#define PCIE_PHY_CFG0			0xc004
++#define PCIE_PHY_CFG1			0xc008
++#define PCIE_PHY_CFG2			0xc00c
++#define PCIE_PHY_CFG3			0xc010
++#define PCIE_PHY_CFG4			0xc014
++#define  PCIE_PHY_PIPE_PD		BIT(14)
++#define  PCIE_PHY_PIPE_PD_O		BIT(15)
++
++/* xRX500 LCPLL SSC, inside the CGU */
++#define PCIE_LCPLL_CFG0			0x0094
++#define  PLL_RESET			BIT(0)
++#define  LCPLL_CFG0_LOCKED		BIT(1)
++#define PCIE_LCPLL_CFG1			0x0098
++#define  PLL_SSC			BIT(24)
++#define  PLL_CLK_OV			BIT(20)
++#define PCIE_LCPLL_SSC_CTRL		0x009c
++#define PCIE_LCPLL_SSC_SCALE		0x00a0
++#define PCIE_LCPLL_COEF(n)		(0x00a4 + (n) * 4)
++#define PCIE_LCPLL_COEF_NUM		8
++
++#define PCIE_LCPLL_LOCK_SLEEP_US	100
++#define PCIE_LCPLL_LOCK_TIMEOUT_US	(100 * USEC_PER_MSEC)
++
++/* CHIPTOP interface mux */
++#define PCIE_IFMUX_CFG			0x120
++#define PCIE_RCLK(id)			BIT((id) + 22)
++
++#define PCIE_PHY_ID_MAX			2
++
++/*
++ * The LCPLL and its spread-spectrum generator sit in the CGU and are shared
++ * by every PHY instance, so the programming sequence must run exactly once.
++ * The refcount and the sequence itself are serialised against concurrent and
++ * deferred probes of the sibling instances.
++ */
++static DEFINE_MUTEX(intel_pciephy_ssc_lock);
++static int intel_pciephy_ssc_refcount;
++
++struct intel_pciephy {
++	struct device *dev;
++	void __iomem *phy_base;
++	struct regmap *cgu;
++	struct regmap *chiptop;
++	struct phy *phy;
++	struct reset_control *rst;
++	u32 id;
++	bool ssc_en;
++	bool ssc_on;
++};
++
++static void intel_pciephy_dbg_dump(struct intel_pciephy *priv)
++{
++	struct device *dev = priv->dev;
++	u32 val;
++	int i;
++
++	regmap_read(priv->cgu, PCIE_LCPLL_CFG0, &val);
++	dev_dbg(dev, "LCPLL CFG0: 0x%08x\n", val);
++	regmap_read(priv->cgu, PCIE_LCPLL_CFG1, &val);
++	dev_dbg(dev, "LCPLL CFG1: 0x%08x\n", val);
++	regmap_read(priv->cgu, PCIE_LCPLL_SSC_CTRL, &val);
++	dev_dbg(dev, "SSC CTRL: 0x%08x\n", val);
++	regmap_read(priv->cgu, PCIE_LCPLL_SSC_SCALE, &val);
++	dev_dbg(dev, "SSC SCALE: 0x%08x\n", val);
++
++	for (i = 0; i < PCIE_LCPLL_COEF_NUM; i++) {
++		regmap_read(priv->cgu, PCIE_LCPLL_COEF(i), &val);
++		dev_dbg(dev, "LCPLL COEF[%d]: 0x%08x\n", i, val);
++	}
++
++	regmap_read(priv->chiptop, PCIE_IFMUX_CFG, &val);
++	dev_dbg(dev, "PCIE PHY IFMUX[22-24]: 0x%08x\n", val);
++}
++
++static void intel_pciephy_power(struct intel_pciephy *priv, bool on)
++{
++	u32 val;
++
++	val = readl(priv->phy_base + PCIE_PHY_CFG4);
++	if (on)
++		val &= ~PCIE_PHY_PIPE_PD_O;
++	else
++		val |= PCIE_PHY_PIPE_PD_O;
++	writel(val, priv->phy_base + PCIE_PHY_CFG4);
++
++	mdelay(1);
++}
++
++static void intel_pciephy_lcpll_wait_lock(struct intel_pciephy *priv)
++{
++	u32 val;
++	int ret;
++
++	ret = regmap_read_poll_timeout(priv->cgu, PCIE_LCPLL_CFG0, val,
++				       val & LCPLL_CFG0_LOCKED,
++				       PCIE_LCPLL_LOCK_SLEEP_US,
++				       PCIE_LCPLL_LOCK_TIMEOUT_US);
++	if (ret)
++		dev_err(priv->dev, "LCPLL not locked yet\n");
++}
++
++static void intel_pciephy_ssc_enable(struct intel_pciephy *priv)
++{
++	int i;
++
++	if (!priv->ssc_en)
++		return;
++
++	guard(mutex)(&intel_pciephy_ssc_lock);
++
++	if (priv->ssc_on)
++		return;
++
++	priv->ssc_on = true;
++	if (intel_pciephy_ssc_refcount++ > 0) {
++		dev_dbg(priv->dev, "SSC already enabled, count: %d\n",
++			intel_pciephy_ssc_refcount);
++		return;
++	}
++
++	/* Enable SSC and LCPLL */
++	regmap_write(priv->cgu, PCIE_LCPLL_CFG1, 0x10003004);
++	regmap_write(priv->cgu, PCIE_LCPLL_CFG1, 0x10103004);
++
++	/* Need bit 0 to go from 0 to 1 */
++	regmap_write(priv->cgu, PCIE_LCPLL_CFG0, 0x00000190);
++	regmap_write(priv->cgu, PCIE_LCPLL_CFG0, 0x00000191);
++
++	intel_pciephy_lcpll_wait_lock(priv);
++
++	/* Fixed coefficient parameters */
++	for (i = 0; i < 4; i++)
++		regmap_write(priv->cgu, PCIE_LCPLL_COEF(i), 0x0000ff60);
++	for (i = 4; i < PCIE_LCPLL_COEF_NUM; i++)
++		regmap_write(priv->cgu, PCIE_LCPLL_COEF(i), 0x000000a0);
++
++	/* Program DIV and len parameters */
++	regmap_write(priv->cgu, PCIE_LCPLL_SSC_CTRL, 0x0000ff1c);
++	regmap_write(priv->cgu, PCIE_LCPLL_SSC_CTRL, 0x0000ff1f);
++	regmap_write(priv->cgu, PCIE_LCPLL_SSC_CTRL, 0x0000ff1c);
++	regmap_write(priv->cgu, PCIE_LCPLL_SSC_CTRL, 0x0000ff1d);
++	mdelay(1);
++
++	dev_dbg(priv->dev, "PCIe LCPLL SSC mode enabled\n");
++}
++
++static void intel_pciephy_ssc_disable(struct intel_pciephy *priv)
++{
++	if (!priv->ssc_en)
++		return;
++
++	guard(mutex)(&intel_pciephy_ssc_lock);
++
++	if (!priv->ssc_on)
++		return;
++
++	priv->ssc_on = false;
++	if (--intel_pciephy_ssc_refcount > 0) {
++		dev_dbg(priv->dev, "SSC still in use, count: %d\n",
++			intel_pciephy_ssc_refcount);
++		return;
++	}
++
++	/* Disable SSC CTRL */
++	regmap_write(priv->cgu, PCIE_LCPLL_SSC_CTRL, 0x0);
++	mdelay(1);
++
++	/* Disable SSC and LCPLL */
++	regmap_update_bits(priv->cgu, PCIE_LCPLL_CFG1,
++			   PLL_SSC | PLL_CLK_OV, PLL_SSC);
++
++	/* Reset the PLL */
++	regmap_update_bits(priv->cgu, PCIE_LCPLL_CFG0, PLL_RESET, 0);
++	regmap_update_bits(priv->cgu, PCIE_LCPLL_CFG0, PLL_RESET, PLL_RESET);
++
++	intel_pciephy_lcpll_wait_lock(priv);
++}
++
++static void intel_pciephy_reset(struct intel_pciephy *priv)
++{
++	reset_control_assert(priv->rst);
++	reset_control_deassert(priv->rst);
++	udelay(1);
++}
++
++static void intel_pciephy_ref_clk(struct intel_pciephy *priv, bool on)
++{
++	/* 0 is enable, 1 is disable */
++	regmap_update_bits(priv->chiptop, PCIE_IFMUX_CFG, PCIE_RCLK(priv->id),
++			   on ? 0 : PCIE_RCLK(priv->id));
++}
++
++static int intel_pciephy_init(struct phy *phy)
++{
++	struct intel_pciephy *priv = phy_get_drvdata(phy);
++
++	intel_pciephy_power(priv, false);
++	intel_pciephy_ssc_enable(priv);
++	intel_pciephy_power(priv, true);
++
++	intel_pciephy_reset(priv);
++
++	intel_pciephy_ref_clk(priv, true);
++	intel_pciephy_dbg_dump(priv);
++
++	return 0;
++}
++
++static int intel_pciephy_exit(struct phy *phy)
++{
++	struct intel_pciephy *priv = phy_get_drvdata(phy);
++
++	/* Powering the PDI down halts the whole system, leave it alone */
++	intel_pciephy_ssc_disable(priv);
++	intel_pciephy_ref_clk(priv, false);
++	intel_pciephy_dbg_dump(priv);
++
++	return 0;
++}
++
++static const struct phy_ops intel_pciephy_ops = {
++	.init = intel_pciephy_init,
++	.exit = intel_pciephy_exit,
++	.owner = THIS_MODULE,
++};
++
++static int intel_pciephy_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct phy_provider *phy_provider;
++	struct intel_pciephy *priv;
++	u32 val;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = dev;
++
++	ret = device_property_read_u32(dev, "intel,phy-id", &priv->id);
++	if (ret)
++		return dev_err_probe(dev, ret, "missing intel,phy-id\n");
++	if (priv->id > PCIE_PHY_ID_MAX)
++		return dev_err_probe(dev, -EINVAL, "invalid intel,phy-id %u\n",
++				     priv->id);
++
++	priv->phy_base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(priv->phy_base))
++		return dev_err_probe(dev, PTR_ERR(priv->phy_base),
++				     "failed to map the PHY registers\n");
++
++	priv->cgu = syscon_regmap_lookup_by_phandle(np, "intel,cgu-syscon");
++	if (IS_ERR(priv->cgu))
++		return dev_err_probe(dev, PTR_ERR(priv->cgu),
++				     "failed to get the CGU syscon\n");
++
++	priv->chiptop = syscon_regmap_lookup_by_phandle(np, "intel,syscon");
++	if (IS_ERR(priv->chiptop))
++		return dev_err_probe(dev, PTR_ERR(priv->chiptop),
++				     "failed to get the CHIPTOP syscon\n");
++
++	priv->rst = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(priv->rst))
++		return dev_err_probe(dev, PTR_ERR(priv->rst),
++				     "failed to get the PHY reset\n");
++
++	if (!device_property_read_u32(dev, "intel,ssc-enable", &val))
++		priv->ssc_en = !!val;
++	else
++		priv->ssc_en = device_property_present(dev, "intel,ssc-enable");
++
++	priv->phy = devm_phy_create(dev, np, &intel_pciephy_ops);
++	if (IS_ERR(priv->phy))
++		return dev_err_probe(dev, PTR_ERR(priv->phy),
++				     "failed to create the PHY\n");
++
++	phy_set_drvdata(priv->phy, priv);
++
++	phy_provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	if (IS_ERR(phy_provider))
++		return dev_err_probe(dev, PTR_ERR(phy_provider),
++				     "failed to register the PHY provider\n");
++
++	/* Leave the PHY in a known state before any consumer shows up */
++	intel_pciephy_reset(priv);
++
++	dev_dbg(dev, "PCIe slim PHY[%u] probed, SSC %s\n", priv->id,
++		str_enabled_disabled(priv->ssc_en));
++
++	return 0;
++}
++
++static const struct of_device_id intel_pciephy_match[] = {
++	{ .compatible = "intel,grx500-pciephy" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, intel_pciephy_match);
++
++static struct platform_driver intel_pciephy_driver = {
++	.probe = intel_pciephy_probe,
++	.driver = {
++		.name = "intel-pcie-slim-phy",
++		.of_match_table = intel_pciephy_match,
++	},
++};
++module_platform_driver(intel_pciephy_driver);
++
++MODULE_DESCRIPTION("Intel GRX500 PCIe slim PHY driver");
++MODULE_LICENSE("GPL");

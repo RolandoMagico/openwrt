@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 15:30:38 +0200
+Subject: dt-bindings: net: add the Intel xRX500 packet buffer manager
+
+The manager that sits between the two switch macros and the processors
+of this SoC family has never been described. It has eleven register
+windows, five interrupts, two clocks and two pools of reserved memory.
+Name them.
+
+Describe a processor's end of a macro's datapath as a child of it. A
+conduit owns no registers of its own: it takes segments from this device's
+pools, enqueues on this device's ports, and consumes a ring a DMA
+controller writes into, all of which are described elsewhere and named
+here. There is one per macro, because a macro's queues, ports and channels
+are its own and nothing forwards between the two.
+
+One window of the twelve the vendor device tree carries is left out, the
+one the vendor names sbim. The vendor's own driver does not map it,
+there is no register description for its address anywhere in the vendor
+sources, and the only evidence for what it might be is that four-letter
+name in the vendor device tree. A window that cannot be named is better
+left out than described wrongly; re-adding it is one line in each of the
+schema and the device tree if a use appears.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/net/lantiq,xrx500-cbm.yaml b/Documentation/devicetree/bindings/net/lantiq,xrx500-cbm.yaml
+new file mode 100644
+index 000000000000..4eb6705d1e21
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/lantiq,xrx500-cbm.yaml
+@@ -0,0 +1,232 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/lantiq,xrx500-cbm.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Intel xRX500 packet buffer manager
++
++maintainers:
++  - Grische <github@grische.xyz>
++
++description: |
++  The packet buffer manager of the Intel MIPS xRX500 (GRX500) SoC family sits
++  between the two GSWIP-3.0 switch macros and the processors. It owns the
++  pools of fixed-size segments every packet on the datapath is held in, an
++  enqueue manager and a dequeue manager facing them, a traffic manager
++  between the two, and the table that binds an endpoint to a queue. Both
++  switch macros and all four packet DMA controllers of the SoC draw their
++  buffers from it, so it is one device however many endpoints are in use.
++
++  A conduit is a processor's end of one macro's datapath. It takes a segment
++  from a pool, writes a frame into it behind the switch header, and enqueues
++  it on the ingress port of the processor it is running on; in the other
++  direction it consumes the ring that macro's receive DMA channel writes
++  into. A conduit owns no registers of its own: everything it touches belongs
++  either to this device or to a DMA controller it names. It is therefore a
++  child of this node, one per macro, and is what a switch macro's CPU port
++  points at.
++
++properties:
++  compatible:
++    const: lantiq,xrx500-cbm
++
++  reg:
++    items:
++      - description: traffic manager
++      - description: |
++          the manager's own control registers: the pool base addresses and
++          the interrupt lines below
++      - description: |
++          queue index table, the lookup that turns an endpoint and a traffic
++          class into an egress queue
++      - description: per-queue enqueue counters
++      - description: per-queue dequeue counters
++      - description: |
++          load spreader, which distributes completed receive descriptors over
++          the processors
++      - description: enqueue manager, one block per ingress port
++      - description: dequeue manager, one block per egress port
++      - description: free segment queue manager of the first pool
++      - description: free segment queue manager of the second pool
++      - description: |
++          descriptor window the manager stages the DMA controllers'
++          descriptors in
++
++  reg-names:
++    items:
++      - const: tmu
++      - const: cbm
++      - const: qidt
++      - const: qeqcnt
++      - const: qdqcnt
++      - const: ls
++      - const: eqm
++      - const: dqm
++      - const: fsqm0
++      - const: fsqm1
++      - const: dma-desc
++
++  interrupts:
++    items:
++      - description: |
++          the manager's own line, carrying the exceptions of the two segment
++          pools and of the traffic manager, and the port interrupts of the
++          first processor
++      - description: load spreader port 0
++      - description: load spreader port 1
++      - description: load spreader port 2
++      - description: load spreader port 3
++
++  interrupt-names:
++    items:
++      - const: cbm
++      - const: ls0
++      - const: ls1
++      - const: ls2
++      - const: ls3
++
++  clocks:
++    items:
++      - description: the bus clock the manager's timers are derived from
++      - description: the manager's gate
++
++  clock-names:
++    items:
++      - const: freq
++      - const: cbm
++
++  memory-region:
++    items:
++      - description: standard segment pool
++      - description: jumbo segment pool
++
++  memory-region-names:
++    items:
++      - const: std-pool
++      - const: jumbo-pool
++
++  '#address-cells':
++    const: 1
++
++  '#size-cells':
++    const: 0
++
++patternProperties:
++  "^ethernet@[01]$":
++    type: object
++    $ref: ethernet-controller.yaml#
++    unevaluatedProperties: false
++    description:
++      One processor-side end of a switch macro's datapath.
++
++    properties:
++      compatible:
++        const: lantiq,xrx500-conduit
++
++      reg:
++        minimum: 0
++        maximum: 1
++        description:
++          Index of the switch macro this conduit serves. The two macros have
++          separate sets of queues, ports and DMA channels, and nothing
++          forwards between them.
++
++      lantiq,transmit-dma:
++        $ref: /schemas/types.yaml#/definitions/phandle
++        description:
++          The packet DMA controller whose channels carry this conduit's
++          transmitted frames from the dequeue manager to the switch macro.
++
++      lantiq,receive-dma:
++        $ref: /schemas/types.yaml#/definitions/phandle
++        description:
++          The packet DMA controller whose channels carry received frames from
++          the switch macro. The conduit points one of its channels at a ring
++          of its own and consumes it directly.
++
++    required:
++      - compatible
++      - reg
++      - lantiq,transmit-dma
++      - lantiq,receive-dma
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - interrupt-names
++  - clocks
++  - clock-names
++  - memory-region
++  - memory-region-names
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/irq.h>
++    #include <dt-bindings/interrupt-controller/mips-gic.h>
++
++    reserved-memory {
++            #address-cells = <1>;
++            #size-cells = <1>;
++            ranges;
++
++            /*
++             * The manager hands these out in whole segments, 2 KiB from the
++             * standard pool and 8 KiB from the jumbo one, and addresses them
++             * by physical address. They carry no compatible and no kernel
++             * mapping: the driver maps them itself, write-back, and that is
++             * the only access path to them. Each has to hold at least two
++             * segments and to start on a segment boundary, or the driver
++             * moves its base up to one and loses the difference.
++             */
++            std_pool: packet-segments@23800000 {
++                    reg = <0x23800000 0x1200000>;
++                    no-map;
++            };
++
++            jumbo_pool: jumbo-packet-segments@24a00000 {
++                    reg = <0x24a00000 0x800000>;
++                    no-map;
++            };
++    };
++
++    ethernet@1e700000 {
++            compatible = "lantiq,xrx500-cbm";
++            reg = <0x1e700000 0x1000>,
++                  <0x1e710000 0x10000>,
++                  <0x1e720000 0x4000>,
++                  <0x1e750000 0x400>,
++                  <0x1e750800 0x400>,
++                  <0x1e760000 0x10000>,
++                  <0x1e780000 0x20000>,
++                  <0x1e7c0000 0x30000>,
++                  <0x1e800000 0x100000>,
++                  <0x1e900000 0x100000>,
++                  <0x1e500000 0x100000>;
++            reg-names = "tmu", "cbm", "qidt", "qeqcnt", "qdqcnt", "ls",
++                        "eqm", "dqm", "fsqm0", "fsqm1", "dma-desc";
++            interrupt-parent = <&gic>;
++            interrupts = <GIC_SHARED 174 IRQ_TYPE_LEVEL_HIGH>,
++                         <GIC_SHARED 178 IRQ_TYPE_LEVEL_HIGH>,
++                         <GIC_SHARED 179 IRQ_TYPE_LEVEL_HIGH>,
++                         <GIC_SHARED 180 IRQ_TYPE_LEVEL_HIGH>,
++                         <GIC_SHARED 181 IRQ_TYPE_LEVEL_HIGH>;
++            interrupt-names = "cbm", "ls0", "ls1", "ls2", "ls3";
++            clocks = <&cgu 12>, <&cgu 41>;
++            clock-names = "freq", "cbm";
++            memory-region = <&std_pool>, <&jumbo_pool>;
++            memory-region-names = "std-pool", "jumbo-pool";
++            #address-cells = <1>;
++            #size-cells = <0>;
++
++            conduit_lan: ethernet@0 {
++                    compatible = "lantiq,xrx500-conduit";
++                    reg = <0>;
++                    lantiq,transmit-dma = <&dma2tx>;
++                    lantiq,receive-dma = <&dma2rx>;
++            };
++    };

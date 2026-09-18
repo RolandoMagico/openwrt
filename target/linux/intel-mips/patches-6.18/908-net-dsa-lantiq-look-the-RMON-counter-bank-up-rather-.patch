@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 12:56:44 +0200
+Subject: net: dsa: lantiq: look the RMON counter bank up rather than deriving
+ it
+
+The buffer manager addresses a port's RMON counters by a bank id that the
+statistics reader takes to be the port number. On GSWIP-2.x it is, but the
+family does not keep that identity: on later models the banks of the ports
+above the first eight are offset from the port numbers, so reading the port
+number as a bank id reaches a different counter block and reports numbers that
+belong to something else.
+
+Describe the mapping as a per-port table with the same -1 sentinel the MAC
+block table uses, and skip a port that has no bank instead of reporting
+whatever the read returns.
+
+No functional change: the default table maps the banks 1:1 onto the port
+numbers, and every existing model has a bank for every port.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.h b/drivers/net/dsa/lantiq/lantiq_gswip.h
+index 998ed31174d0..343dac7a1625 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.h
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.h
+@@ -303,6 +303,10 @@ struct gswip_hw_info {
+ 	 * NULL maps the blocks 1:1 onto the port numbers.
+ 	 */
+ 	const s16 *mac_ctrl;
++	/* Per-port RMON counter bank id, -1 if the port has no bank.
++	 * NULL maps the banks 1:1 onto the port numbers.
++	 */
++	const s16 *rmon_table;
+ 	bool supports_2500m;
+ 	const struct gswip_pce_microcode (*pce_microcode)[];
+ 	size_t pce_microcode_size;
+@@ -334,6 +338,7 @@ struct gswip_priv {
+ 	const struct gswip_hw_info *hw_info;
+ 	const struct gswip_mdio_layout *mdio_layout;
+ 	const s16 *mac_ctrl;
++	const s16 *rmon_table;
+ 	const struct xway_gphy_match_data *gphy_fw_name_cfg;
+ 	struct dsa_switch *ds;
+ 	struct device *dev;
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index 968e20b76446..8cf031279496 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -172,6 +172,11 @@ static int gswip_mac_ctrl_reg(struct gswip_priv *priv, int port, u16 reg)
+ 	return priv->mac_ctrl[port] + reg;
+ }
+ 
++static const s16 gswip_rmon_table_2x[GSWIP_MAX_PORTS] = {
++	0, 1, 2, 3, 4, 5, 6,
++	[GSWIP_2X_MAX_PORTS ... GSWIP_MAX_PORTS - 1] = -1,
++};
++
+ static int gswip_mdio_poll(struct gswip_priv *priv)
+ {
+ 	u32 ctrl;
+@@ -1596,16 +1601,20 @@ static void gswip_get_ethtool_stats(struct dsa_switch *ds, int port,
+ {
+ 	struct gswip_priv *priv = ds->priv;
+ 	const struct gswip_rmon_cnt_desc *rmon_cnt;
++	s16 table = priv->rmon_table[port];
+ 	int i;
+ 	u64 high;
+ 
++	if (table < 0)
++		return;
++
+ 	for (i = 0; i < ARRAY_SIZE(gswip_rmon_cnt); i++) {
+ 		rmon_cnt = &gswip_rmon_cnt[i];
+ 
+-		data[i] = gswip_bcm_ram_entry_read(priv, port,
++		data[i] = gswip_bcm_ram_entry_read(priv, table,
+ 						   rmon_cnt->offset);
+ 		if (rmon_cnt->size == 2) {
+-			high = gswip_bcm_ram_entry_read(priv, port,
++			high = gswip_bcm_ram_entry_read(priv, table,
+ 							rmon_cnt->offset + 1);
+ 			data[i] |= high << 32;
+ 		}
+@@ -1764,6 +1773,11 @@ int gswip_probe_common(struct gswip_priv *priv, u32 version)
+ 	else
+ 		priv->mac_ctrl = gswip_mac_ctrl_2x;
+ 
++	if (priv->hw_info->rmon_table)
++		priv->rmon_table = priv->hw_info->rmon_table;
++	else
++		priv->rmon_table = gswip_rmon_table_2x;
++
+ 	priv->ds = devm_kzalloc(priv->dev, sizeof(*priv->ds), GFP_KERNEL);
+ 	if (!priv->ds)
+ 		return -ENOMEM;

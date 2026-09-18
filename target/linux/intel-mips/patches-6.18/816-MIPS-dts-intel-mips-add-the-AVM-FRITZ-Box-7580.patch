@@ -1,0 +1,388 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 29 Aug 2026 00:27:17 +0200
+Subject: MIPS: dts: intel-mips: add the AVM FRITZ!Box 7580
+
+Third board on this platform, second on the GRX550 die, and the board
+the die layer was split out for: almost all of it arrives from
+seale_avm_grx550.dtsi unchanged, down to the flash map, which is the
+FRITZ!Box 7590's to the byte.
+
+Seven things are its own, and they are the whole of what the vendor's
+own board file says. Its DSL companion is a VRX318 rather than a VRX518,
+so RC2's inbound byte swapping is cleared -- the setting follows the
+part, and the FRITZ!Box 7560 carries the same part with the same value.
+Its panel has no ambient-brightness carrier on SSO pin 0, dimming from a
+discrete light sensor on i2c instead, which nothing here describes. Its
+SSO pins 4, 5 and 6 name different lamps. Its shift clock runs at the
+slowest rate the divider offers, 3.125 MHz, where every other board in
+the family leaves the default standing. Its panel update rate is set
+here rather than inherited, for the reason below. All three of its
+buttons move. And it mutes the clkout1 pinmux, which needs nothing from
+us because this port never muxed clkout1 and the pad comes up as a GPIO.
+
+SSO_CON1.US is why the update rate cannot be inherited. It selects what
+clocks a changed output word out to the external shift register, and the
+die layer asks for 250 kHz, which is off the top of the driver's
+freq_tbl[]. That takes the last branch of sso_gpio_freq_set() and
+selects US=GPTC: a general purpose timer outside the SSO block, which
+some other driver is expected to have programmed. Nothing in this kernel
+programs one, and un-gating the three GPTU modules would not be enough
+either -- the timer has to be running, not merely powered. On a board
+that does not come up with one already running, the latch never fires
+and the word never leaves: the shift register sits at its all-zeros
+power-on state, which leaves the sole active-low lamp lit and everything
+else dark, while every register reads back exactly as intended. Asking
+for 10 Hz lands on freq_tbl[3], below FPID_FREQ_RANK_MAX, which selects
+US=FPID: the divided FSC clock, generated inside the SSO block and
+dependent on nothing outside it. Those first four freq_tbl[] entries are
+the die layer's 8 kHz fpid clock over 4000, 2000, 1000 and 800, so 10 Hz
+is the fastest of them, and a tenth of a second from write to photons is
+ample for indicator lamps. The die layer keeps US=GPTC, because that is
+what its other board is proven under, but it now says out loud what the
+setting depends on.
+
+The buttons deserve the warning they carry in the file: dect and wlan
+are swapped against the FRITZ!Box 7560 rather than merely renumbered, so
+a block copied from either sibling does not fail loudly. It hands
+KEY_RFKILL to the DECT button, and holding that for five seconds is
+OpenWrt's factory reset.
+
+The LED master enable is stated here rather than in the die layer, on
+the vendor's own second thoughts: the 07.29 GPL release puts it in the
+GRX550 layer and the 08.25 GPL release deletes it from there and
+re-states it per board. 08.25 carries no HW225 board file at all, so a
+naive composition from the newer release loses the line and the whole
+panel stays dark while every register reads back correct.
+
+Partition offsets are not in any vendor release, for any board of this
+family, by design: the vendor NAND node carries no partitions and its
+own comment says the boot loader fills them in. The map here is the
+layout that boot loader installs, so that a vendor recovery can hand the
+kernel back to the original firmware without remapping flash.
+
+Sources: the vendor's hw225.dtsi and vrx318.dtsi from the 07.29 GPL
+release for the board data, and the 08.25 GPL release for the shared
+layers.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+index 9a0e2a6631a4..93b0e070e79e 100644
+--- a/arch/mips/boot/dts/intel-mips/Makefile
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ dtb-y	+= easy350_anywan.dtb
+ dtb-y	+= seale_avm_fritz7560.dtb
++dtb-y	+= seale_avm_fritz7580.dtb
+ dtb-y	+= seale_avm_fritz7590.dtb
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7580.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7580.dts
+new file mode 100644
+index 000000000000..57e5c4e7daaf
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7580.dts
+@@ -0,0 +1,302 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Copyright (C) 2026 Grische <github@grische.xyz>
++/*
++ * AVM FRITZ!Box 7580 (HW225), GRX550. Board-specific data only; the SoC is
++ * described in xrx500.dtsi, the board family in seale_avm.dtsi and the die
++ * variant in seale_avm_grx550.dtsi.
++ */
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/leds/common.h>
++
++#include "seale_avm_grx550.dtsi"
++
++/ {
++	model = "AVM FRITZ!Box 7580";
++	compatible = "avm,fritz7580", "intel,xrx500";
++
++	/*
++	 * The boot loader carries a table of device-tree blobs keyed by
++	 * hardware sub-revision. Declaring the tag is cosmetic here — the
++	 * loader passes this kernel no device tree and the appended blob is
++	 * parsed unconditionally — but it stops the loader reporting an
++	 * unmatched sub-revision.
++	 */
++	avm-hw-revision {
++		compatible = "avm,avm_hw_revision";
++		revision = "225";
++		subrevision = "1";
++	};
++
++	/*
++	 * Capped at the top of the uncached window (PHYS_OFFSET + SZ_256M):
++	 * above it the KSEG1 alias of a page is a register address, so no
++	 * coherent allocation may land there.
++	 */
++	memory@20000000 {
++		device_type = "memory";
++		reg = <0x20000000 0x10000000>;
++	};
++
++	/*
++	 * These aliases name the boot, failsafe and upgrade lamps for
++	 * userspace; without them the boot-progress indication is silently
++	 * absent.
++	 */
++	aliases {
++		serial0 = &asc0;
++
++		led-boot = &led_power;
++		led-running = &led_power;
++		led-failsafe = &led_info_red;
++		led-upgrade = &led_info;
++		led-wifi = &led_wlan;
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++		/*
++		 * Unused while MIPS_CMDLINE_BUILTIN_EXTEND is selected;
++		 * present so a board that needs its own arguments has
++		 * somewhere to put them.
++		 */
++		bootargs = "";
++	};
++
++	/*
++	 * Every region below must stay under PHYS_OFFSET + SZ_256M; the
++	 * uncached alias above that address reaches registers, not DRAM. The
++	 * addresses are the vendor's, stated once for the whole GRX550
++	 * family.
++	 */
++	reserved-memory {
++		#address-cells = <1>;
++		#size-cells = <1>;
++		ranges;
++
++		/*
++		 * Crash persistence, at the address the vendor's own device
++		 * tree uses for it. 1 MiB of the 4 MiB region below _text.
++		 * The zone sizes fill reg exactly; fs/pstore/ram.c fails the
++		 * whole probe if they overflow it.
++		 */
++		ramoops@20100000 {
++			compatible = "ramoops";
++			reg = <0x20100000 0x100000>;
++			record-size = <0x4000>;
++			console-size = <0x80000>;
++			mem-type = <1>;
++		};
++
++		/*
++		 * The rest of the region seale_avm.dtsi reserves, whose first
++		 * megabyte the crash log above has taken.
++		 */
++		/delete-node/ avm-reserved@20100000;
++
++		avm-reserved@20200000 {
++			reg = <0x20200000 0x300000>;
++			no-map;
++		};
++
++		/*
++		 * Owned by the second CPU's boot loader; no-map so this
++		 * kernel never maps another CPU's memory.
++		 */
++		cpunet@2dfc0000 {
++			reg = <0x2dfc0000 0x40000>;
++			no-map;
++		};
++
++		bootcore@2e000000 {
++			reg = <0x2e000000 0x2000000>;
++			no-map;
++		};
++
++		/*
++		 * Fixed-address seed buffer shared with the second CPU;
++		 * reserved no-map so nothing here maps or reads it.
++		 */
++		shm-rng-seed@3dfb0000 {
++			reg = <0x3dfb0000 0x1000>;
++			no-map;
++		};
++	};
++};
++
++/*
++ * Toshiba TC58BVG2S0HTA BENAND, 512 MiB. The labels are ABI: sysupgrade
++ * addresses partitions by label, so they may not be renamed. The map is the
++ * one the vendor boot loader installs.
++ */
++&nand0 {
++	partitions {
++		compatible = "fixed-partitions";
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		/*
++		 * First-stage boot loader. Read-only: overwriting it bricks
++		 * the device past the point of recovery without an external
++		 * programmer.
++		 */
++		partition@0 {
++			label = "urlader";
++			reg = <0x0 0x100000>;
++			read-only;
++		};
++
++		/*
++		 * AVM TFFS environment: the only copy of this unit's identity
++		 * (MAC addresses, serial number). Never written from Linux,
++		 * and erasing it cannot be undone.
++		 */
++		partition@100000 {
++			label = "nand-tffs";
++			reg = <0x100000 0x400000>;
++			read-only;
++		};
++
++		/*
++		 * Two 8 MiB kernel slots, named by position: which one is
++		 * active is boot-loader run-time state, so no label may claim
++		 * to be the active one.
++		 */
++		partition@500000 {
++			label = "kernel0";
++			reg = <0x500000 0x800000>;
++		};
++
++		partition@d00000 {
++			label = "kernel1";
++			reg = <0xd00000 0x800000>;
++		};
++
++		/* UBI: rootfs and rootfs_data. Ends at the 512 MiB mark. */
++		partition@1500000 {
++			label = "ubi";
++			reg = <0x1500000 0x1eb00000>;
++		};
++	};
++};
++
++/*
++ * RC0 and RC1 carry the two QCA9984 radios; RC2 carries a VRX318. Inbound
++ * byte swapping is off for this endpoint. The PCI domain numbers are
++ * ABI-visible: userspace names the radios 0000:01:00.0 and 0001:01:00.0.
++ */
++&pcie2 {
++	status = "okay";
++	intel,inbound-swap = <0>;
++	intel,outbound-swap = <0>;
++	reset-gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
++};
++
++/* 3.125 MHz is the shift-clock rate the vendor asks for on this board. */
++&ssogpio {
++	intel,sso-shift-clk-frequency-hz = <3125000>;
++	intel,sso-update-rate-hz = <10>;
++
++	/*
++	 * The child must be named "ssoled": the driver matches on the node
++	 * name. No label property — colour and function compose the
++	 * ABI-visible LED name.
++	 */
++	ssoled {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		/*
++		 * The two halves of the bicolour info lamp, one physical
++		 * lamp: lit together they mix to orange on the chassis.
++		 */
++		led_info: led@2 {
++			reg = <2>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "info";
++			gpios = <&ssogpio 2 GPIO_ACTIVE_HIGH>;
++		};
++
++		led_info_red: led@3 {
++			reg = <3>;
++			color = <LED_COLOR_ID_RED>;
++			function = "info";
++			gpios = <&ssogpio 3 GPIO_ACTIVE_HIGH>;
++		};
++
++		led@4 {
++			reg = <4>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "fon";
++			gpios = <&ssogpio 4 GPIO_ACTIVE_HIGH>;
++		};
++
++		led_wlan: led@5 {
++			reg = <5>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = LED_FUNCTION_WLAN;
++			gpios = <&ssogpio 5 GPIO_ACTIVE_HIGH>;
++		};
++
++		led@6 {
++			reg = <6>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "internet";
++			gpios = <&ssogpio 6 GPIO_ACTIVE_HIGH>;
++		};
++
++		/*
++		 * Lit as soon as the driver probes. The lamp is already on
++		 * when the kernel starts, and blinking it off mid-boot would
++		 * read as a failed boot. Active low.
++		 */
++		led_power: led@7 {
++			reg = <7>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = LED_FUNCTION_POWER;
++			gpios = <&ssogpio 7 GPIO_ACTIVE_LOW>;
++			default-state = "on";
++		};
++	};
++};
++
++/* Polled: the GPIO banks publish no irq domain. */
++/ {
++	keys {
++		compatible = "gpio-keys-polled";
++		poll-interval = <100>;
++
++		button-dect {
++			label = "dect";
++			linux,code = <KEY_PHONE>;
++			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
++		};
++
++		button-wlan {
++			label = "wlan";
++			linux,code = <KEY_RFKILL>;
++			gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
++		};
++
++		button-wps {
++			label = "wps";
++			linux,code = <KEY_WPS_BUTTON>;
++			gpios = <&gpio0 1 GPIO_ACTIVE_LOW>;
++		};
++	};
++};
++
++/*
++ * The master LED enable is a plain GPIO, not an SSO pin, and nothing in this
++ * tree consumes it — hence the hog. The whole panel is dark while it is low.
++ */
++&gpio1 {
++	led-enable-hog {
++		gpio-hog;
++		gpios = <11 GPIO_ACTIVE_LOW>;
++		output-high;
++		line-name = "led-enable";
++	};
++};

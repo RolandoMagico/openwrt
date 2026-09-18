@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 31 Aug 2026 17:31:50 +0200
+Subject: dt-bindings: vendor-prefixes: add AVM GmbH
+
+AVM GmbH (www.avm.de) makes the FRITZ!Box line of routers. Their board
+device trees use avm, as their vendor prefix.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/vendor-prefixes.yaml b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+index a9cf85fd6fbe..76ca6c956535 100644
+--- a/Documentation/devicetree/bindings/vendor-prefixes.yaml
++++ b/Documentation/devicetree/bindings/vendor-prefixes.yaml
+@@ -201,6 +201,8 @@ patternProperties:
+     description: avia semiconductor
+   "^avic,.*":
+     description: Shanghai AVIC Optoelectronics Co., Ltd.
++  "^avm,.*":
++    description: AVM GmbH
+   "^avnet,.*":
+     description: Avnet, Inc.
+   "^awinic,.*":

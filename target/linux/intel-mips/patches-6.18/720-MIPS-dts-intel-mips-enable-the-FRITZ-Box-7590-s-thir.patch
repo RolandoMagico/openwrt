@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 01:48:44 +0200
+Subject: MIPS: dts: intel-mips: enable the FRITZ!Box 7590's third PCIe port
+
+RC0 and RC1 arrive from seale_avm.dtsi and carry this board's two
+QCA9984 radios. RC2 is the board's own, and behind it is the VRX518 DSL
+companion, 8086:09a9, with an 8 MiB prefetchable BAR0 that fits the
+48 MiB window with room over.
+
+No driver in this tree claims that device, so this enables an
+enumeration and nothing more: the part appears in lspci and then sits
+idle, with no DMA, no interrupts and no firmware download. It is worth a
+status and three properties anyway. This is the first PCIe of any kind
+on the GRX550, and RC2 is a third independent exercise of the root
+complex glue, the config accessors and the serdes PHY on a die none of
+them has run on before -- as well as the only thing that drives the
+endian syscon's RC2 inbound-swap bit, which is what makes the
+board-to-board register comparison complete rather than two thirds of
+one.
+
+That swap bit is the one real PCIe difference between the two boards.
+The FRITZ!Box 7560 clears it; this board does not. The vendor clears it
+from a file that reaches the FRITZ!Box 7560 only through the GRX350
+common include, and the GRX550 chain does not pull that file in -- not
+on this board, not on any other, and not in the release where the file
+is present to be pulled. So the shared setting stands here.
+
+Which value a VRX518 actually wants cannot be settled on this board,
+because nothing crosses the link. Following the vendor is the safer of
+the two guesses; the FRITZ!Box 7560's value describes a different chip
+with a different driver.
+
+The radios get no child node, here or anywhere. ath10k takes board and
+calibration data from firmware files and reads nothing out of DT, so
+there is nothing for one to say.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 7a4e3a009602..ce4799246b02 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -216,6 +216,18 @@ partition@1500000 {
+ 	};
+ };
+ 
++/*
++ * RC0 and RC1 carry the two QCA9984 radios; RC2 carries a VRX518 with no
++ * in-tree driver. Inbound byte swapping stays on: the SoC is big-endian and
++ * the DesignWare core is not.
++ */
++&pcie2 {
++	status = "okay";
++	intel,inbound-swap = <1>;
++	intel,outbound-swap = <0>;
++	reset-gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
++};
++
+ /*
+  * Both USB host controllers. The vendor's HW226 chain carries no status
+  * override on either of them, where the FRITZ!Box 7560's grx350_common.dtsi disables

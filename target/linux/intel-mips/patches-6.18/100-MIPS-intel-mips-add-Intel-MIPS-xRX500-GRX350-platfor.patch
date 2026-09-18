@@ -1,0 +1,691 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:05:39 +0000
+Subject: MIPS: intel-mips: add Intel MIPS (xRX500/GRX350) platform support
+
+Add arch/mips/intel-mips/, a platform for the Intel (formerly Lantiq)
+xRX500 family of interAptiv-based network SoCs - GRX330/GRX350/GRX550 -
+as found in DSL gateways such as the AVM FRITZ!Box 7560.
+
+Platform characteristics:
+
+ - MIPS interAptiv (MIPS32 R3.5) dual-core / dual-VPE with CM2.5, GIC
+   and CPC.
+
+ - EVA (Enhanced Virtual Addressing) segmentation with a non-zero
+   PHYS_OFFSET: DDR starts at physical 0x20000000. kernel-entry-init.h
+   programs the segmentation control registers to a 2 GiB EVA layout
+   and spaces.h/ioremap.h carry the matching address-space constants.
+
+ - The boot chain hands the boot core over already joined to the
+   coherence domain and already running a coherent cache attribute, so
+   prom.c preserves that state rather than establishing it: it does not
+   force Config.K0, does not write GCR_CL_COHERENCE, and does not probe
+   the Cluster Power Controller. Nothing that ships on this hardware
+   executes the CPCEN write, and every mainline consumer of the CPC is
+   behind mips_cpc_present() and reachable only from CPS smp_ops or a
+   power-gated idle state, so leaving mips_cpc_probe() uncalled costs
+   this platform nothing. DMA coherency is handled in software
+   (DMA_NONCOHERENT + per-device dma-noncoherent).
+
+ - The boot loader hands over no device tree, so
+   plat_early_init_devtree() takes the blob get_fdt() finds and panics
+   when there is none.
+
+ - irq.c registers the CPU IRQ domain and the MIPS GIC; time.c
+   initializes the R4K clock event/source from the CPS-probed
+   frequency.
+
+This is a forward-port of the 2018 "MIPS: intel-mips: add initial
+support for Intel MIPS SoCs" submission by Songjun Wu
+<songjun.wu@linux.intel.com>:
+
+  https://lore.kernel.org/all/20180803030237.3366-1-songjun.wu@linux.intel.com/
+
+updated to the v6.18 APIs (of_fdt, strscpy, smp-ops registration, DMA
+coherence API) and with Paul Burton's review feedback on that series
+addressed: war.h and the cpu_has_* overrides that match generic
+defaults are gone, MIPS32R1 support is dropped (the family is R2+
+only), fixup_bigphys_addr and plat_publish_devices are removed, and
+the redundant __pa_symbol use is cleaned up.
+
+Assisted-by: Claude:claude-fable-5
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/Kbuild.platforms b/arch/mips/Kbuild.platforms
+index 41a00fa860c1..63718207fe06 100644
+--- a/arch/mips/Kbuild.platforms
++++ b/arch/mips/Kbuild.platforms
+@@ -13,6 +13,7 @@ platform-$(CONFIG_MIPS_COBALT)		+= cobalt/
+ platform-$(CONFIG_MACH_DECSTATION)	+= dec/
+ platform-$(CONFIG_ECONET)		+= econet/
+ platform-$(CONFIG_MIPS_GENERIC)		+= generic/
++platform-$(CONFIG_INTEL_MIPS)		+= intel-mips/
+ platform-$(CONFIG_MACH_JAZZ)		+= jazz/
+ platform-$(CONFIG_LANTIQ)		+= lantiq/
+ platform-$(CONFIG_MACH_LOONGSON2EF)	+= loongson2ef/
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index a14646db07b3..c1757c30a2aa 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -476,6 +476,34 @@ config LANTIQ
+ 	select ARCH_HAS_RESET_CONTROLLER
+ 	select RESET_CONTROLLER
+ 
++config INTEL_MIPS
++	bool "Intel MIPS interAptiv SoC based platforms"
++	select BOOT_RAW
++	select CEVT_R4K
++	select COMMON_CLK
++	select CPU_MIPS32_3_5_EVA
++	select CPU_MIPS32_3_5_FEATURES
++	select CPU_MIPSR2_IRQ_EI
++	select CPU_MIPSR2_IRQ_VI
++	select CSRC_R4K
++	select DMA_NONCOHERENT
++	select GENERIC_ISA_DMA
++	select IRQ_MIPS_CPU
++	select MFD_CORE
++	select MFD_SYSCON
++	select MIPS_CPU_SCACHE
++	select MIPS_GIC
++	select SYS_HAS_CPU_MIPS32_R2
++	select SYS_HAS_CPU_MIPS32_R3_5
++	select SYS_SUPPORTS_BIG_ENDIAN
++	select SYS_SUPPORTS_32BIT_KERNEL
++	select SYS_SUPPORTS_MIPS16
++	select SYS_SUPPORTS_MIPS_CPS
++	select SYS_SUPPORTS_MULTITHREADING
++	select SYS_SUPPORTS_ZBOOT
++	select TIMER_OF
++	select USE_OF
++
+ config MACH_LOONGSON32
+ 	bool "Loongson 32-bit family of machines"
+ 	select MACH_GENERIC_CORE
+@@ -1064,6 +1092,7 @@ source "arch/mips/bmips/Kconfig"
+ source "arch/mips/econet/Kconfig"
+ source "arch/mips/generic/Kconfig"
+ source "arch/mips/ingenic/Kconfig"
++source "arch/mips/intel-mips/Kconfig"
+ source "arch/mips/jazz/Kconfig"
+ source "arch/mips/lantiq/Kconfig"
+ source "arch/mips/mobileye/Kconfig"
+diff --git a/arch/mips/include/asm/mach-intel-mips/cpu-feature-overrides.h b/arch/mips/include/asm/mach-intel-mips/cpu-feature-overrides.h
+new file mode 100644
+index 000000000000..08d8eb436f8d
+--- /dev/null
++++ b/arch/mips/include/asm/mach-intel-mips/cpu-feature-overrides.h
+@@ -0,0 +1,48 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * This file was derived from: include/asm-mips/cpu-features.h
++ *	Copyright (C) 2003, 2004 Ralf Baechle
++ *	Copyright (C) 2004 Maciej W. Rozycki
++ *	Copyright (C) 2018 Intel Corporation.
++ */
++
++#ifndef __ASM_MACH_INTEL_MIPS_CPU_FEATURE_OVERRIDES_H
++#define __ASM_MACH_INTEL_MIPS_CPU_FEATURE_OVERRIDES_H
++
++#define cpu_has_tlb		1
++#define cpu_has_tx39_cache	0
++#define cpu_has_fpu		0
++#define cpu_has_counter		1
++#define cpu_has_watch		1
++
++#define cpu_has_ejtag		1
++
++#define cpu_has_mips16		0
++#define cpu_has_mdmx		0
++#define cpu_has_mips3d		0
++#define cpu_has_smartmips	0
++#define cpu_has_vz		0
++
++#define cpu_has_mips32r1	1
++#define cpu_has_mips32r2	1
++#define cpu_has_mips64r1	0
++#define cpu_has_mips64r2	0
++
++#define cpu_has_dsp		1
++#define cpu_has_dsp2		0
++#define cpu_has_mipsmt		1
++
++#define cpu_has_vint		1
++#define cpu_has_veic		0
++
++#define cpu_has_64bits		0
++#define cpu_has_64bit_zero_reg	0
++
++#define cpu_has_eva		1
++#define cpu_has_tlbinv		1
++
++#define cpu_dcache_line_size()	32
++#define cpu_icache_line_size()	32
++#define cpu_scache_line_size()	32
++
++#endif /* __ASM_MACH_INTEL_MIPS_CPU_FEATURE_OVERRIDES_H */
+diff --git a/arch/mips/include/asm/mach-intel-mips/ioremap.h b/arch/mips/include/asm/mach-intel-mips/ioremap.h
+new file mode 100644
+index 000000000000..951eee1423e8
+--- /dev/null
++++ b/arch/mips/include/asm/mach-intel-mips/ioremap.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ *  Copyright (C) 2014 Lei Chuanhua <Chuanhua.lei@lantiq.com>
++ *  Copyright (C) 2018 Intel Corporation.
++ */
++#ifndef __ASM_MACH_INTEL_MIPS_IOREMAP_H
++#define __ASM_MACH_INTEL_MIPS_IOREMAP_H
++
++#include <linux/types.h>
++
++/*
++ * TOP IO Space definition for SSX7 components /PCIe/ToE/Memcpy
++ * physical 0xa0000000 --> virtual 0xe0000000
++ */
++#define GRX500_TOP_IOREMAP_BASE			0xA0000000
++#define GRX500_TOP_IOREMAP_SIZE			0x20000000
++#define GRX500_TOP_IOREMAP_PHYS_VIRT_OFFSET	0x40000000
++
++static inline void __iomem *plat_ioremap(phys_addr_t offset, unsigned long size,
++					 unsigned long flags)
++{
++	if (offset >= GRX500_TOP_IOREMAP_BASE &&
++	    offset < (GRX500_TOP_IOREMAP_BASE + GRX500_TOP_IOREMAP_SIZE))
++		return (void __iomem *)(unsigned long)
++			(offset + GRX500_TOP_IOREMAP_PHYS_VIRT_OFFSET);
++	return NULL;
++}
++
++static inline int plat_iounmap(const volatile void __iomem *addr)
++{
++	return (unsigned long)addr >= (unsigned long)GRX500_TOP_IOREMAP_BASE;
++}
++#endif /* __ASM_MACH_INTEL_MIPS_IOREMAP_H */
+diff --git a/arch/mips/include/asm/mach-intel-mips/irq.h b/arch/mips/include/asm/mach-intel-mips/irq.h
+new file mode 100644
+index 000000000000..1aa51a35a8fe
+--- /dev/null
++++ b/arch/mips/include/asm/mach-intel-mips/irq.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ *  Copyright (C) 2014 Lei Chuanhua <Chuanhua.lei@lantiq.com>
++ *  Copyright (C) 2018 Intel Corporation.
++ */
++
++#ifndef __INTEL_MIPS_IRQ_H
++#define __INTEL_MIPS_IRQ_H
++
++
++#define NR_IRQS 256
++
++#include_next <irq.h>
++
++#endif /* __INTEL_MIPS_IRQ_H */
+diff --git a/arch/mips/include/asm/mach-intel-mips/kernel-entry-init.h b/arch/mips/include/asm/mach-intel-mips/kernel-entry-init.h
+new file mode 100644
+index 000000000000..b91b9186a2d9
+--- /dev/null
++++ b/arch/mips/include/asm/mach-intel-mips/kernel-entry-init.h
+@@ -0,0 +1,104 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Chris Dearman (chris@mips.com)
++ * Leonid Yegoshin (yegoshin@mips.com)
++ * Copyright (C) 2012 Mips Technologies, Inc.
++ * Copyright (C) 2018 Intel Corporation.
++ */
++#ifndef __ASM_MACH_INTEL_MIPS_KERNEL_ENTRY_INIT_H
++#define __ASM_MACH_INTEL_MIPS_KERNEL_ENTRY_INIT_H
++/*
++* Prepare segments for EVA boot:
++*
++* This is in case the processor boots in legacy configuration
++* (SI_EVAReset is de-asserted and CONFIG5.K == 0) with 1GB DDR
++*
++* On entry, t1 is loaded with CP0_CONFIG
++*
++* ========================= Mappings =============================
++* Virtual memory           Physical memory            Mapping
++* 0x00000000 - 0x7fffffff  0x20000000 - 0x9ffffffff   MUSUK (kuseg)
++* 0x80000000 - 0x9fffffff  0x80000000 - 0x9ffffffff   UK    (kseg0)
++* 0xa0000000 - 0xbfffffff  0x20000000 - 0x3ffffffff   UK    (kseg1)
++* 0xc0000000 - 0xdfffffff             -               MSK   (kseg2)
++* 0xe0000000 - 0xffffffff  0xa0000000 - 0xbfffffff    UK     2nd IO
++*
++* user space virtual:   0x00000000 ~ 0x7fffffff
++* kernel space virtual: 0x60000000 ~ 0x9fffffff
++*                  physical: 0x20000000 ~ 0x5fffffff (flat 1GB)
++* user/kernel space overlapped from 0x60000000 ~ 0x7fffffff (virtual)
++* where physical 0x20000000 ~ 0x2fffffff (cached and uncached)
++*           virtual  0xa0000000 ~ 0xafffffff (1st IO space)
++*           virtual  0xf0000000 ~ 0xffffffff (2nd IO space)
++*
++* The last 64KB of physical memory are reserved for correct HIGHMEM
++* macros arithmetics.
++* Detailed KSEG and PHYS_OFFSET and PAGE_OFFSEt adaption, refer to
++* asm/mach-intel-mips/spaces.h
++*/
++	.macro  platform_eva_init
++
++	.set    push
++	.set    reorder
++	/*
++	 * Get Config.K0 value and use it to program
++	 * the segmentation registers
++	 */
++	mfc0    t1, CP0_CONFIG
++	andi    t1, 0x7 /* CCA */
++	move    t2, t1
++	ins     t2, t1, 16, 3
++	/* SegCtl0 */
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |               \
++		(5 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |    \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                                \
++		(((MIPS_SEGCFG_MSK << MIPS_SEGCFG_AM_SHIFT) |                 \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                                 \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	ins     t0, t1, 16, 3
++	mtc0    t0, $5, 2
++
++	/* SegCtl1 */
++	li      t0, ((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |                \
++		(1 << MIPS_SEGCFG_PA_SHIFT) | (2 << MIPS_SEGCFG_C_SHIFT) |     \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                                 \
++		(((MIPS_SEGCFG_UK << MIPS_SEGCFG_AM_SHIFT) |                   \
++		(1 << MIPS_SEGCFG_PA_SHIFT) |                                  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	ins     t0, t1, 16, 3
++	mtc0    t0, $5, 3
++
++	/* SegCtl2 */
++	li      t0, ((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |              \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                                  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) |                                 \
++		(((MIPS_SEGCFG_MUSK << MIPS_SEGCFG_AM_SHIFT) |                 \
++		(0 << MIPS_SEGCFG_PA_SHIFT) |                                  \
++		(1 << MIPS_SEGCFG_EU_SHIFT)) << 16)
++	or      t0, t2
++	mtc0    t0, $5, 4
++
++	jal     mips_ihb
++	mfc0    t0, $16, 5
++	li      t2, 0x40000000      /* K bit */
++	or      t0, t0, t2
++	mtc0    t0, $16, 5
++	sync
++	jal     mips_ihb
++
++	.set    pop
++	.endm
++
++	.macro	kernel_entry_setup
++	sync
++	ehb
++	platform_eva_init
++	.endm
++
++	.macro	smp_slave_setup
++	sync
++	ehb
++	platform_eva_init
++	.endm
++
++#endif /* __ASM_MACH_INTEL_MIPS_KERNEL_ENTRY_INIT_H */
+diff --git a/arch/mips/include/asm/mach-intel-mips/spaces.h b/arch/mips/include/asm/mach-intel-mips/spaces.h
+new file mode 100644
+index 000000000000..72410984d103
+--- /dev/null
++++ b/arch/mips/include/asm/mach-intel-mips/spaces.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Author: Leonid Yegoshin (yegoshin@mips.com)
++ * Copyright (C) 2012 MIPS Technologies, Inc.
++ * Copyright (C) 2014 Lei Chuanhua <Chuanhua.lei@lantiq.com>
++ * Copyright (C) 2018 Intel Corporation.
++ */
++
++#ifndef _ASM_INTEL_MIPS_SPACES_H
++#define _ASM_INTEL_MIPS_SPACES_H
++
++#define PAGE_OFFSET             _AC(0x80000000, UL)
++#define PHYS_OFFSET             _AC(0x20000000, UL)
++
++/* No Highmem Support */
++#define HIGHMEM_START		_AC(0xffff0000, UL)
++
++#define FIXADDR_TOP		((unsigned long)(long)(int)0xcffe0000)
++
++#include <asm/mach-generic/spaces.h>
++#endif /* __ASM_INTEL_MIPS_SPACES_H */
+diff --git a/arch/mips/intel-mips/Kconfig b/arch/mips/intel-mips/Kconfig
+new file mode 100644
+index 000000000000..f51570c43663
+--- /dev/null
++++ b/arch/mips/intel-mips/Kconfig
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: GPL-2.0-only
++if INTEL_MIPS
++
++choice
++	prompt "Built-in device tree"
++	help
++	  Legacy bootloaders do not pass a DTB pointer to the kernel, so
++	  if a "wrapper" is not being used, the kernel will need to include
++	  a device tree that matches the target board.
++
++	  The builtin DTB will only be used if the firmware does not supply
++	  a valid DTB.
++
++config DTB_INTEL_MIPS_GRX500
++	bool "Intel MIPS GRX500 Board"
++	select BUILTIN_DTB
++
++endchoice
++
++endif
+diff --git a/arch/mips/intel-mips/Makefile b/arch/mips/intel-mips/Makefile
+new file mode 100644
+index 000000000000..eed257db9f84
+--- /dev/null
++++ b/arch/mips/intel-mips/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++obj-y += prom.o
++obj-y += irq.o
++obj-y += time.o
+diff --git a/arch/mips/intel-mips/Platform b/arch/mips/intel-mips/Platform
+new file mode 100644
+index 000000000000..b4ef15ec165c
+--- /dev/null
++++ b/arch/mips/intel-mips/Platform
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# MIPS SoC platform
++#
++
++cflags-$(CONFIG_INTEL_MIPS)			+= -I$(srctree)/arch/mips/include/asm/mach-intel-mips
++ifdef CONFIG_EVA
++#	ifdef CONFIG_EVA_2GB
++#		load-$(CONFIG_LANTIQ)		= 0xffffffff20020000
++#	endif
++#	ifdef CONFIG_EVA_1GB
++#		load-$(CONFIG_LANTIQ)		= 0xffffffff60020000
++#	endif
++#	ifdef CONFIG_EVA_LEGACY
++#		load-$(CONFIG_LANTIQ)		= 0xffffffff80500000
++#	endif
++	load-$(CONFIG_INTEL_MIPS)		= 0xffffffff80500000
++else
++	load-$(CONFIG_INTEL_MIPS)		= 0xffffffff80020000
++endif
+diff --git a/arch/mips/intel-mips/irq.c b/arch/mips/intel-mips/irq.c
+new file mode 100644
+index 000000000000..2fbdd58aaf51
+--- /dev/null
++++ b/arch/mips/intel-mips/irq.c
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2016 Intel Corporation.
++ */
++#include <linux/init.h>
++#include <linux/irqchip.h>
++#include <linux/of_irq.h>
++#include <asm/irq.h>
++#include <asm/irq_cpu.h>
++#include <asm/mips-cps.h>
++#include <asm/time.h>
++
++void __init arch_init_irq(void)
++{
++	struct device_node *intc_node;
++
++	pr_info("EIC is %s\n", cpu_has_veic ? "on" : "off");
++	pr_info("VINT is %s\n", cpu_has_vint ? "on" : "off");
++
++	intc_node = of_find_compatible_node(NULL, NULL,
++					    "mti,cpu-interrupt-controller");
++	if (!cpu_has_veic && !intc_node)
++		mips_cpu_irq_init();
++
++	irqchip_init();
++}
++
++int get_c0_perfcount_int(void)
++{
++	return gic_get_c0_perfcount_int();
++}
++EXPORT_SYMBOL_GPL(get_c0_perfcount_int);
++
++unsigned int get_c0_compare_int(void)
++{
++	return gic_get_c0_compare_int();
++}
+diff --git a/arch/mips/intel-mips/prom.c b/arch/mips/intel-mips/prom.c
+new file mode 100644
+index 000000000000..0d62ec710264
+--- /dev/null
++++ b/arch/mips/intel-mips/prom.c
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2014 Lei Chuanhua <Chuanhua.lei@lantiq.com>
++ * Copyright (C) 2016 Intel Corporation.
++ */
++#include <linux/export.h>
++#include <linux/init.h>
++#include <linux/of_platform.h>
++#include <linux/of_fdt.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
++#include <linux/dma-map-ops.h>
++#include <linux/printk.h>
++#include <asm/bootinfo.h>
++#include <asm/mips-cps.h>
++#include <asm/mipsregs.h>
++#include <asm/prom.h>
++#include <asm/smp-ops.h>
++
++#define IOPORT_RESOURCE_START   0x10000000
++#define IOMEM_RESOURCE_START    0x10000000
++
++const char *get_system_type(void)
++{
++	return "Intel MIPS interAptiv SoC";
++}
++
++void prom_free_prom_memory(void)
++{
++}
++
++static void __init prom_init_cmdline(void)
++{
++	int i;
++	int argc;
++	char **argv;
++
++	/*
++	 * If u-boot pass parameters, it is ok, however, if without u-boot
++	 * JTAG or other tool has to reset all register value before it goes
++	 * emulation most likely belongs to this category
++	 */
++	if (fw_arg0 == 0 || fw_arg1 == 0)
++		return;
++
++	/*
++	 * a0: fw_arg0 - the number of string in init cmdline
++	 * a1: fw_arg1 - the address of string in init cmdline
++	 *
++	 * In accordance with the MIPS UHI specification, the bootloader can
++	 * pass the following arguments to the kernel: - $a0: -2. $a1: KSEG0
++	 * address of the flattened device-tree blob.
++	 */
++	if (fw_arg0 == -2)
++		return;
++
++	argc = fw_arg0;
++	argv = (char **)KSEG1ADDR(fw_arg1);
++
++	arcs_cmdline[0] = '\0';
++
++	for (i = 0; i < argc; i++) {
++		char *p = (char *)KSEG1ADDR(argv[i]);
++
++		if (argv[i] && *p) {
++			strlcat(arcs_cmdline, p, sizeof(arcs_cmdline));
++			strlcat(arcs_cmdline, " ", sizeof(arcs_cmdline));
++		}
++	}
++}
++
++static int __init plat_enable_iocoherency(void)
++{
++	if (!mips_cps_numiocu(0))
++		return 0;
++
++	/* Nothing special needs to be done to enable coherency */
++	pr_info("Coherence Manager IOCU detected\n");
++	/* Second IOCU for MPE or other master access register */
++	write_gcr_reg0_base(0xa0000000);
++	write_gcr_reg0_mask(0xf8000000 | CM_GCR_REGn_MASK_CMTGT_IOCU1);
++	return 1;
++}
++
++static void __init plat_setup_iocoherency(void)
++{
++	/*
++	 * Software coherency: the datapath masters are programmed with
++	 * direct-DDR bus addresses, which the Coherence Manager does not
++	 * snoop, so cache maintenance must run on every DMA.
++	 */
++	plat_enable_iocoherency();
++	dma_default_coherent = false;
++	pr_info("software DMA cache coherency enforced\n");
++}
++
++static void free_init_pages_eva_intel(void *begin, void *end)
++{
++	free_init_pages("unused kernel", __pa_symbol((unsigned long *)begin),
++			__pa_symbol((unsigned long *)end));
++}
++
++static void plat_early_init_devtree(void)
++{
++	void *dtb;
++
++	/*
++	 * The boot loader passes no device tree; get_fdt() returns the blob
++	 * appended to vmlinux.bin.
++	 */
++	dtb = get_fdt();
++	if (!dtb)
++		panic("no dtb found");
++
++	__dt_setup_arch(dtb);
++}
++
++void __init plat_mem_setup(void)
++{
++	ioport_resource.start = IOPORT_RESOURCE_START;
++	ioport_resource.end = ~0UL; /* No limit */
++	iomem_resource.start = IOMEM_RESOURCE_START;
++	iomem_resource.end = ~0UL; /* No limit */
++
++	set_io_port_base((unsigned long)KSEG1);
++
++	strscpy(arcs_cmdline, boot_command_line, COMMAND_LINE_SIZE);
++
++	plat_early_init_devtree();
++	plat_setup_iocoherency();
++
++	if (IS_ENABLED(CONFIG_EVA))
++		free_init_pages_eva = free_init_pages_eva_intel;
++	else
++		free_init_pages_eva = 0;
++}
++
++void __init device_tree_init(void)
++{
++	unflatten_and_copy_device_tree();
++}
++
++void __init prom_init(void)
++{
++	prom_init_cmdline();
++
++	/*
++	 * The boot firmware enters Linux with the core already in the CM
++	 * coherence domain and a coherent CCA selected, so nothing here may
++	 * join it again: the writes that would do so change the fabric
++	 * configuration of a system that is already running on it.
++	 */
++
++	/*
++	 * mips_cpc_probe() is skipped for the same reason: it writes
++	 * GCR_CPC_BASE, and re-pointing the CPC window while the other core
++	 * is running under the boot firmware's configuration is not safe
++	 * here.
++	 */
++
++	if (!register_cps_smp_ops())
++		return;
++
++	if (!register_vsmp_smp_ops())
++		return;
++}
+diff --git a/arch/mips/intel-mips/time.c b/arch/mips/intel-mips/time.c
+new file mode 100644
+index 000000000000..e3bb04b75271
+--- /dev/null
++++ b/arch/mips/intel-mips/time.c
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2016 Intel Corporation.
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/clocksource.h>
++#include <linux/of.h>
++
++#include <asm/time.h>
++
++void __init plat_time_init(void)
++{
++	unsigned long cpuclk;
++	struct device_node *np;
++	struct clk *clk;
++
++	of_clk_init(NULL);
++
++	np = of_get_cpu_node(0, NULL);
++	if (!np) {
++		pr_err("Failed to get CPU node\n");
++		return;
++	}
++
++	clk = of_clk_get(np, 0);
++	if (IS_ERR(clk)) {
++		pr_err("Failed to get CPU clock: %ld\n", PTR_ERR(clk));
++		return;
++	}
++
++	cpuclk = clk_get_rate(clk);
++	/* the chip resolution is the half of the clock*/
++	mips_hpt_frequency = cpuclk / 2;
++	clk_put(clk);
++
++	write_c0_compare(read_c0_count());
++	pr_info("CPU Clock: %ldHz  mips_hpt_frequency %dHz\n",
++		cpuclk, mips_hpt_frequency);
++	timer_probe();
++}

@@ -1,0 +1,522 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 16:33:01 +0200
+Subject: PCI: intel-gw: add xrx500 (GRX500/GRX350) root complex support
+
+The Lantiq/Intel xRX500 family puts three of these root complexes on one
+SoC. The application block is the same one this driver already knows --
+CCR with LTSSM in bit 0 at 0x10, MSG_CR at 0x30, PMC at 0x44, IRNEN at
+0xf4, IRNCR at 0xf8, INTx starting at bit 12 -- and the port logic
+registers behind it are stock DesignWare. The vendor's out-of-tree
+driver is this driver with the macros renamed; its link-up check is
+dw_pcie_link_up() spelled out longhand. What genuinely differs is the
+byte order, the absence of an address translation unit in the
+configuration path, and a couple of resources this SoC does not have.
+
+Byte order first, because it is the part that fails silently.
+
+This is a big-endian MIPS platform, and INTEL_MIPS deliberately does not
+select SWAP_IO_SPACE -- that switch is global, and the SoC's working
+ethernet datapath is written against the unswapped accessors. The
+controller hands back numerically correct 32-bit dwords regardless, so
+readl() is right and readb()/readw() read the mirrored byte lane. Left
+alone, dw_pcie_setup_rc()'s 16-bit write of PCI_CLASS_DEVICE lands on
+the revision ID and programming interface bytes instead of the class
+code. The root port then does not describe itself as a bridge, the core
+never scans the secondary bus, and there are no endpoints and no
+register that looks wrong. dw_pcie_find_capability()'s walk over the
+capability list is byte- and word-sized as well, and goes the same way.
+
+So provide .read_dbi/.write_dbi that do every sub-dword access as a
+dword read plus shift, and a dword read-modify-write. That covers all of
+DBI, and the iATU and eDMA blocks, which reuse the same callbacks with a
+different base -- hence honouring the @base argument rather than
+pci->dbi_base. It does not cover the root bus: dw_pcie_ops installs
+pci_generic_config_read()/write(), which reach dbi_base directly with
+readb()/readw(). Substituting the _read32/_write32 variants fixes that
+half; they read and write whole dwords and extract the lane themselves.
+This is the shape pcie-bt1.c uses for the same reason.
+
+Second, configuration space. The controller decodes its 8 MiB "config"
+window in hardware -- three bits of bus, five of device, three of
+function -- with no iATU in the path, which is what the vendor
+devicetree means by "intel,iatu = <0>". Supplying .child_ops is how that
+gets communicated: dw_pcie_setup_rc() programs the iATU only while
+child_ops is still the DesignWare default, so installing our own turns
+the whole iATU path off structurally rather than by a flag. Three bits
+of bus number is also why the binding stops the bus-range at 7; bus 8
+would alias back onto DBI.
+
+For the same reason the generic ECAM path has to be declined explicitly,
+or it would leave bridge->sysdata pointing at a struct pci_config_window
+that our .map_bus reads back as a struct dw_pcie_rp. That is not a
+theoretical tidy-up. Of the two tests in dw_pcie_ecam_enabled(), the
+window-size one already passes here: an 8 MiB config window is 8 ECAM
+buses and bus-range = <0 7> asks for exactly 8. Only the 256 MiB
+alignment test still says no, and it does so because of where these
+windows happen to sit rather than because anything in the binding pins
+them there. The decision is taken before ->init runs, so it goes through
+the soc data like the rest.
+
+The child accessor also refuses every device but 0 on the first child
+bus, which dw_pcie_other_conf_map_bus() leaves to only_one_child() in
+the core. That helper is not equivalent here. It answers yes only once
+the parent has been recognised as PCI_EXP_TYPE_ROOT_PORT, which is a
+conclusion drawn from the PCIe capability walk and the class code --
+that is, from the very sub-dword DBI accessors described above. Should
+those be subtly wrong, the guard is what makes the failure legible: the
+symptom becomes a link that enumerates nothing, rather than thirty-two
+identical phantom endpoints on bus 1 with BARs assigned to each out of
+the host bridge's memory window. The vendor driver has the same check.
+
+The root complex' own BAR0 and BAR1 read as zero, as they do in the
+vendor driver ("NB, ignore RC BAR0/BAR1 due to hardware bugs"), so the
+core sizes them as absent. There is deliberately no matching guard on
+writes -- the vendor has none either, and it is harmless: __pci_read_base()
+writes all-ones, reads the size back, and restores the value it first
+read, which this quirk made zero, and which is what dw_pcie_setup_rc()
+leaves in BAR0 anyway.
+
+Third, the chiptop byte swappers. Each root complex has an inbound and
+an outbound swap bit in a syscon register outside the controller, named
+by "intel,syscon" with the bit numbers in "intel,inbound-shift" and
+"intel,outbound-shift" and the per-board policy in the matching "-swap"
+properties. Missing shifts are refused rather than defaulted, and out of
+range shifts with them: the vendor BSP treats absent properties as zero
+and writes bit 0 twice, which on a three-RC SoC means quietly swapping
+some other port's traffic, and a shift past 31 would land back on bit 0
+by way of the shift count masking rather than by way of the zero. The
+regmap itself is mandatory on this SoC, and the soc data says so: the
+lookup helper returns a plain NULL both for an absent property and for
+a kernel built without MFD_SYSCON, and a NULL regmap means the swappers
+keep whatever the bootloader left them at. That is invisible from every
+register -- the link trains, configuration space reads correctly, BARs
+get assigned -- and shows up only as inbound DMA payloads with their
+bytes mirrored, which is to say as a device firmware load that fails or
+a descriptor ring of nonsense, diagnosed a long way from here. Failing
+the probe is the cheaper outcome. The write happens at the top of
+intel_pcie_host_setup(), before the core
+comes out of reset and before the link is trained. That is also the fix
+for a vendor bug: it does this once in probe and never again, so the
+setting does not survive suspend/resume; going through host_setup()
+covers ->init and intel_pcie_resume_noirq() alike.
+
+Fourth, interrupts. INTx only for now. INTA-D reach the GIC on their own
+lines through the devicetree "interrupt-map", and there is no MSI
+support here yet, so the soc data unmasks the four INTx sources and
+nothing else. The rest of PCIE_APP_IRN_INT are latched status bits in
+IRNCR, and this driver neither requests the application block interrupt
+nor clears that register; enabling them would strand a level line
+asserted for whoever requests that interrupt next.
+
+Keeping the DesignWare built-in MSI controller out needs a positive act,
+because dw_pcie_host_init() derives pp->has_msi_ctrl from the absence of
+an .msi_init hook and of "msi-parent"/"msi-map". Supplying a hook that
+returns zero clears has_msi_ctrl, which makes dw_pcie_msi_host_init()
+and the MSI register programming in dw_pcie_msi_init() both no-ops, and
+satisfies the one call site left. Supplying nothing would be actively
+worse than doing nothing: dw_pcie_msi_host_init() falls back to
+platform_get_irq(pdev, 0) when it finds no "msi" interrupt, which on
+this binding is the application block's "ir" line, and would take it
+over as a chained MSI demultiplexer.
+
+Lastly the resources. This SoC has no core reset line of its own -- the
+vendor devicetree describes no "resets" here -- so the soc data marks it
+optional. Clock, phy and PERST# gpio are all present and stay mandatory.
+The devicetree also needs no "pcie" alias: the vendor driver's single
+of_alias_get_id() call feeds nothing but debug prints and an interrupt
+name string, while the register bit positions come from the explicit
+shift properties and the PCI domain from "linux,pci-domain".
+
+Two pieces of the vendor bring-up sequence are intentionally not
+carried over. Its RC-mode and lane/width setup are gated on the link
+capability register reporting Gen3 or better, and this silicon reports
+Gen2, so on this hardware they have never run; making them run would be
+a change to behaviour, not a port of it. Its L2 handshake on teardown is
+gated the same way, and this driver already reaches the same conclusion
+from max-link-speed = <2>.
+
+pci->atu_base stays at dbi_base + 0xC0000. dw_pcie_get_resources() would
+otherwise leave it at the dbi_base + 0x300000 default, three megabytes
+past the end of the one-megabyte "dbi" mapping.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/pci/controller/dwc/pcie-intel-gw.c b/drivers/pci/controller/dwc/pcie-intel-gw.c
+index 5d34ca9ba069..9be70d5fc536 100644
+--- a/drivers/pci/controller/dwc/pcie-intel-gw.c
++++ b/drivers/pci/controller/dwc/pcie-intel-gw.c
+@@ -9,11 +9,13 @@
+ #include <linux/clk.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/pci_regs.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
+ #include <linux/property.h>
++#include <linux/regmap.h>
+ #include <linux/reset.h>
+ 
+ #include "../../pci.h"
+@@ -49,13 +51,30 @@
+ #define PCIE_APP_IRN_SYS_ERR_RC		BIT(29)
+ #define PCIE_APP_INTX_OFST		12
+ 
++#define PCIE_APP_IRN_INTX \
++	(PCIE_APP_IRN_INTA | PCIE_APP_IRN_INTB | \
++	PCIE_APP_IRN_INTC | PCIE_APP_IRN_INTD)
++
+ #define PCIE_APP_IRN_INT \
+ 	(PCIE_APP_IRN_AER_REPORT | PCIE_APP_IRN_PME | \
+ 	PCIE_APP_IRN_RX_VDM_MSG | PCIE_APP_IRN_SYS_ERR_RC | \
+ 	PCIE_APP_IRN_PM_TO_ACK | PCIE_APP_IRN_MSG_LTR | \
+ 	PCIE_APP_IRN_BW_MGT | PCIE_APP_IRN_LINK_AUTO_BW_STAT | \
+-	PCIE_APP_IRN_INTA | PCIE_APP_IRN_INTB | \
+-	PCIE_APP_IRN_INTC | PCIE_APP_IRN_INTD)
++	PCIE_APP_IRN_INTX)
++
++/*
++ * Byte-swap control for the three xRX500 root complexes, in the chiptop
++ * syscon rather than in the controller itself. One bit per direction per
++ * RC; which bits belong to which RC is described by "intel,inbound-shift"
++ * and "intel,outbound-shift" in the devicetree.
++ */
++#define PCIE_CHIPTOP_ENDIAN		0x4c
++
++/* xRX500 decodes its 8 MiB config window with only three bits of bus number */
++#define PCIE_XRX500_CFG_BUS(x)		(((x) & 0x7) << 20)
++#define PCIE_XRX500_CFG_DEV(x)		(((x) & 0x1f) << 15)
++#define PCIE_XRX500_CFG_FUNC(x)		(((x) & 0x7) << 12)
++#define PCIE_XRX500_CFG_REG(x)		((x) & 0xffc)
+ 
+ #define RESET_INTERVAL_MS		100
+ 
+@@ -65,12 +84,17 @@
+  * @host_ops: DesignWare host bridge hooks for this SoC
+  * @irn_mask: Application logic interrupts to unmask once the link is up
+  * @core_rst_optional: SoC has no core reset line of its own
++ * @native_ecam: Glue decodes the config window itself, keep generic ECAM away
++ * @needs_endian_syscon: Byte swapping lives outside the controller, "intel,syscon"
++ *			 is not optional here
+  */
+ struct intel_pcie_soc {
+ 	const struct dw_pcie_ops	*dw_pcie_ops;
+ 	const struct dw_pcie_host_ops	*host_ops;
+ 	u32				irn_mask;
+ 	bool				core_rst_optional;
++	bool				native_ecam;
++	bool				needs_endian_syscon;
+ };
+ 
+ struct intel_pcie {
+@@ -82,6 +106,11 @@ struct intel_pcie {
+ 	struct clk		*core_clk;
+ 	struct reset_control	*core_rst;
+ 	struct phy		*phy;
++	struct regmap		*syscon;
++	u32			inbound_shift;
++	u32			outbound_shift;
++	u32			inbound_swap;
++	u32			outbound_swap;
+ };
+ 
+ static void pcie_update_bits(void __iomem *base, u32 ofs, u32 mask, u32 val)
+@@ -122,6 +151,137 @@ static void pcie_rc_cfg_wr_mask(struct intel_pcie *pcie, u32 ofs,
+ 	pcie_update_bits(pcie->pci.dbi_base, ofs, mask, val);
+ }
+ 
++/*
++ * The xRX500 answers DBI and configuration reads with a numerically correct
++ * value in the wrong byte order, so every access through this window has to
++ * be swapped in software. The quirk is per-SoC, not per-board.
++ */
++static u32 intel_pcie_xrx500_read_dbi(struct dw_pcie *pci, void __iomem *base,
++				      u32 reg, size_t size)
++{
++	u32 val = readl(base + (reg & ~0x3));
++
++	if (size == 4)
++		return val;
++
++	val >>= (reg & 0x3) * BITS_PER_BYTE;
++
++	return val & (BIT(size * BITS_PER_BYTE) - 1);
++}
++
++static void intel_pcie_xrx500_write_dbi(struct dw_pcie *pci, void __iomem *base,
++					u32 reg, size_t size, u32 val)
++{
++	void __iomem *addr = base + (reg & ~0x3);
++	u32 mask, shift;
++
++	if (size == 4) {
++		writel(val, addr);
++		return;
++	}
++
++	shift = (reg & 0x3) * BITS_PER_BYTE;
++	mask = (BIT(size * BITS_PER_BYTE) - 1) << shift;
++
++	writel((readl(addr) & ~mask) | ((val << shift) & mask), addr);
++}
++
++static const struct dw_pcie_ops intel_pcie_xrx500_ops = {
++	.read_dbi	= intel_pcie_xrx500_read_dbi,
++	.write_dbi	= intel_pcie_xrx500_write_dbi,
++};
++
++/*
++ * The root bus does not go through .read_dbi/.write_dbi -- dw_pcie_ops
++ * installs pci_generic_config_read()/write(), which reach dbi_base with a
++ * bare readb()/readw() and land in the same trap. The 32-bit variants read
++ * and write whole dwords and do the lane extraction themselves, which is
++ * exactly what this controller needs.
++ */
++static int intel_pcie_xrx500_rd_own_conf(struct pci_bus *bus, unsigned int devfn,
++					 int where, int size, u32 *val)
++{
++	/* RC BAR0 and BAR1 are not usable on this controller. */
++	if ((where & ~0x3) == PCI_BASE_ADDRESS_0 ||
++	    (where & ~0x3) == PCI_BASE_ADDRESS_1) {
++		*val = 0;
++		return PCIBIOS_SUCCESSFUL;
++	}
++
++	return pci_generic_config_read32(bus, devfn, where, size, val);
++}
++
++static struct pci_ops intel_pcie_xrx500_own_ops = {
++	.map_bus	= dw_pcie_own_conf_map_bus,
++	.read		= intel_pcie_xrx500_rd_own_conf,
++	.write		= pci_generic_config_write32,
++};
++
++static void __iomem *intel_pcie_xrx500_child_map_bus(struct pci_bus *bus,
++						     unsigned int devfn,
++						     int where)
++{
++	struct dw_pcie_rp *pp = bus->sysdata;
++
++	/* A point-to-point link has exactly one device on it. */
++	if (pci_is_root_bus(bus->parent) && PCI_SLOT(devfn) > 0)
++		return NULL;
++
++	if (!dw_pcie_link_up(to_dw_pcie_from_pp(pp)))
++		return NULL;
++
++	return pp->va_cfg0_base + (PCIE_XRX500_CFG_BUS(bus->number) |
++				   PCIE_XRX500_CFG_DEV(PCI_SLOT(devfn)) |
++				   PCIE_XRX500_CFG_FUNC(PCI_FUNC(devfn)) |
++				   PCIE_XRX500_CFG_REG(where));
++}
++
++/*
++ * This controller decodes the "config" window itself; there is no address
++ * translation unit in the path, which is why the vendor devicetree says
++ * "intel,iatu = <0>". Providing .child_ops at all is what tells
++ * dw_pcie_setup_rc() so: it programs the iATU only when child_ops is still
++ * the DesignWare default. The eight bus numbers the window decodes are also
++ * why the devicetree bus-range must stop at 7 -- bus 8 would alias onto DBI.
++ */
++static struct pci_ops intel_pcie_xrx500_child_ops = {
++	.map_bus	= intel_pcie_xrx500_child_map_bus,
++	.read		= pci_generic_config_read32,
++	.write		= pci_generic_config_write32,
++};
++
++static void intel_pcie_endian_setup(struct intel_pcie *pcie)
++{
++	struct device *dev = pcie->pci.dev;
++	u32 mask, val = 0;
++
++	if (!pcie->syscon)
++		return;
++
++	mask = BIT(pcie->inbound_shift) | BIT(pcie->outbound_shift);
++
++	/*
++	 * The chiptop swappers exist for a big-endian CPU; the vendor BSP
++	 * compiles the "set" side out on little-endian and clears both bits
++	 * unconditionally there. Keep that, but as a plain condition so both
++	 * arms stay compile-checked.
++	 */
++	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN)) {
++		if (pcie->inbound_swap)
++			val |= BIT(pcie->inbound_shift);
++		if (pcie->outbound_swap)
++			val |= BIT(pcie->outbound_shift);
++	}
++
++	regmap_update_bits(pcie->syscon, PCIE_CHIPTOP_ENDIAN, mask, val);
++
++	if (!regmap_read(pcie->syscon, PCIE_CHIPTOP_ENDIAN, &val))
++		dev_info(dev, "chiptop endian %#04x: %#010x (in bit %u swap %u, out bit %u swap %u)\n",
++			 PCIE_CHIPTOP_ENDIAN, val, pcie->inbound_shift,
++			 pcie->inbound_swap, pcie->outbound_shift,
++			 pcie->outbound_swap);
++}
++
+ static void intel_pcie_ltssm_enable(struct intel_pcie *pcie)
+ {
+ 	pcie_app_wr_mask(pcie, PCIE_APP_CCR, PCIE_APP_CCR_LTSSM_ENABLE,
+@@ -261,6 +421,51 @@ static int intel_pcie_get_resources(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	pcie->syscon = syscon_regmap_lookup_by_phandle_optional(dev->of_node,
++								"intel,syscon");
++	if (IS_ERR(pcie->syscon))
++		return dev_err_probe(dev, PTR_ERR(pcie->syscon),
++				     "Failed to look up \"intel,syscon\"\n");
++
++	/*
++	 * syscon_regmap_lookup_by_phandle_optional() returns NULL both when
++	 * the property is absent and when the lookup fails, so the two cases
++	 * have to be told apart by checking for the property first.
++	 */
++	if (pcie->soc->needs_endian_syscon && !pcie->syscon)
++		return dev_err_probe(dev, -EINVAL,
++				     "\"intel,syscon\" is required on this SoC\n");
++
++	if (pcie->syscon) {
++		/*
++		 * Which bits of the chiptop register belong to this root
++		 * complex is not derivable from anything else the node
++		 * carries, and getting it wrong means silently swapping some
++		 * other RC's traffic, so refuse to guess. The vendor BSP
++		 * defaults both to zero and writes bit 0 twice when the
++		 * properties are missing.
++		 */
++		ret = device_property_read_u32(dev, "intel,inbound-shift",
++					       &pcie->inbound_shift);
++		if (!ret)
++			ret = device_property_read_u32(dev, "intel,outbound-shift",
++						       &pcie->outbound_shift);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "\"intel,syscon\" needs intel,inbound-shift and intel,outbound-shift\n");
++
++		if (pcie->inbound_shift > 31 || pcie->outbound_shift > 31)
++			return dev_err_probe(dev, -ERANGE,
++					     "Endian bit %u/%u is outside the chiptop register\n",
++					     pcie->inbound_shift,
++					     pcie->outbound_shift);
++
++		device_property_read_u32(dev, "intel,inbound-swap",
++					 &pcie->inbound_swap);
++		device_property_read_u32(dev, "intel,outbound-swap",
++					 &pcie->outbound_swap);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -302,6 +507,17 @@ static int intel_pcie_host_setup(struct intel_pcie *pcie)
+ 	int ret;
+ 	struct dw_pcie *pci = &pcie->pci;
+ 
++	/*
++	 * Configure the chiptop byte swappers before anything else touches the
++	 * controller: they sit in the path the DBI and configuration windows
++	 * ride on, and the syscon block they live in is reachable while the
++	 * core is still in reset and its clock still gated. The vendor BSP
++	 * does this once in probe and never again, so its setting does not
++	 * survive a suspend/resume cycle; doing it here covers ->init and
++	 * intel_pcie_resume_noirq() alike.
++	 */
++	intel_pcie_endian_setup(pcie);
++
+ 	intel_pcie_core_rst_assert(pcie);
+ 	intel_pcie_device_rst_assert(pcie);
+ 	intel_pcie_core_rst_deassert(pcie);
+@@ -336,6 +552,12 @@ static int intel_pcie_host_setup(struct intel_pcie *pcie)
+ 	if (ret)
+ 		goto err;
+ 
++	/*
++	 * Clear any pending status before unmasking, as the vendor driver
++	 * does per pin.
++	 */
++	pcie_app_wr(pcie, PCIE_APP_IRNCR, pcie->soc->irn_mask);
++
+ 	/* Enable integrated interrupts */
+ 	pcie_app_wr_mask(pcie, PCIE_APP_IRNEN, pcie->soc->irn_mask,
+ 			 pcie->soc->irn_mask);
+@@ -407,12 +629,58 @@ static const struct dw_pcie_host_ops intel_pcie_dw_ops = {
+ 	.init = intel_pcie_rc_init,
+ };
+ 
++/*
++ * INTx only: INTA-D reach the GIC over their own lines, and there is no MSI
++ * controller behind this root complex.
++ */
++static int intel_pcie_xrx500_msi_init(struct dw_pcie_rp *pp)
++{
++	return 0;
++}
++
++static int intel_pcie_xrx500_rc_init(struct dw_pcie_rp *pp)
++{
++	pp->bridge->ops = &intel_pcie_xrx500_own_ops;
++	pp->bridge->child_ops = &intel_pcie_xrx500_child_ops;
++
++	return intel_pcie_rc_init(pp);
++}
++
++static const struct dw_pcie_host_ops intel_pcie_xrx500_dw_ops = {
++	.init = intel_pcie_xrx500_rc_init,
++	.msi_init = intel_pcie_xrx500_msi_init,
++};
++
+ static const struct intel_pcie_soc lgm_pcie_soc = {
+ 	.dw_pcie_ops		= &intel_pcie_ops,
+ 	.host_ops		= &intel_pcie_dw_ops,
+ 	.irn_mask		= PCIE_APP_IRN_INT,
+ };
+ 
++static const struct intel_pcie_soc xrx500_pcie_soc = {
++	.dw_pcie_ops		= &intel_pcie_xrx500_ops,
++	.host_ops		= &intel_pcie_xrx500_dw_ops,
++	/* Unmask the INTx sources and nothing else. */
++	.irn_mask		= PCIE_APP_IRN_INTX,
++	/*
++	 * No core reset of its own: the controller leaves reset with the block
++	 * it sits in, and the vendor devicetree describes no "resets" here.
++	 */
++	.core_rst_optional	= true,
++	/*
++	 * The controller decodes the "config" window itself; it is not
++	 * ECAM-shaped, so the bus number is masked to three bits and
++	 * bus-range stops at 7.
++	 */
++	.native_ecam		= true,
++	/*
++	 * Byte swapping for this SoC is in the chiptop syscon rather than in
++	 * the controller, so an absent regmap is not a missing nicety, it is a
++	 * datapath left in an unknown endianness. See intel_pcie_get_resources().
++	 */
++	.needs_endian_syscon	= true,
++};
++
+ static int intel_pcie_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -445,6 +713,7 @@ static int intel_pcie_probe(struct platform_device *pdev)
+ 
+ 	pci->ops = pcie->soc->dw_pcie_ops;
+ 	pp->ops = pcie->soc->host_ops;
++	pp->native_ecam = pcie->soc->native_ecam;
+ 
+ 	ret = dw_pcie_host_init(pp);
+ 	if (ret) {
+@@ -462,6 +731,7 @@ static const struct dev_pm_ops intel_pcie_pm_ops = {
+ 
+ static const struct of_device_id of_intel_pcie_match[] = {
+ 	{ .compatible = "intel,lgm-pcie", .data = &lgm_pcie_soc },
++	{ .compatible = "intel,xrx500-pcie", .data = &xrx500_pcie_soc },
+ 	{}
+ };
+ 

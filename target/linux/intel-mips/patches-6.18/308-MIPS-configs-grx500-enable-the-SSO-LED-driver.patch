@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 13:35:23 +0200
+Subject: MIPS: configs: grx500: enable the SSO LED driver
+
+The FRITZ!Box 7590's front panel needs LEDS_LGM, and this defconfig is
+where every other feature block on this platform declares itself. As a
+module, matching the two LED symbols already here and the reason stated
+in OpenWrt's target config: the driver ships as a kmod package, and =y
+would leave that package with no object to install.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index c619a89c4a0b..fd543dfedcb1 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -116,6 +116,7 @@ CONFIG_USB_DWC3_HOST=y
+ CONFIG_NEW_LEDS=y
+ CONFIG_LEDS_CLASS=y
+ CONFIG_LEDS_GPIO=y
++CONFIG_LEDS_LGM=m
+ CONFIG_LEDS_TRIGGERS=y
+ CONFIG_LEDS_TRIGGER_TIMER=y
+ CONFIG_LEDS_TRIGGER_DEFAULT_ON=y

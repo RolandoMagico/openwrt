@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 17:08:23 +0200
+Subject: mfd: syscon: add syscon_regmap_lookup_by_phandle_optional_args()
+
+A driver whose syscon property is mandatory on one SoC and absent on
+another has to choose between the two ends of the lookup family:
+syscon_regmap_lookup_by_phandle_optional(), which reports absence as NULL
+but cannot carry the phandle arguments, or
+syscon_regmap_lookup_by_phandle_args(), which carries them but reports
+absence as an error the caller has to recognise by errno.
+
+Callers that pick the first end keep the register offsets the arguments
+would have supplied as driver-side defines, which is the thing the
+arguments exist to avoid. Callers that pick the second end open-code the
+errno check, and can get it subtly wrong: the _args() form reports an
+absent property as -ENOENT but an unresolvable phandle as -ENODEV, so a
+check that treats any error as "this SoC has no syscon" turns a mistyped
+device tree into a silently unconfigured device.
+
+Add the missing combination, mapping only -ENOENT to NULL. A property
+that is present but does not resolve still fails, which is a distinction
+the existing _optional() variant cannot make: it wraps
+syscon_regmap_lookup_by_phandle(), where both cases arrive as -ENODEV.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/mfd/syscon.c b/drivers/mfd/syscon.c
+index ae71a2710bed..0f0fd633fabc 100644
+--- a/drivers/mfd/syscon.c
++++ b/drivers/mfd/syscon.c
+@@ -360,3 +360,26 @@ struct regmap *syscon_regmap_lookup_by_phandle_optional(struct device_node *np,
+ 	return regmap;
+ }
+ EXPORT_SYMBOL_GPL(syscon_regmap_lookup_by_phandle_optional);
++
++/*
++ * It behaves the same as syscon_regmap_lookup_by_phandle_args() except where
++ * the property is absent. In this case, instead of returning -ENOENT, the
++ * function returns NULL and leaves @out_args untouched. A property that is
++ * present but does not resolve still fails, so a device tree that names a
++ * syscon the wrong way is not mistaken for one that names none.
++ */
++struct regmap *syscon_regmap_lookup_by_phandle_optional_args(struct device_node *np,
++					const char *property,
++					int arg_count,
++					unsigned int *out_args)
++{
++	struct regmap *regmap;
++
++	regmap = syscon_regmap_lookup_by_phandle_args(np, property, arg_count,
++						      out_args);
++	if (IS_ERR(regmap) && PTR_ERR(regmap) == -ENOENT)
++		return NULL;
++
++	return regmap;
++}
++EXPORT_SYMBOL_GPL(syscon_regmap_lookup_by_phandle_optional_args);
+diff --git a/include/linux/mfd/syscon.h b/include/linux/mfd/syscon.h
+index aad9c6b50463..adf70202c960 100644
+--- a/include/linux/mfd/syscon.h
++++ b/include/linux/mfd/syscon.h
+@@ -28,6 +28,10 @@ struct regmap *syscon_regmap_lookup_by_phandle_args(struct device_node *np,
+ 						    unsigned int *out_args);
+ struct regmap *syscon_regmap_lookup_by_phandle_optional(struct device_node *np,
+ 							const char *property);
++struct regmap *syscon_regmap_lookup_by_phandle_optional_args(struct device_node *np,
++							     const char *property,
++							     int arg_count,
++							     unsigned int *out_args);
+ int of_syscon_register_regmap(struct device_node *np,
+ 			      struct regmap *regmap);
+ #else
+@@ -69,6 +73,15 @@ static inline struct regmap *syscon_regmap_lookup_by_phandle_optional(
+ 	return NULL;
+ }
+ 
++static inline struct regmap *syscon_regmap_lookup_by_phandle_optional_args(
++					struct device_node *np,
++					const char *property,
++					int arg_count,
++					unsigned int *out_args)
++{
++	return NULL;
++}
++
+ static inline int of_syscon_register_regmap(struct device_node *np,
+ 					struct regmap *regmap)
+ {

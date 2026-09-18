@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 12 Aug 2026 15:55:24 +0000
+Subject: MIPS: intel-mips: set NR_CPUS=4 in grx500_defconfig
+
+The GRX350's interAptiv cluster is 2 cores x 2 VPEs, i.e. 4 logical
+CPUs. The FRITZ!Box 7560 board DTS added by this series declares all
+four, and the OpenWrt overlay for this target already ships
+CONFIG_NR_CPUS=4, so raise the in-tree defconfig to match the hardware
+topology instead of describing half of it.
+
+This is not an SMP enablement. Boot remains effectively uniprocessor:
+smp-cps self-disables on this platform, because the CPS vector
+allocation is skipped under the CONFIG_INTEL_MIPS guard in
+cps_smp_setup() so core_entry_reg stays zero and cps_prepare_cpus()
+bails out with "core_entry address unsuitable"; the shipped cmdline
+also carries nosmp. Secondary bring-up is barred on this SoC in the
+first place, as the CM2 reset vector for a secondary core cannot reach
+RAM above PHYS_OFFSET through CKSEG1.
+
+What the value does buy is correctness for anything sized off NR_CPUS.
+Nothing in the tree should be, but getting the topology right removes a
+class of latent mis-sizing at zero runtime cost.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index 9dd7ba8e1f74..c81e5195923f 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -5,7 +5,7 @@ CONFIG_SCHED_SMT=y
+ # CONFIG_MIPS_MT_FPAFF is not set
+ CONFIG_MIPS_CPS=y
+ CONFIG_DEFAULT_MMAP_MIN_ADDR=65536
+-CONFIG_NR_CPUS=2
++CONFIG_NR_CPUS=4
+ CONFIG_HZ_100=y
+ # CONFIG_SECCOMP is not set
+ # CONFIG_LOCALVERSION_AUTO is not set

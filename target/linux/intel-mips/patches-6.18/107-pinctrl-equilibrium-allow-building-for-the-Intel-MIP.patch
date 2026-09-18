@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 16:21:42 +0000
+Subject: pinctrl: equilibrium: allow building for the Intel MIPS platform
+
+The Equilibrium pin controller is not exclusive to the Lightning
+Mountain (x86) SoC: the Intel MIPS (xRX500/GRX350) family carries the
+very same IP block. Its PINPAD and GPIO register maps are byte-identical
+to the ones this driver programs -- REG_PMX_BASE/PUEN/PDEN/SRC/DCC0/
+DCC1/OD/AVAIL at 0x00/0x80..0x98 and GPIO OUT/IN/DIR/IRN*/OUTSET/OUTCLR/
+DIRSET/DIRCLR at 0x00..0x4C -- as can be verified against the vendor
+xrx500 pinctrl driver in the AVM 4.9 tree (drivers/pinctrl/
+pinctrl-equilibrium.{c,h}, bound there to "intel,pinctrl-xrx500").
+
+Extend the dependency so PINCTRL_EQUILIBRIUM is selectable on
+INTEL_MIPS, mirroring what "serial: lantiq: allow building for the Intel
+MIPS platform", earlier in this series, did for the shared ASC UART.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/pinctrl/Kconfig b/drivers/pinctrl/Kconfig
+index 80db4195a559..3de5abdd8e0b 100644
+--- a/drivers/pinctrl/Kconfig
++++ b/drivers/pinctrl/Kconfig
+@@ -230,7 +230,7 @@ config PINCTRL_EP93XX
+ config PINCTRL_EQUILIBRIUM
+ 	tristate "Generic pinctrl and GPIO driver for Intel Lightning Mountain SoC"
+ 	depends on OF && HAS_IOMEM
+-	depends on X86 || COMPILE_TEST
++	depends on X86 || INTEL_MIPS || COMPILE_TEST
+ 	select PINMUX
+ 	select PINCONF
+ 	select GPIOLIB

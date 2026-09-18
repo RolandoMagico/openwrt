@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:00:41 +0000
+Subject: MIPS: smp-cps: leave the fabric alone on intel-mips
+
+cps_smp_setup() establishes the coherence environment for core 0: it
+forces a coherent cache attribute, calls mips_cps_core_init(), joins the
+core to the coherence domain and allocates the CPS exception vectors.
+
+On intel-mips the boot chain has already done all of it before the
+kernel is entered, so none of it is the kernel's to redo. The core
+arrives with a coherent write-back attribute selected and already joined
+to the coherence domain, which leaves the attribute force and the domain
+write restating the state the platform is running on, and
+mips_cps_core_init() would rewrite TCHALT, TCBIND and VPECONF0 on the
+live core to get there. The CPS vectors are unused for a separate
+reason: this SoC releases its secondary VPEs through a firmware mailbox,
+and the CPS reset path could not reach them in any case, because a
+freshly reset core decodes GCR_Cx_RESET_BASE under legacy segmentation,
+which on this SoC addresses no RAM.
+
+Skip the block when CONFIG_INTEL_MIPS is enabled. The fallback chain is
+safe: core_entry_reg stays zero, and cps_prepare_cpus() checks it and
+self-disables before releasing any core, so no secondary is started
+against an unset vector.
+
+Assisted-by: Claude:claude-opus-4-7
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/kernel/smp-cps.c b/arch/mips/kernel/smp-cps.c
+index e2094922cec0..d28d50631caa 100644
+--- a/arch/mips/kernel/smp-cps.c
++++ b/arch/mips/kernel/smp-cps.c
+@@ -266,20 +266,28 @@ static void __init cps_smp_setup(void)
+ 		__cpu_logical_map[v] = v;
+ 	}
+ 
+-	/* Set a coherent default CCA (CWB) */
+-	change_c0_config(CONF_CM_CMASK, 0x5);
++	/*
++	 * Skip the CPS fabric writes on intel-mips: the firmware boot chain
++	 * establishes CM membership and the coherent CCA before the kernel is
++	 * entered, and re-programming either from cached code is neither
++	 * necessary nor safe here.
++	 */
++	if (!IS_ENABLED(CONFIG_INTEL_MIPS)) {
++		/* Set a coherent default CCA (CWB) */
++		change_c0_config(CONF_CM_CMASK, 0x5);
+ 
+-	/* Initialise core 0 */
+-	mips_cps_core_init();
++		/* Initialise core 0 */
++		mips_cps_core_init();
+ 
+-	/* Make core 0 coherent with everything */
+-	write_gcr_cl_coherence(0xff);
++		/* Make core 0 coherent with everything */
++		write_gcr_cl_coherence(0xff);
+ 
+-	if (allocate_cps_vecs())
+-		pr_err("Failed to allocate CPS vectors\n");
++		if (allocate_cps_vecs())
++			pr_err("Failed to allocate CPS vectors\n");
+ 
+-	if (core_entry_reg && mips_cm_revision() >= CM_REV_CM3)
+-		write_gcr_bev_base(core_entry_reg);
++		if (core_entry_reg && mips_cm_revision() >= CM_REV_CM3)
++			write_gcr_bev_base(core_entry_reg);
++	}
+ 
+ #ifdef CONFIG_MIPS_MT_FPAFF
+ 	/* If we have an FPU, enroll ourselves in the FPU-full mask */

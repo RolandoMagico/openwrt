@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 10:56:27 +0200
+Subject: MIPS: dts: intel-mips: widen the FRITZ!Box 7590 to its full 512 MiB
+
+The memory node declared 224 MiB of a 512 MiB board. That ceiling was
+never about the part: it was the boundary of the 4Kec bootcore's window.
+A dual-kernel image starts that bootcore alongside this kernel, and the
+bootcore blob in it declares ram-size = <256>; the bootcore turns that
+number into a PM_DDR_GROUP_NONE deny-all region over everything above
+it, so every initiator loses the upper half of populated DRAM. The
+vendor describes that second CPU and its own memory window in its
+bootcore device tree (grx550_bootcore.dtsi).
+
+A single-kernel image removes the premise rather than working around it.
+It starts no bootcore, so the protection pass never runs and the deny-all
+region never exists. With no fabric denial there is nothing between this
+kernel and the rest of the DRAM, so declare all of it.
+
+The consequence is a hard coupling, and the comment above the node says
+so at length: this DTB is single-kernel-only. Booting it from a
+dual-kernel image reinstates the deny-all across the upper half of the
+range it declares, and the failure is a fault or a hang on first touch up
+there, not a diagnosable message.
+
+Add the shm rng seed reservation at 0x3dfb0000, which could not be
+declared while the node ended at 224 MiB. The vendor states the address
+absolutely on both cores. It declares the region without no-map and with
+an avm,shm-rng-seed-early compatible, because its driver reads the buffer
+from a RESERVEDMEM_OF_DECLARE hook; mainline has no such driver, so this
+is a pure address reservation -- compatibles dropped, no-map added,
+because nothing here should map or read it.
+
+Keep the cpunet and bootcore reservations. They stop being free at this
+width: while the node ended at 0x2e000000 the bootcore window was outside
+memblock.memory and its no-map was a supported no-op, whereas now both
+fall inside and 32 MiB plus 256 KiB come off usable RAM for real. That is
+worth paying. They are inert on the single-kernel boots this DTB is for,
+and they are what makes a dual-kernel boot survivable rather than
+silently corrupting; they should be deleted with the dual-kernel chain,
+not before it.
+
+One bound did not move. The uncached KSEG1 alias of DRAM still ends at
+PHYS_OFFSET + SZ_256M = 0x30000000, so general dma_alloc_coherent()
+consumers must stay below it. Cached RAM is fine across the whole node,
+since under EVA's SegCtl KSEG0 maps 0x80000000 to 0x20000000 and spans
+all 512 MiB.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 1c341e2bd329..9ff2a40bb044 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -27,29 +27,42 @@ avm-hw-revision {
+ 	};
+ 
+ 	/*
+-	 * 224 MiB of the board's 512 MiB, at PHYS_OFFSET 0x20000000.
++	 * The board's full 512 MiB, at PHYS_OFFSET 0x20000000.
+ 	 *
+-	 * The ceiling is not a guess and it is not the part's size. Two
+-	 * separate things sit above it:
++	 * ## THIS DTB IS SINGLE-KERNEL-ONLY.                      ##
++	 * ## Booting it from a dual-kernel container corrupts or  ##
++	 * ## hangs, and it does so silently at first.             ##
+ 	 *
+-	 * The 4Kec bootcore. It runs concurrently with this kernel on every
+-	 * dual-kernel boot, out of the 32 MiB window at 0x2e000000, with its
+-	 * cpunet mailbox pool immediately below. Ending the memory node
+-	 * exactly at 0x2e000000 keeps Linux and the bootcore out of each
+-	 * other's DRAM by construction. Protecting: [0x30000000, 0x9fffffff]"
+-	 * on this silicon. Anything this kernel places above 0x30000000 would
+-	 * be denied by the fabric, not merely shared.
++	 * The coupling is exact and it is not a style preference. The
++	 * bootcore's protect_unattached() takes the ram-size = <256> its own
++	 * device tree declares and programs a PM_DDR_GROUP_NONE deny-all
++	 * fabric region over its 32 MiB window at [0x2e000000, 0x2fffffff]
++	 * and over everything above that size, [0x30000000, 0x9fffffff].
+ 	 *
+-	 * Widening past this needs the bootcore question settled first (a
+-	 * bootcore built for 512 MiB, or a single-kernel image that starts no
+-	 * bootcore at all) and the KSEG1 aperture bound respected -- see the
+-	 * warning on the reservations below. It also cannot move the CBM pools
+-	 * that seale_avm.dtsi reserves at 0x23800000..0x25200000, only extend
+-	 * past them.
++	 * The upper half of this board's populated DRAM -- precisely the half
++	 * this memory node now declares -- is then denied to every initiator.
++	 * The failure is a fault or hang on first touch of anything above
++	 * 0x30000000, and it is not the KSEG1-aperture class and not helped
++	 * by staying under that bound.
++	 *
++	 * A single-kernel image starts no bootcore, so the protection pass
++	 * never runs and this node is safe.
++	 *
++	 * Two bounds that did NOT move and still apply at 512 MiB:
++	 *
++	 * The uncached KSEG1 alias of DRAM ends at PHYS_OFFSET + 0x12310000 =
++	 * 0x32310000 (~291 MiB), measured. Cached RAM is fine across the
++	 * whole node -- under EVA's SegCtl, KSEG0 maps 0x80000000 to
++	 * 0x20000000 and covers all 512 MiB -- but general
++	 * dma_alloc_coherent() consumers must stay below 0x32310000. hdma is
++	 * already re-bound to that aperture; a new uncached consumer is what
++	 * would break here first, not the node width. The CBM pools at
++	 * 0x23800000..0x25200000 that seale_avm.dtsi reserves cannot move,
++	 * only be extended past.
+ 	 */
+ 	memory@20000000 {
+ 		device_type = "memory";
+-		reg = <0x20000000 0x0e000000>;
++		reg = <0x20000000 0x20000000>;
+ 	};
+ 
+ 	aliases {
+@@ -104,6 +117,15 @@ bootcore@2e000000 {
+ 			reg = <0x2e000000 0x2000000>;
+ 			no-map;
+ 		};
++
++		/*
++		 * Fixed-address seed buffer shared with the second CPU;
++		 * reserved no-map so nothing here maps or reads it.
++		 */
++		shm-rng-seed@3dfb0000 {
++			reg = <0x3dfb0000 0x1000>;
++			no-map;
++		};
+ 	};
+ };
+ 

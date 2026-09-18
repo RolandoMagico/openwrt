@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 16:25:48 +0200
+Subject: PCI: intel-gw: allow building on MIPS
+
+The Intel Gateway PCIe controller is a DesignWare core behind an Intel
+application-logic wrapper, and the same wrapper sits in front of the
+three root complexes on the Lantiq/Intel GRX500 family (xRX500, GRX350),
+which are MIPS interAptiv rather than x86. The register block matches:
+the application block's CCR/LTSSM, MSG_CR, PMC, IRNEN and IRNCR live at
+the same offsets, and the port logic registers are the stock DesignWare
+ones.
+
+Nothing in the driver is x86-specific -- it is written against readl(),
+the DesignWare core library, the generic clock, reset, phy and gpiod
+APIs, and device properties. The dependency simply predates any non-x86
+user.
+
+Widen it rather than replace it, so the existing Intel Gateway (LGM)
+platforms keep the driver exactly as before, and COMPILE_TEST coverage
+on every other architecture stays in place.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/pci/controller/dwc/Kconfig b/drivers/pci/controller/dwc/Kconfig
+index 349d4657393c..d59b3eefccdc 100644
+--- a/drivers/pci/controller/dwc/Kconfig
++++ b/drivers/pci/controller/dwc/Kconfig
+@@ -175,7 +175,7 @@ config PCIE_HISI_STB
+ 
+ config PCIE_INTEL_GW
+ 	bool "Intel Gateway PCIe controller "
+-	depends on OF && (X86 || COMPILE_TEST)
++	depends on OF && (X86 || MIPS || COMPILE_TEST)
+ 	depends on PCI_MSI
+ 	select PCIE_DW_HOST
+ 	help

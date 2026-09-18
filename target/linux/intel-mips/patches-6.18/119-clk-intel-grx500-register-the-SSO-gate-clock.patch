@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 13:34:59 +0200
+Subject: clk: intel: grx500: register the SSO gate clock
+
+GCLK_SSO and G_SSO_SHIFT have both been in the tree since the driver
+arrived, but no INTEL_GATE() entry ever turned them into a clock, so
+clocks = <&cgu GCLK_SSO> could not resolve. The LED controller at
+0x16d00000 needs it twice over: devm_clk_bulk_get() fails the probe if
+either of its two named clocks is missing, and syscon_node_to_regmap()
+independently attaches clock index 0 to the regmap as the gate on
+register access.
+
+CLK_IGNORE_UNUSED, for the reason the comment above the table gives at
+length: the boot chain establishes the gate state this SoC runs on and
+nothing in the vendor tree ever changes a gate bit, so an unclaimed gate
+is not an idle one and clk_disable_unused() must not treat it as one.
+
+There is a second reason here, specific to this gate. The LED driver
+registers a devm action that disables its clocks, so a probe that fails
+anywhere after clk_bulk_prepare_enable() -- a deferred gpiod get, say
+-- actively turns this gate off on the way out, and it was on before
+the driver existed. Without the flag the same is true of any boot where
+the module is simply absent. The gate the vendor never touches should
+survive both.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/clk/intel/clk-grx500.c b/drivers/clk/intel/clk-grx500.c
+index 6ae36e27dc71..b3447f43cb13 100644
+--- a/drivers/clk/intel/clk-grx500.c
++++ b/drivers/clk/intel/clk-grx500.c
+@@ -130,6 +130,8 @@ static struct intel_clk_branch grx500_branch_clks[] __initdata = {
+ 		   G_USB0_SHIFT, GATE_CLK_HW, 0),
+ 	INTEL_GATE(GCLK_USB1, "g_usb1", NULL, CLK_IGNORE_UNUSED, GRX500_CLK_GSR1,
+ 		   G_USB1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(GCLK_SSO, "g_sso", NULL, CLK_IGNORE_UNUSED, GRX500_CLK_GSR1,
++		   G_SSO_SHIFT, GATE_CLK_HW, 0),
+ 	INTEL_GATE(GCLK_GPTC0, "g_gptc0", NULL, CLK_IGNORE_UNUSED, GRX500_CLK_GSR1,
+ 		   G_GPTC0_SHIFT, GATE_CLK_HW, 0),
+ 	INTEL_GATE(GCLK_GPTC1, "g_gptc1", NULL, CLK_IGNORE_UNUSED, GRX500_CLK_GSR1,

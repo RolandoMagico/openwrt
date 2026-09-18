@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 15 Aug 2026 10:54:53 +0200
+Subject: MIPS: dts: intel-mips: reserve a ramoops region on the FRITZ!Box 7560
+
+The board has no JTAG. The serial console is the only post-mortem channel
+there is, which means a wedge nobody is watching leaves nothing behind at
+all. Reserve 1 MiB for pstore's ram backend so the tail of the kernel log
+survives into the next boot.
+
+The address is picked by three constraints rather than convenience. We
+do not build CONFIG_EVA, so the kernel loads at physical 0x20020000 and
+the vendor's own ramoops region -- 4 MiB at 0x20100000, which works for
+them only because they do build CONFIG_EVA and load at 0x20500000 -- is
+inside our image. The region also has to stay low enough that a recovery
+image staged in RAM cannot overwrite the record being diagnosed. That
+leaves the gap immediately below 0x23800000.
+
+The zone split is lopsided towards the console on purpose. A watchdog
+bite is not an oops, so nothing calls kmsg_dump and the dmesg zones only
+ever fill on a real panic -- and each one stores at most
+PSTORE_DEFAULT_KMSG_BYTES of a single part, so sizing them generously
+reserves space that can never be used. The console zone is the only thing
+that captures a silent wedge, which is precisely the case this
+reservation exists for.
+
+mem-type = <1> maps the region uncached, because a record has to be in
+DRAM rather than a dirty cache line when the watchdog pulls the reset and
+nothing flushes on that path. Not no-map: all that is wanted is for the
+allocator to keep off the region, which memblock_reserve does, whereas
+no-map asks the architecture to leave the range out of its own mapping
+for no benefit here.
+
+Whether the contents survive the RCU warm reset at all is not something
+the vendor sources answer, and it is what the hardware test is for.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+index cf26ea178c63..7108b3415d75 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -82,6 +82,14 @@ reserved-memory {
+ 		#address-cells = <1>;
+ 		#size-cells = <1>;
+ 		ranges;
++
++		ramoops@23700000 {
++			compatible = "ramoops";
++			reg = <0x23700000 0x100000>;
++			record-size = <0x4000>;
++			console-size = <0x80000>;
++			mem-type = <1>;
++		};
+ 	};
+ };
+ 

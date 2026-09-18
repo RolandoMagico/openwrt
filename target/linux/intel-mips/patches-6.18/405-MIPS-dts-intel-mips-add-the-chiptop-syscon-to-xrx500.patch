@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 16:24:08 +0200
+Subject: MIPS: dts: intel-mips: add the chiptop syscon to xrx500.dtsi
+
+The xRX500 keeps a page of chip-level configuration registers one
+0x80000 step above the RCU, at physical 0x16080000. Nothing in this
+tree describes it yet, and nothing needs to bind a driver to it: it is
+a grab bag of single fields that belong to other blocks' bring-up
+sequences, reached by phandle from whoever owns the block.
+
+The PCIe support landing next needs two of them. The root complexes
+drive an endianness word at +0x4c, one inbound and one outbound
+byte-swap bit per port; the serdes PHYs drive the IFMUX reference-clock
+gate at +0x120, one enable bit per PHY. Both go through
+syscon_regmap_lookup_by_phandle() on an "intel,syscon" property, so the
+node has to exist and has to carry "syscon" in its compatible list
+before either driver can probe.
+
+Describe it as a plain syscon, alongside cgu@16200000 which is already
+one. The address is the vendor tree's chiptop@00080000 (AVM 4.9
+arch/mips/boot/dts/lantiq/xrx500.dtsi) resolved out of its
+ssx4@16000000 wrapper, whose ranges are <0x0 0x16000000 0x02000000>,
+into the flat absolute form this dtsi uses throughout. The size is the
+vendor's as well.
+
+No "simple-mfd": unlike the RCU this node has no children, and the
+registers it holds have no owner of their own.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 8426bfbed168..319eb8de4b11 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -54,6 +54,15 @@ cgu: cgu@16200000 {
+ 		#clock-cells = <1>;
+ 	};
+ 
++	/*
++	 * Chip-top configuration block: a pure syscon. Consumers reach single
++	 * fields through a phandle plus an offset.
++	 */
++	chiptop: syscon@16080000 {
++		compatible = "intel,grx500-chiptop", "syscon";
++		reg = <0x16080000 0x1000>;
++	};
++
+ 	/*
+ 	 * Reset Control Unit. The mainline lantiq,xrx200-reset driver must be
+ 	 * a syscon child: its reg is a byte offset into the parent regmap,

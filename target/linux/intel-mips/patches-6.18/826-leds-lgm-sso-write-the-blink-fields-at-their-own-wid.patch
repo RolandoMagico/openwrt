@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 11 Sep 2026 09:31:24 +0200
+Subject: leds: lgm-sso: write the blink fields at their own width
+
+sso_led_freq_set() treats the blink rate and the clock-source select as
+three-bit fields and writes them one field too high. For a field whose
+low bit sits at low it takes high = low + 2, masks with
+GENMASK(high, low), and shifts the value by high.
+
+Those fields are two bits wide. A LED_BLINK_H8_* register gives each
+blink slot six bits -- an FPID rank, a GPTC rank, and the select that
+says which of the two the hardware reads -- which is what
+GET_FREQ_OFFSET()'s (src * 2) stride and GET_SRC_OFFSET()'s + 4 already
+describe. low + 2 is therefore not the top of the field but the bottom
+of the next one. So the value lands entirely in that neighbour, while
+the mask spans the whole intended field plus the neighbour's bottom
+bit: the update clears the field it set out to write, and the only bit
+it can set belongs to somebody else.
+
+The clock-source select is where this is felt. It is written last, and
+it is what decides whether the hardware reads the pin's FPID rank or
+its GPTC rank; left as found, a device tree asking for one of the four
+GPTC-derived rates gets the FPID source the register came up with. The
+rate does not arrive either, because the rank write missed in the same
+way. And since the neighbouring slot belongs to another pin, asking one
+LED for a blink rate disturbs the next one's -- or, for the last slot
+of LED_BLINK_H8_0, shifts past the last bit the register implements and
+is dropped on the floor.
+
+Mask and shift at the field's own width. The vendor driver this one was
+rewritten from writes both fields as (val & 0x3) << off.
+
+Pins 0..23 are unaffected: sso_led_freq_set() returns early for them.
+No device tree in tree declares a pin in either of the upper two
+groups, which is how this survived alongside the rest.
+
+Fixes: c3987cd2bca3 ("leds: lgm: Add LED controller driver for LGM SoC")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index 9644a8433226..720955112b11 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -24,6 +24,12 @@
+ 
+ #define LED_BLINK_H8_0			0x0
+ #define LED_BLINK_H8_1			0x4
++/*
++ * A LED_BLINK_H8_* register gives every blink slot six bits, as three two-bit
++ * fields: the FPID rank, then the GPTC rank, then the select that says which
++ * of the two the hardware reads. Pins 24..31 get a slot each; pins 0..23 share
++ * the one sso_led_pin_blink_off() calls the "led 32 location".
++ */
+ #define GET_FREQ_OFFSET(pin, src)	(((pin) * 6) + ((src) * 2))
+ #define GET_SRC_OFFSET(pinc)		(((pinc) * 6) + 4)
+ 
+@@ -206,7 +212,7 @@ static struct sso_led
+ static void sso_led_freq_set(struct sso_led_priv *priv, u32 pin, int freq_idx)
+ {
+ 	u32 reg, off, freq_src, val_freq;
+-	u32 low, high, val;
++	u32 low, val;
+ 	unsigned int group;
+ 
+ 	if (!freq_idx)
+@@ -231,16 +237,14 @@ static void sso_led_freq_set(struct sso_led_priv *priv, u32 pin, int freq_idx)
+ 	/* set blink rate idx */
+ 	if (freq_src != CLK_SRC_GPTC_HS) {
+ 		low = GET_FREQ_OFFSET(off, freq_src);
+-		high = low + 2;
+-		val = val_freq << high;
+-		regmap_update_bits(priv->mmap, reg, GENMASK(high, low), val);
++		val = val_freq << low;
++		regmap_update_bits(priv->mmap, reg, GENMASK(low + 1, low), val);
+ 	}
+ 
+ 	/* select clock source */
+ 	low = GET_SRC_OFFSET(off);
+-	high = low + 2;
+-	val = freq_src << high;
+-	regmap_update_bits(priv->mmap, reg, GENMASK(high, low), val);
++	val = freq_src << low;
++	regmap_update_bits(priv->mmap, reg, GENMASK(low + 1, low), val);
+ }
+ 
+ /*

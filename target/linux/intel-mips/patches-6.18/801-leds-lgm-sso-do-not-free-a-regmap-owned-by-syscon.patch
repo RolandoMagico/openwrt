@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 13:01:58 +0200
+Subject: leds: lgm-sso: do not free a regmap owned by syscon
+
+The driver gets its regmap from syscon_node_to_regmap() and then calls
+regmap_exit() on it in both probe error paths and again in .remove.
+The regmap is not the driver's to free.
+
+syscon_node_to_regmap() either returns an existing entry or creates one
+with of_syscon_register(), which puts it on the global syscon_list
+(drivers/mfd/syscon.c, list_add_tail() at the end of the function).
+Nothing in that file ever takes an entry off that list again -- there
+is no list_del() in it at all -- and the list is keyed by device_node,
+so the regmap outlives every consumer by design and the next lookup of
+the same node hands out the same pointer.
+
+Freeing it therefore leaves a dangling entry on syscon_list. The next
+caller gets a pointer to freed memory, and that caller can be this same
+driver: both probe error paths are reachable with -EPROBE_DEFER
+underneath them, the sole gpiod get in sso_led_dt_parse() being the
+obvious source, so a deferred probe frees the regmap and the retry then
+uses it. The driver can also be built as a module, which puts .remove
+on the same footing.
+
+Drop all three calls. The regmap needs no teardown here: syscon owns
+it, and on the error paths there is nothing else left to undo -- the
+clocks are released by the devm action registered above them.
+
+Fixes: c3987cd2bca3 ("leds: lgm: Add LED controller driver for LGM SoC")
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index 62a573637bd9..96e327ca5d55 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -815,10 +815,8 @@ static int intel_sso_led_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	ret = sso_probe_gpios(priv);
+-	if (ret) {
+-		regmap_exit(priv->mmap);
++	if (ret)
+ 		return ret;
+-	}
+ 
+ 	INIT_LIST_HEAD(&priv->led_list);
+ 
+@@ -828,10 +826,9 @@ static int intel_sso_led_probe(struct platform_device *pdev)
+ 	priv->gptc_clkrate = DEF_GPTC_CLK_RATE;
+ 
+ 	ret = sso_led_dt_parse(priv);
+-	if (ret) {
+-		regmap_exit(priv->mmap);
++	if (ret)
+ 		return ret;
+-	}
++
+ 	dev_info(priv->dev, "sso LED init success!\n");
+ 
+ 	return 0;
+@@ -848,8 +845,6 @@ static void intel_sso_led_remove(struct platform_device *pdev)
+ 		list_del(&led->list);
+ 		sso_led_shutdown(led);
+ 	}
+-
+-	regmap_exit(priv->mmap);
+ }
+ 
+ static const struct of_device_id of_sso_led_match[] = {

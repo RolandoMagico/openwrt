@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 10:00:12 +0200
+Subject: MIPS: intel-mips: enable the syscon restart handler in
+ grx500_defconfig
+
+The RCU node now describes the global software reset as a syscon-reboot
+child, but the driver that binds it is behind a menuconfig that defaults
+off, so a defconfig kernel still has no restart handler at all and still
+hangs in machine_hang() when asked to reboot.
+
+CONFIG_POWER_RESET is a plain menuconfig with no default and has to be
+stated before anything under it is reachable; CONFIG_POWER_RESET_SYSCON
+then selects MFD_SYSCON, which this configuration already has on for
+reset-lantiq.c and the RCU regmap the reboot node borrows from its
+parent.
+
+Nothing else in drivers/power/reset belongs here. The board has no
+programmable power-off path -- pm_power_off stays NULL and "halt" keeps
+parking the CPU, which is the correct outcome for hardware whose only
+off switch is the mains.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index c393e0431518..50280ffee7df 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -90,6 +90,8 @@ CONFIG_SERIAL_LANTIQ=y
+ # CONFIG_HW_RANDOM is not set
+ CONFIG_PINCTRL=y
+ CONFIG_PINCTRL_EQUILIBRIUM=y
++CONFIG_POWER_RESET=y
++CONFIG_POWER_RESET_SYSCON=y
+ # CONFIG_HWMON is not set
+ # CONFIG_VGA_CONSOLE is not set
+ # CONFIG_HID is not set

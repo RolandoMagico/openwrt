@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 16:33:52 +0000
+Subject: MIPS: intel-mips: enable pinctrl, GPIO LEDs and buttons in
+ grx500_defconfig
+
+Turn on the pieces the freshly described xRX500 pin controller and GPIO
+banks need, so the in-tree defconfig produces a kernel that can actually
+drive a board's front panel:
+
+ - CONFIG_PINCTRL / CONFIG_PINCTRL_EQUILIBRIUM. PINCTRL is a plain
+   menuconfig with no default, so it has to be stated explicitly;
+   PINCTRL_EQUILIBRIUM then selects PINMUX, PINCONF, GENERIC_PINCONF,
+   GENERIC_PINCTRL_GROUPS, GENERIC_PINMUX_FUNCTIONS, GPIOLIB,
+   GPIO_GENERIC and GPIOLIB_IRQCHIP on its own.
+
+ - CONFIG_NEW_LEDS / LEDS_CLASS / LEDS_GPIO for the gpio-leds nodes,
+   plus LEDS_TRIGGERS with the timer, default-on and netdev triggers --
+   the three the status-LED conventions on these boards rely on
+   (heartbeat-style activity, "on while running", and a link/activity
+   LED bound to a netdev).
+
+ - CONFIG_INPUT / INPUT_KEYBOARD / KEYBOARD_GPIO_POLLED for the
+   gpio-keys-polled nodes, and INPUT_EVDEV so a button press is
+   actually observable from userspace on a bare defconfig kernel --
+   without an event handler the input device exists but reports
+   nowhere. INPUT_KEYBOARD was previously explicitly disabled.
+
+Note for downstream users: distributions that replace the in-kernel
+button handling with their own (OpenWrt's gpio-button-hotplug binds the
+same "gpio-keys-polled" compatible) must leave KEYBOARD_GPIO_POLLED off
+in their own config or the two will fight over the device.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index c81e5195923f..c393e0431518 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -76,7 +76,10 @@ CONFIG_ATM_BR2684=m
+ CONFIG_BLK_DEV_RAM=y
+ CONFIG_BLK_DEV_RAM_COUNT=4
+ CONFIG_BLK_DEV_RAM_SIZE=8192
+-# CONFIG_INPUT_KEYBOARD is not set
++CONFIG_INPUT=y
++CONFIG_INPUT_EVDEV=y
++CONFIG_INPUT_KEYBOARD=y
++CONFIG_KEYBOARD_GPIO_POLLED=y
+ # CONFIG_INPUT_MOUSE is not set
+ # CONFIG_SERIO is not set
+ # CONFIG_CONSOLE_TRANSLATIONS is not set
+@@ -85,10 +88,19 @@ CONFIG_BLK_DEV_RAM_SIZE=8192
+ # CONFIG_DEVMEM is not set
+ CONFIG_SERIAL_LANTIQ=y
+ # CONFIG_HW_RANDOM is not set
++CONFIG_PINCTRL=y
++CONFIG_PINCTRL_EQUILIBRIUM=y
+ # CONFIG_HWMON is not set
+ # CONFIG_VGA_CONSOLE is not set
+ # CONFIG_HID is not set
+ # CONFIG_USB_SUPPORT is not set
++CONFIG_NEW_LEDS=y
++CONFIG_LEDS_CLASS=y
++CONFIG_LEDS_GPIO=y
++CONFIG_LEDS_TRIGGERS=y
++CONFIG_LEDS_TRIGGER_TIMER=y
++CONFIG_LEDS_TRIGGER_DEFAULT_ON=y
++CONFIG_LEDS_TRIGGER_NETDEV=y
+ # CONFIG_VIRTIO_MENU is not set
+ # CONFIG_MIPS_PLATFORM_DEVICES is not set
+ CONFIG_INTEL_CGU_CLK=y

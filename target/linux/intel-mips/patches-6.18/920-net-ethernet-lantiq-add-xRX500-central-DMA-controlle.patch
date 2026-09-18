@@ -1,0 +1,3358 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:20:09 +0000
+Subject: net: ethernet: lantiq: add xRX500 central DMA controller driver
+ (hdma)
+
+Add the driver for the xRX500 central DMA engines. Four controller
+instances serve the ethernet datapath (DMA1TX, DMA1RX, DMA2TX, DMA2RX).
+Each is reset at postcore probe and configured from a table in the
+driver, keyed by its register base, which carries its identity together
+with its arbitration, burst length, polling interval, descriptor
+placement, prefetch, byte enables, byte order and software poll quota.
+None of that describes anything a board can wire differently. Port and
+channel state is programmed after that, with port control 0x1F03,
+channel control and class, and interrupt status cleared with interrupts
+left disabled, because the CBM, not the CPU, services these channels in
+steady state. Clocks are deliberately left untouched:
+the boot chain hands over running clocks (see the clk driver's
+CLK_IGNORE_UNUSED policy).
+
+The controller identity is exported so that a driver holding a phandle
+to a controller can name a channel on it. The compatible is spelled the
+way the binding does.
+
+The channel-level API (ltq_request_dma, ltq_dma_chan_on/off/reset,
+descriptor allocation and window configuration, IRQ enable/disable) is
+consumed by the CBM patches that follow. One detail learned on hardware
+is embedded here:
+
+ - Channel-config faithfulness: the vendor never zeroes
+   CDBA/CDLEN/CDPTNR when (re)configuring a live channel, and the
+   DMA interrupt-enable mask must keep the egress channel bit set;
+   deviating from either stalls the egress path. The V3
+   memory-window readback used by other SoCs aliases onto DMA_CTRL
+   on GRX500 and must not be read.
+
+Descriptor rings are bounded to [PHYS_OFFSET, PHYS_OFFSET + SZ_256M), at
+both ends of the ring. This bound is a property of the uncached window,
+not the top of DRAM.
+
+The SegCtl this platform boots under maps kernel VA 0xA0000000-0xBFFFFFFF
+uncached onto physical 0x20000000-0x3FFFFFFF, and only the lower half of
+that is DRAM. The upper half -- VA 0xB0000000 and up -- is the SoC's
+register space, appearing there at its nominal address plus 0x20000000,
+and it is what every ioremap() on this platform is served out of. So the
+uncached alias of DRAM is exactly the first 256 MiB of the window, and
+above PHYS_OFFSET + SZ_256M a DRAM page's uncached alias *is* a register
+address.
+
+That band is not harmlessly empty, and bounding at the first block that
+answers rather than at the window edge would not be conservative. A
+coherent page at physical 0x31477000 aliases onto nominal 0x11477000,
+nothing is decoded there, and a kernel-mode memcpy through it took a
+fatal data bus error on this silicon. Higher up the alias decodes onto
+live registers instead, where the write simply lands while the device
+goes on reading the untouched DRAM page.
+
+This driver keeps its own copy of the bound rather than relying on the
+generic check in arch/mips/mm/dma-noncoherent.c, because it aliases
+addresses by hand instead of using the pointer the allocator returned,
+and so never passes through that check.
+
+A ring's CPU view is derived from its physical address as
+CKSEG1ADDR(desc_phys), and the pointer dma_free_coherent() is handed is
+kept apart from it, so a channel that does not own its ring never frees
+one.
+
+hdma_port_chan_tbl() maps each dequeue port the buffer manager serves to
+its transmit channels, ports 7 to 10 on DMA2TX for the LAN ports and
+port 19 on DMA1TX for the WAN port. A port's channels are opened once
+and stay open, because closing and reopening a CBM-managed channel
+leaves the dequeue handshake stale, and a failed open releases every
+channel it acquired.
+
+Descriptor fetch-on-demand is switched on as the last step of controller
+initialisation, after every port and channel is configured, so the
+controller never fetches from a channel still in its reset state.
+
+Nothing builds this code yet. The buffer manager, the traffic manager
+and the DMA driver resolve symbols against each other, so they are wired
+into the build together once the last of them exists.
+
+Ported from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+drivers/dma/intel/hdma.c/.h and include/linux/dma/lantiq_dmax.h -
+Copyright (C) 2014-2015 Lei Chuanhua <chuanhua.lei@lantiq.com>,
+(C) 2016-2017 Intel Corporation; notices restored to all four
+files - reduced to the four ethernet controllers and translated to
+v6.18 APIs.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.c b/drivers/net/ethernet/lantiq/dma/hdma.c
+new file mode 100644
+index 000000000000..f077e1049f6d
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/dma/hdma.c
+@@ -0,0 +1,2179 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2014 ~ 2015 Lei Chuanhua <chuanhua.lei@lantiq.com>
++ * Copyright (C) 2016 ~ 2017 Intel Corporation.
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/dma/intel/hdma.c.
++ *
++ * xRX500 high-speed DMA controllers: controller and channel configuration,
++ * descriptor rings, the interrupt chip and the per-port channel tables that
++ * pair a CBM dequeue port with a DMA channel.
++ */
++
++#define pr_fmt(fmt) "hdma: " fmt
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/build_bug.h>
++#include <linux/platform_device.h>
++#include <linux/io.h>
++#include <linux/string.h>
++#include <linux/dma-mapping.h>
++#include <linux/err.h>
++#include <linux/bitmap.h>
++#include <linux/interrupt.h>
++#include <linux/irq.h>
++#include <linux/irqdomain.h>
++#include <linux/irqdesc.h>
++#include <linux/of.h>
++#include <linux/of_irq.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/sizes.h>
++
++#include "hdma.h"
++#include "hdma_regs.h"
++
++/*
++ * itoc — extract struct dma_ctrl from an irq_data via the per-irq chip
++ * data. AVM hdma.c:212 verbatim. Used by the per-irq chip ops
++ * (dma_disable_irq / dma_enable_irq / dma_ack_irq / dma_mask_and_ack_irq).
++ * The chip data is set per-irq by dma_irq_map() (the irq_domain map
++ * callback) at irq_domain_create_legacy() time.
++ */
++#define itoc(i) ((struct dma_ctrl *)irq_get_chip_data((i)->irq))
++
++/*
++ * dma_name[] — AVM hdma.c:215-223 verbatim. Indexed by cid (the value of enum
++ * dma_controller).
++ */
++static const char *const dma_name[] = {
++	"dma0",
++	"dma1tx",
++	"dma1rx",
++	"dma2tx",
++	"dma2rx",
++	"dma3",
++	"dma4",
++};
++
++/**
++ * struct ltq_dma_soc_cfg - fabric configuration of one DMA controller.
++ * @base:         physical base of the controller's register window.
++ * @cid:          controller identity.
++ * @pkt_arb:      arbitration mode between channels.
++ * @burst:        burst length, shared by both directions of the port.
++ * @polling_cnt:  descriptor polling interval.
++ * @chan_fc:      channel flow control.
++ * @desc_fod:     fetch descriptors on demand.
++ * @desc_in_sram: descriptors are staged in on-chip memory.
++ * @drb:          descriptor read burst.
++ * @byte_en:      byte enables on the write master.
++ * @budget:       frames per software poll; no register behind it.
++ * @lab_cnt:      look-ahead buffer count.
++ * @orrc:         outstanding read requests.
++ * @txendi:       transmit byte order.
++ * @rxendi:       receive byte order.
++ *
++ * Every value here describes on-chip fabric behaviour - arbitration, burst
++ * length, descriptor placement, prefetch, byte enables - or, in the case of
++ * @budget, a software quota with no register behind it at all. None of it is
++ * something a board can wire differently, so it belongs to the driver rather
++ * than to a device tree node.
++ *
++ * The identity cannot be allocated at probe: it is encoded in the top byte of
++ * every channel handle, so it is keyed off the register base like everything
++ * else here.
++ *
++ * Several fields reach no register on some controllers, because the setter
++ * for them returns early unless the controller is the one that implements the
++ * field. They are carried as the vendor states them per controller rather
++ * than pruned, so that the table stays a transcription.
++ */
++struct ltq_dma_soc_cfg {
++	phys_addr_t base;
++	enum dma_controller cid;
++	u32 pkt_arb;
++	u32 burst;
++	u32 polling_cnt;
++	u32 chan_fc;
++	u32 desc_fod;
++	u32 desc_in_sram;
++	u32 drb;
++	u32 byte_en;
++	u32 budget;
++	u32 lab_cnt;
++	u32 orrc;
++	u32 txendi;
++	u32 rxendi;
++};
++
++static const struct ltq_dma_soc_cfg ltq_dma_soc_cfgs[] = {
++	{
++		.base = 0x1a100000, .cid = DMA1TX,
++		.pkt_arb = DMA_ARB_PKT, .burst = 16, .polling_cnt = 108,
++		.chan_fc = 1, .desc_fod = 1, .desc_in_sram = 1, .drb = 0,
++		.byte_en = 1, .budget = DMA_IRQ_BUDGET, .lab_cnt = 2,
++		.orrc = 0,
++		.txendi = DMA_ENDIAN_TYPE3, .rxendi = DMA_ENDIAN_TYPE3,
++	},
++	{
++		.base = 0x1a200000, .cid = DMA1RX,
++		.pkt_arb = DMA_ARB_PKT, .burst = 16, .polling_cnt = 24,
++		.chan_fc = 0, .desc_fod = 1, .desc_in_sram = 0, .drb = 0,
++		.byte_en = 0, .budget = DMA_IRQ_BUDGET, .lab_cnt = 0,
++		.orrc = 0,
++		.txendi = DMA_ENDIAN_TYPE3, .rxendi = DMA_ENDIAN_TYPE3,
++	},
++	{
++		.base = 0x1c100000, .cid = DMA2TX,
++		.pkt_arb = DMA_ARB_PKT, .burst = 16, .polling_cnt = 24,
++		.chan_fc = 1, .desc_fod = 1, .desc_in_sram = 0, .drb = 0,
++		.byte_en = 1, .budget = DMA_IRQ_BUDGET, .lab_cnt = 0,
++		.orrc = 0,
++		.txendi = DMA_ENDIAN_TYPE3, .rxendi = DMA_ENDIAN_TYPE3,
++	},
++	{
++		.base = 0x1c200000, .cid = DMA2RX,
++		.pkt_arb = DMA_ARB_PKT, .burst = 16, .polling_cnt = 24,
++		.chan_fc = 0, .desc_fod = 1, .desc_in_sram = 0, .drb = 0,
++		.byte_en = 1, .budget = DMA_IRQ_BUDGET, .lab_cnt = 0,
++		.orrc = 0,
++		.txendi = DMA_ENDIAN_TYPE3, .rxendi = DMA_ENDIAN_TYPE3,
++	},
++};
++
++static const struct ltq_dma_soc_cfg *ltq_dma_soc_cfg_get(phys_addr_t base)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(ltq_dma_soc_cfgs); i++)
++		if (ltq_dma_soc_cfgs[i].base == base)
++			return &ltq_dma_soc_cfgs[i];
++
++	return NULL;
++}
++
++int ltq_dma_ctrl_id_by_phys(phys_addr_t base)
++{
++	const struct ltq_dma_soc_cfg *cfg = ltq_dma_soc_cfg_get(base);
++
++	return cfg ? (int)cfg->cid : -ENODEV;
++}
++
++/*
++ * ltq_dma_controller[] — per-cid storage for the struct dma_ctrl bound by
++ * ltq_dma_probe. AVM hdma.c:238 verbatim.
++ */
++static struct dma_ctrl ltq_dma_controller[DMAMAX];
++
++/* Handy dma register accessors — AVM hdma.c:247-262 verbatim. */
++static inline unsigned int ltq_dma_r32(struct dma_ctrl *pctrl, u32 offset)
++{
++	return ioread32(pctrl->membase + offset);
++}
++
++static inline void ltq_dma_w32(struct dma_ctrl *pctrl, u32 value, u32 offset)
++{
++	iowrite32(value, pctrl->membase + offset);
++}
++
++static inline void ltq_dma_w32_mask(struct dma_ctrl *pctrl, u32 clr, u32 set,
++				    u32 offset)
++{
++	ltq_dma_w32(pctrl, (ltq_dma_r32(pctrl, offset) & ~clr) | set, offset);
++}
++
++/* AVM hdma.c:4093-4118 verbatim. */
++static u32 burst_len_to_burst_cfg(int val)
++{
++	u32 burst = DMA_BURSTL_16DW;
++
++	switch (val) {
++	case 2:
++		burst = DMA_BURSTL_2DW;
++		break;
++	case 4:
++		burst = DMA_BURSTL_4DW;
++		break;
++	case 8:
++		burst = DMA_BURSTL_8DW;
++		break;
++	case 16:
++		burst = DMA_BURSTL_16DW;
++		break;
++	case 32:
++		burst = DMA_BURSTL_32DW;
++		break;
++	default:
++		burst = DMA_BURSTL_16DW;
++		break;
++	}
++	return burst;
++}
++
++/* AVM hdma.c:242-245 verbatim. */
++static char const *dma_get_name_by_cid(int cid)
++{
++	return dma_name[cid];
++}
++
++/* AVM hdma.c:269-274 verbatim. */
++static struct dma_ctrl *dma_port_get_controller(struct dma_port *port)
++{
++	if (!port)
++		return NULL;
++	return port->controller;
++}
++
++/* AVM hdma.c:276-281 verbatim. */
++static struct dma_ctrl *dma_chan_get_controller(struct dmax_chan *pch)
++{
++	if (!pch)
++		return NULL;
++	return pch->controller;
++}
++
++/* AVM hdma.c:301-306 verbatim. */
++static struct dma_port *dma_chan_get_port(struct dmax_chan *pch)
++{
++	if (!pch)
++		return NULL;
++	return pch->port;
++}
++
++/* AVM hdma.c:352-357 verbatim. */
++static int dma_set_port_controller_data(struct dma_port *port,
++					struct dma_ctrl *pctrl)
++{
++	port->controller = pctrl;
++	return 0;
++}
++
++/* AVM hdma.c:359-364 verbatim. */
++static int dma_set_chan_controller_data(struct dmax_chan *pch,
++					struct dma_ctrl *pctrl)
++{
++	pch->controller = pctrl;
++	return 0;
++}
++
++/* AVM hdma.c:366-370 verbatim. */
++static int dma_set_chan_port_data(struct dmax_chan *pch, struct dma_port *port)
++{
++	pch->port = port;
++	return 0;
++}
++
++/* AVM hdma.c:377-380 verbatim. */
++static inline bool dma_chan_tx(struct dmax_chan *pch)
++{
++	return (pch->flags & DMA_TX_CH) ? true : false;
++}
++
++/* AVM hdma.c:382-385 verbatim. */
++static inline bool dma_chan_rx(struct dmax_chan *pch)
++{
++	return (pch->flags & DMA_RX_CH) ? true : false;
++}
++
++/*
++ * dma_ctrl_reset — AVM hdma.c:407-415 verbatim. Pulses DMA_CTRL_RST and
++ * waits 1ms for the silicon self-clear. The RST bit is self-clearing per
++ * the GRX350 reference manual; the udelay ensures the writeback observes
++ * the cleared state before dma_ctrl_cfg starts programming.
++ */
++static void dma_ctrl_reset(struct dma_ctrl *pctrl)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32_mask(pctrl, 0, DMA_CTRL_RST, DMA_CTRL);
++	udelay(1000);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/* DMA controller related configuration — AVM hdma.c:418-426 verbatim. */
++static void dma_ctrl_pkt_arb_cfg(struct dma_ctrl *pctrl, int enable)
++{
++	if (enable) {
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_MBRSTARB, 0, DMA_CTRL);
++		ltq_dma_w32_mask(pctrl, 0, DMA_CTRL_PKTARB, DMA_CTRL);
++	} else {
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_PKTARB, 0, DMA_CTRL);
++	}
++}
++
++/* AVM hdma.c:428-451 verbatim. */
++static void dma_ctrl_arb_cfg(struct dma_ctrl *pctrl)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	switch (pctrl->arb_type) {
++	case DMA_ARB_BURST:
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_PKTARB, 0, DMA_CTRL);
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_MBRSTARB, 0, DMA_CTRL);
++		break;
++	case DMA_ARB_MUL_BURST:
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_PKTARB, 0, DMA_CTRL);
++		ltq_dma_w32_mask(pctrl, 0, DMA_CTRL_MBRSTARB, DMA_CTRL);
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_MBRSTARB,
++				 SM(DMA_ARB_MUL_BURST_DEFAULT,
++				    DMA_CTRL_MBRST_CNT),
++				 DMA_CTRL);
++		break;
++	case DMA_ARB_PKT:
++		dma_ctrl_pkt_arb_cfg(pctrl, 1);
++		break;
++	}
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/*
++ * dma_ctrl_sram_desc_cfg — AVM hdma.c:453-466. DMA1RX / DMA2TX still silently
++ * return.
++ */
++static void dma_ctrl_sram_desc_cfg(struct dma_ctrl *pctrl, int enable)
++{
++	unsigned long flags;
++
++	if ((pctrl->cid != DMA3) && (pctrl->cid != DMA4) &&
++	    (pctrl->cid != DMA1TX))
++		return;
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	if (enable)
++		ltq_dma_w32_mask(pctrl, 0, DMA_CTRL_DSRAM_PATH, DMA_CTRL);
++	else
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_DSRAM_PATH, 0, DMA_CTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/* AVM hdma.c:468-480 verbatim. */
++static void dma_ctrl_chan_flow_ctl_cfg(struct dma_ctrl *pctrl, int enable)
++{
++	unsigned long flags;
++
++	if ((pctrl->cid != DMA1TX) && (pctrl->cid != DMA2TX))
++		return;
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	if (enable)
++		ltq_dma_w32_mask(pctrl, 0, DMA_CTRL_CH_FL, DMA_CTRL);
++	else
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_CH_FL, 0, DMA_CTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/* AVM hdma.c:482-492 verbatim. */
++static void dma_ctrl_global_polling_enable(struct dma_ctrl *pctrl)
++{
++	u32 reg = 0;
++	unsigned long flags;
++
++	reg |= DMA_CPOLL_EN;
++	reg |= (u32)(SM(pctrl->pollcnt, DMA_CPOLL_CNT));
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32_mask(pctrl, DMA_CPOLL_CNT, reg, DMA_CPOLL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/*
++ * dma_ctrl_desc_fetch_on_demand_cfg - AVM hdma.c:494-509.
++ *
++ * Since AVM 08.25 moved the call out of dma_ctrl_cfg and onto the tail of
++ * dma_ctrl_init, the TOE reset-parity path (hdma_ig192_toe_dma3_reset,
++ * cid=DMA3) no longer reaches this function at all — it calls dma_ctrl_cfg
++ * directly, not dma_ctrl_init. That path's hardware effect is unchanged
++ * either way, precisely because this early return meant DMA3 never got a
++ * write. Kept because AVM has it. DMA1TX / DMA1RX / DMA2TX fall through as
++ * before.
++ */
++static void dma_ctrl_desc_fetch_on_demand_cfg(struct dma_ctrl *pctrl,
++					      int enable)
++{
++	unsigned long flags;
++
++	if ((pctrl->cid == DMA0) || (pctrl->cid == DMA3) ||
++	    (pctrl->cid == DMA4))
++		return;
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	if (enable)
++		ltq_dma_w32_mask(pctrl, 0, DMA_CTRL_DS_FOD, DMA_CTRL);
++	else
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_DS_FOD, 0, DMA_CTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/* AVM hdma.c:511-521 verbatim. */
++static void dma_ctrl_desc_read_back_cfg(struct dma_ctrl *pctrl, int enable)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	if (enable)
++		ltq_dma_w32_mask(pctrl, 0, DMA_CTRL_DRB, DMA_CTRL);
++	else
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_DRB, 0, DMA_CTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/* AVM hdma.c:523-533 verbatim. */
++static void dma_ctrl_byte_enable_cfg(struct dma_ctrl *pctrl, int enable)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	if (enable)
++		ltq_dma_w32_mask(pctrl, 0, DMA_CTRL_ENBE, DMA_CTRL);
++	else
++		ltq_dma_w32_mask(pctrl, DMA_CTRL_ENBE, 0, DMA_CTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/* AVM hdma.c:535-550 verbatim. DMA1TX only — silent no-op on others. */
++static void dma_ctrl_labcnt_cfg(struct dma_ctrl *pctrl)
++{
++	u32 reg = 0;
++	unsigned long flags;
++
++	if (pctrl->cid != DMA1TX)
++		return;
++
++	if (pctrl->labcnt <= 0)
++		return;
++	reg |= DMA_CTRL_PRELOAD_EN;
++	reg |= (u32)(SM(pctrl->labcnt, DMA_CTRL_PRELOAD_INT));
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32_mask(pctrl, DMA_CTRL_PRELOAD_INT, reg, DMA_CTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/*
++ * dma_ctrl_orrc_cfg — AVM hdma.c:557-575 verbatim. ORRC is valid for
++ * V3.0 + TX/memcopy controllers only; DMA1RX/DMA2RX (RX controllers)
++ * silently return.
++ *   orr_cnt >= 16 → 16; 4 <= orr_cnt < 16 → orr_cnt; orr_cnt < 4 → 3
++ *   (silicon minimum). Out-of-range disables ORRC entirely.
++ */
++static void dma_ctrl_orrc_cfg(struct dma_ctrl *pctrl)
++{
++	u32 val = 0;
++
++	if (pctrl->ver <= DMA_VER_22)
++		return;
++
++	/* Only valid for DMA TX and memory copy DMA. */
++	if (pctrl->cid == DMA1RX || pctrl->cid == DMA2RX)
++		return;
++
++	if (pctrl->orrc <= 0 || pctrl->orrc > DMA_ORRC_MAX_CNT) {
++		ltq_dma_w32_mask(pctrl, DMA_ORRC_EN | DMA_ORRC_ORRCNT, 0,
++				 DMA_ORRC);
++	} else {
++		val = DMA_ORRC_EN | SM(pctrl->orrc, DMA_ORRC_ORRCNT);
++		ltq_dma_w32(pctrl, val, DMA_ORRC);
++	}
++}
++
++/*
++ * AVM hdma.c:577-617, minus the descriptor-fetch-on-demand block, which
++ * AVM 08.25 moved to the tail of dma_ctrl_init (see there).
++ */
++static int dma_ctrl_cfg(struct dma_ctrl *pctrl)
++{
++	int enable;
++
++	if ((pctrl->flags & DMA_FLCTL))
++		enable = 1;
++	else
++		enable = 0;
++	dma_ctrl_chan_flow_ctl_cfg(pctrl, enable);
++
++	if ((pctrl->flags & DMA_DESC_IN_SRAM))
++		enable = 1;
++	else
++		enable = 0;
++	dma_ctrl_sram_desc_cfg(pctrl, enable);
++
++	dma_ctrl_arb_cfg(pctrl);
++	if ((pctrl->flags & DMA_DRB))
++		enable = 1;
++	else
++		enable = 0;
++	dma_ctrl_desc_read_back_cfg(pctrl, enable);
++
++	if ((pctrl->flags & DMA_EN_BYTE_EN))
++		enable = 1;
++	else
++		enable = 0;
++	dma_ctrl_byte_enable_cfg(pctrl, enable);
++	dma_ctrl_labcnt_cfg(pctrl);
++	dma_ctrl_orrc_cfg(pctrl);
++	dma_ctrl_global_polling_enable(pctrl);
++	dev_dbg(pctrl->dev, "%s Controller 0x%08x configuration done\n",
++		pctrl->name, ltq_dma_r32(pctrl, DMA_CTRL));
++	return 0;
++}
++
++/* AVM hdma.c:619-641 verbatim. */
++static int dma_chan_cctrl_cfg(struct dmax_chan *pch, u32 val)
++{
++	u32 reg;
++	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
++	unsigned long flags;
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	reg = ltq_dma_r32(pctrl, DMA_CCTRL);
++
++	/* Read from hardware */
++	if ((reg & DMA_CCTRL_DIR_TX))
++		pch->flags |= DMA_TX_CH;
++	else
++		pch->flags |= DMA_RX_CH;
++
++	/* Keep the class value unchanged */
++	reg &= (DMA_CCTRL_CLASS | DMA_CCTRL_CLASSH);
++	val |= reg;
++	ltq_dma_w32(pctrl, val, DMA_CCTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++	return 0;
++}
++
++/* AVM hdma.c:661-683 verbatim. */
++static int dma_chan_set_class(struct dmax_chan *pch, u32 val)
++{
++	unsigned long flags;
++	u32 class_val;
++	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
++
++	if (pctrl->ver <= DMA_VER_22)
++		return -EPERM;
++
++	if (val > DMA_MAX_CLASS)
++		return -EINVAL;
++	/* 3 bits low */
++	class_val = SM((val & 0x7), DMA_CCTRL_CLASS);
++	/* 2 bits high */
++	class_val |= SM(((val >> 3) & 0x3), DMA_CCTRL_CLASSH);
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	ltq_dma_w32_mask(pctrl, DMA_CCTRL_CLASS | DMA_CCTRL_CLASSH,
++			 class_val, DMA_CCTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++	return 0;
++}
++
++/* AVM hdma.c:2124-2163 verbatim. */
++static int dma_port_cfg(struct dma_port *port)
++{
++	u32 reg = 0;
++	unsigned long flags;
++	struct dma_ctrl *pctrl;
++	int cid;
++
++	if (!port)
++		return -EINVAL;
++	pctrl = dma_port_get_controller(port);
++	cid = pctrl->cid;
++	reg |= (port->flush_memcpy ? DMA_PCTRL_MEM_FLUSH : 0);
++	reg |= (port->txwgt << DMA_PCTRL_TXWGT_S);
++	reg |= (port->txendi << DMA_PCTRL_TXENDI_S);
++	reg |= (port->rxendi << DMA_PCTRL_RXENDI_S);
++	reg |= (port->pkt_drop << DMA_PCTRL_PDEN_S);
++
++	if (port->txbl == DMA_BURSTL_32DW)
++		reg |= DMA_PCTRL_TXBL32;
++	else if (port->txbl == DMA_BURSTL_16DW)
++		reg |= DMA_PCTRL_TXBL16;
++	else
++		reg |= (port->txbl << DMA_PCTRL_TXBL_S);
++
++	if (port->rxbl == DMA_BURSTL_32DW)
++		reg |= DMA_PCTRL_RXBL32;
++	else if (port->rxbl == DMA_BURSTL_16DW)
++		reg |= DMA_PCTRL_RXBL16;
++	else
++		reg |= (port->rxbl << DMA_PCTRL_RXBL_S);
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, port->pid, DMA_PS);
++	ltq_dma_w32(pctrl, reg, DMA_PCTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++	spin_lock_init(&port->port_lock);
++	dev_dbg(pctrl->dev, "%s Port %d %s Control 0x%08x configuration done\n",
++		dma_name[cid], port->pid, port->name,
++		ltq_dma_r32(pctrl, DMA_PCTRL));
++	return 0;
++}
++
++/*
++ * dma_chan_cfg - AVM hdma.c:2179-2233 with the auto-descriptor-allocation
++ * tail (AVM:2225-2228, the dma_chan_desc_alloc + dma_chan_data_buf_alloc call
++ * pair guarded by !dma_chan_desc_alloc_by_device) STRIPPED.
++ *
++ * Writes happen inside the DMA_CS-selected window (silicon requires DMA_CS to
++ * point at the channel before per-channel register writes take effect).
++ */
++
++static char *common_buffer_alloc(int len, int *byte_offset, void **opt)
++{
++	char *buffer = kmalloc(len, GFP_ATOMIC);
++
++	*byte_offset = 0;
++	return buffer;
++}
++
++static int common_buffer_free(char *dataptr, void *opt)
++{
++	kfree(dataptr);
++	return 0;
++}
++
++static int dma_chan_cfg(struct dmax_chan *pch)
++{
++	u32 reg = 0;
++	int cid;
++	int pid;
++	unsigned long flags;
++	struct dma_ctrl *pctrl;
++	struct dma_port *pport;
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	pctrl = dma_chan_get_controller(pch);
++	pport = dma_chan_get_port(pch);
++
++	if (unlikely(!pport))
++		return -EINVAL;
++
++	cid = pctrl->cid;
++	pid = pport->pid;
++	reg |= (pch->lpbk_ch_nr << DMA_CCTRL_LBCHNR_S);
++	reg |= (pch->lpbk_en ? DMA_CCTRL_LBEN : 0);
++	reg |= (pch->p2pcpy ? DMA_CCTRL_P2PCPY : 0);
++	reg |= (pch->pden ? DMA_CCTRL_PDEN : 0);
++
++	reg |= (pch->txwgt << DMA_CCTRL_TXWGT_S);
++
++	reg |= (pch->onoff ? DMA_CCTRL_ON : 0);
++	reg |= (pch->rst ? DMA_CCTRL_RST : 0);
++	dma_chan_cctrl_cfg(pch, reg);
++	dma_chan_set_class(pch, pch->nr);
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	/* Clear all interrupts and disable. */
++	ltq_dma_w32(pctrl, 0, DMA_CIE);
++	ltq_dma_w32(pctrl, DMA_CI_ALL, DMA_CIS);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++
++	/* Disable related top-level interrupts. */
++	if (pch->nr < 32) {
++		ltq_dma_w32_mask(pctrl, (1u << (pch->nr & 0x1f)), 0,
++				 DMA_IRNEN);
++		ltq_dma_w32_mask(pctrl, 0, (1u << (pch->nr & 0x1f)),
++				 DMA_IRNCR);
++	} else {
++		ltq_dma_w32_mask(pctrl, (1u << (pch->nr & 0x1f)), 0,
++				 DMA_IRNEN1);
++		ltq_dma_w32_mask(pctrl, 0, (1u << (pch->nr & 0x1f)),
++				 DMA_IRNCR1);
++	}
++	pch->alloc = &common_buffer_alloc;
++	pch->free = &common_buffer_free;
++	mutex_init(&pch->ch_lock);
++	spin_lock_init(&pch->irq_lock);
++	dev_dbg(pctrl->dev, "%s port %d chan %d done\n",
++		dma_name[cid], pid, pch->nr);
++	return 0;
++}
++
++/*
++ * do_dma_tasklet - AVM hdma.c:2907-2957 with the DMA0 dispatch branch
++ * (AVM:2921-2934, the !dma_is_64bit special-case for the 8-DW-desc
++ * controller) STRIPPED.
++ *
++ * The per-iteration clear_bit happens BEFORE invoking the callback so a
++ * re-entrant set_bit from a fast follow-up IRQ on the same channel is
++ * preserved (the bit gets re-set and the next iteration picks it up).
++ */
++static void do_dma_tasklet(unsigned long data)
++{
++	int ch_nr;
++	int flags;
++	struct dma_port *pport;
++	struct dmax_chan *pch;
++	struct dma_ctrl *pctrl = (struct dma_ctrl *)data;
++	int budget = pctrl->budget;
++
++	while (!bitmap_empty(pctrl->dma_int_status, pctrl->chans)) {
++		ch_nr = find_first_bit(pctrl->dma_int_status, pctrl->chans);
++		if (budget-- < 0) {
++			tasklet_schedule(&pctrl->dma_tasklet);
++			return;
++		}
++		pport = &pctrl->ports[0];
++		pch = &pport->chans[ch_nr];
++		clear_bit(ch_nr, pctrl->dma_int_status);
++		if (pch->intr_handler) {
++			flags = dma_chan_tx(pch) ? TRANSMIT_CPT_INT : RCV_INT;
++			pch->intr_handler(pch->lnr, pch->priv, flags);
++		}
++	}
++	/*
++	 * Sanity check: a new IRQ may have raced in during the gap between
++	 * the while loop exit and the in-process clear.
++	 */
++	atomic_set(&pctrl->dma_in_process, 0);
++	if (!bitmap_empty(pctrl->dma_int_status, pctrl->chans)) {
++		atomic_set(&pctrl->dma_in_process, 1);
++		tasklet_schedule(&pctrl->dma_tasklet);
++	}
++}
++
++/* AVM hdma.c:2959-2962 verbatim. */
++static inline int dma_irq_to_chan_nr(struct dma_ctrl *pctrl, int irq)
++{
++	return irq - pctrl->irq_base;
++}
++
++/* dma_chan_interrupt — AVM hdma.c:2964-2988 verbatim. */
++static irqreturn_t dma_chan_interrupt(int irq, void *dev_id)
++{
++	unsigned long flags;
++	struct dmax_chan *pch = (struct dmax_chan *)dev_id;
++	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
++
++	/* Disable this channel interrupt. */
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	ltq_dma_w32_mask(pctrl, DMA_CI_ALL, 0, DMA_CIE);
++	/* Record and clear status to prevent dummy interrupts (level irq). */
++	pch->cis = ltq_dma_r32(pctrl, DMA_CIS);
++	ltq_dma_w32(pctrl, DMA_CI_ALL, DMA_CIS);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++
++	/* Record this channel interrupt for the tasklet. */
++	set_bit(dma_irq_to_chan_nr(pctrl, irq), pctrl->dma_int_status);
++
++	/* If not in process, invoke the tasklet. */
++	if (!atomic_read(&pctrl->dma_in_process)) {
++		atomic_set(&pctrl->dma_in_process, 1);
++		tasklet_schedule(&pctrl->dma_tasklet);
++	}
++	return IRQ_HANDLED;
++}
++
++/*
++ * AVM's `cn > 32` is an off-by-one — it sends cn==32 to the low bank, but
++ * cn==32 is bit 0 of the high bank. The dma_chan_cfg boundary at AVM:2213
++ * uses the correct `nr < 32`, so the AVM source itself is inconsistent.
++ */
++static void dma_disable_irq(struct irq_data *d)
++{
++	unsigned long flags;
++	unsigned int reg_off;
++	struct dma_ctrl *pctrl = itoc(d);
++	unsigned int cn;
++
++	if (unlikely(!pctrl))
++		return;
++
++	cn = d->irq - pctrl->irq_base;
++	reg_off = (cn >= 32) ? DMA_IRNEN1 : DMA_IRNEN;
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32_mask(pctrl, BIT((cn & 0x1f)), 0, reg_off);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++static void dma_enable_irq(struct irq_data *d)
++{
++	unsigned long flags;
++	unsigned int reg_off;
++	struct dma_ctrl *pctrl = itoc(d);
++	unsigned int cn;
++
++	if (unlikely(!pctrl))
++		return;
++
++	cn = d->irq - pctrl->irq_base;
++	reg_off = (cn >= 32) ? DMA_IRNEN1 : DMA_IRNEN;
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32_mask(pctrl, 0, BIT((cn & 0x1f)), reg_off);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++static void dma_ack_irq(struct irq_data *d)
++{
++	unsigned int reg_off;
++	struct dma_ctrl *pctrl = itoc(d);
++	unsigned int cn;
++
++	if (unlikely(!pctrl))
++		return;
++
++	cn = d->irq - pctrl->irq_base;
++	reg_off = (cn >= 32) ? DMA_IRNCR1 : DMA_IRNCR;
++	ltq_dma_w32(pctrl, BIT((cn & 0x1f)), reg_off);
++}
++
++static void dma_mask_and_ack_irq(struct irq_data *d)
++{
++	unsigned long flags;
++	unsigned int reg_off;
++	struct dma_ctrl *pctrl = itoc(d);
++	unsigned int cn;
++
++	if (unlikely(!pctrl))
++		return;
++
++	cn = d->irq - pctrl->irq_base;
++	reg_off = (cn >= 32) ? DMA_IRNEN1 : DMA_IRNEN;
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32_mask(pctrl, BIT((cn & 0x1f)), 0, reg_off);
++	reg_off = (cn >= 32) ? DMA_IRNCR1 : DMA_IRNCR;
++	ltq_dma_w32(pctrl, BIT((cn & 0x1f)), reg_off);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++/*
++ * dma_irq_handler — AVM hdma.c:3098-3120 verbatim. Parent chained
++ * handler: reads the top-level IRNCR (and IRNCR1 when chans > 32) and
++ * dispatches to the per-channel virq via generic_handle_irq().
++ */
++static void dma_irq_handler(struct irq_desc *desc)
++{
++	int offset;
++	unsigned long irncr;
++	unsigned long irncr1 = 0;
++	struct dma_ctrl *pctrl = irq_desc_get_handler_data(desc);
++
++	if (unlikely(!pctrl))
++		return;
++	irncr = ltq_dma_r32(pctrl, DMA_IRNCR);
++	if (pctrl->chans > 32)
++		irncr1 = ltq_dma_r32(pctrl, DMA_IRNCR1);
++
++	if (pctrl->chans <= 32) {
++		for_each_set_bit(offset, &irncr, pctrl->chans)
++			generic_handle_irq(pctrl->irq_base + offset);
++	} else {
++		for_each_set_bit(offset, &irncr, 32)
++			generic_handle_irq(pctrl->irq_base + offset);
++		for_each_set_bit(offset, &irncr1, pctrl->chans - 32)
++			generic_handle_irq(pctrl->irq_base + 32 + offset);
++	}
++}
++
++/* AVM hdma.c:3122-3128 verbatim. */
++static struct irq_chip dma_irq_chip = {
++	.name = "dma_irq",
++	.irq_mask = dma_disable_irq,
++	.irq_unmask = dma_enable_irq,
++	.irq_ack = dma_ack_irq,
++	.irq_mask_ack = dma_mask_and_ack_irq,
++};
++
++/*
++ * dma_irq_map — AVM hdma.c:3130-3140 verbatim (modulo dev_dbg call
++ * adapted). Sets the per-irq chip + handler + chip_data so itoc() works
++ * in the disable/enable/ack callbacks.
++ */
++static int dma_irq_map(struct irq_domain *d, unsigned int irq,
++		       irq_hw_number_t hw)
++{
++	struct dma_ctrl *pctrl = d->host_data;
++
++	irq_set_chip_and_handler_name(irq, &dma_irq_chip,
++				      handle_level_irq, "mux");
++	irq_set_chip_data(irq, pctrl);
++	dev_dbg(pctrl->dev, "dma_irq_map irq %d --> hw %ld\n", irq, hw);
++	return 0;
++}
++
++/* AVM hdma.c:3142-3145 verbatim. */
++static const struct irq_domain_ops dma_irq_domain_ops = {
++	.xlate = irq_domain_xlate_onetwocell,
++	.map = dma_irq_map,
++};
++
++/*
++ * dma_irq_chip_init - AVM hdma.c:3153-3181 with v6.18 API translations A: -
++ * the legacy 'irq-domain-add-legacy' helper (renamed in v5.18) is replaced
++ * with irq_domain_create_legacy + explicit fwnode argument
++ * (of_node_to_fwnode(node)).
++ */
++static int dma_irq_chip_init(struct dma_ctrl *pctrl)
++{
++	struct resource irqres;
++	struct device_node *node = pctrl->dev->of_node;
++	struct irq_domain *domain;
++
++	if (of_irq_to_resource_table(node, &irqres, 1) != 1)
++		return 0;
++
++	pctrl->irq_base = irq_alloc_descs(-1, 0, pctrl->chans,
++					  numa_node_id());
++	if ((int)pctrl->irq_base < 0) {
++		dev_err(pctrl->dev, "Can't allocate IRQ numbers\n");
++		return -ENODEV;
++	}
++	pctrl->chained_irq = irqres.start;
++	domain = irq_domain_create_legacy(of_node_to_fwnode(node),
++					  pctrl->chans, pctrl->irq_base, 0,
++					  &dma_irq_domain_ops, pctrl);
++	if (!domain) {
++		dev_err(pctrl->dev, "Can't create legacy IRQ domain\n");
++		return -ENODEV;
++	}
++
++	/*
++	 * v6.18: irq_set_chained_handler_and_data folds the AVM
++	 * legacy-helper + irq_set_handler_data + irq_set_chained_handler
++	 * sequence into one call.
++	 */
++	irq_set_chained_handler_and_data(irqres.start, dma_irq_handler,
++					 pctrl);
++	return 0;
++}
++
++/*
++ * dma_cfg_init() - AVM hdma.c:4120-4319 with the DMA0 / DMA3 / DMA4 branches
++ * stripped.
++ */
++static int dma_cfg_init(struct dma_ctrl *pctrl,
++			const struct ltq_dma_soc_cfg *cfg)
++{
++	u32 burst;
++	int i;
++	struct dma_port *pport;
++	struct dmax_chan *pch;
++
++	pctrl->flags |= DMA_CTL_64BIT;
++
++	pctrl->burst_mask = DMA_4DW_DESC_MASK;
++	pctrl->desc_size = DMA_4DW_DESC_SIZE;
++
++	pctrl->arb_type = cfg->pkt_arb > DMA_ARB_MAX ? DMA_ARB_PKT
++						     : cfg->pkt_arb;
++
++	if (cfg->chan_fc)
++		pctrl->flags |= DMA_FLCTL;
++	else
++		pctrl->flags &= ~DMA_FLCTL;
++
++	if (cfg->desc_fod)
++		pctrl->flags |= DMA_FTOD;
++	else
++		pctrl->flags &= ~DMA_FTOD;
++
++	if (cfg->desc_in_sram)
++		pctrl->flags |= DMA_DESC_IN_SRAM;
++	else
++		pctrl->flags &= ~DMA_DESC_IN_SRAM;
++
++	if (cfg->drb)
++		pctrl->flags |= DMA_DRB;
++	else
++		pctrl->flags &= ~DMA_DRB;
++
++	if (cfg->byte_en)
++		pctrl->flags |= DMA_EN_BYTE_EN;
++	else
++		pctrl->flags &= ~DMA_EN_BYTE_EN;
++
++	pctrl->pollcnt = cfg->polling_cnt;
++	pctrl->labcnt = cfg->lab_cnt;
++	pctrl->orrc = cfg->orrc;
++	pctrl->budget = cfg->budget;
++
++	dev_dbg(pctrl->dev,
++		"arb %d fc %d fod %d insram %d drb %d ben %d pcnt %d labcnt %d orrc %d\n",
++		pctrl->arb_type, cfg->chan_fc, cfg->desc_fod,
++		cfg->desc_in_sram, cfg->drb, cfg->byte_en, pctrl->pollcnt,
++		pctrl->labcnt, pctrl->orrc);
++
++	pctrl->ports = devm_kzalloc(pctrl->dev,
++				    pctrl->port_nrs * sizeof(*pport),
++				    GFP_KERNEL);
++	if (!pctrl->ports)
++		return -ENOMEM;
++
++	pport = &pctrl->ports[0];
++	pport->chan_nrs = pctrl->chans;
++	pport->pid = 0;
++	pport->name = dma_name[pctrl->cid];
++	pport->rxendi = cfg->rxendi;
++	pport->txendi = cfg->txendi;
++
++	burst = burst_len_to_burst_cfg(cfg->burst);
++	pport->rxbl = burst;
++	pport->txbl = burst;
++	pport->txwgt = DMA_TX_PORT_DEFAULT_WEIGHT;
++	pport->pkt_drop = DMA_PKT_DROP_DISABLE;
++	pport->flush_memcpy = 0;
++
++	pport->chans = devm_kzalloc(pctrl->dev,
++				    pport->chan_nrs * sizeof(*pch),
++				    GFP_KERNEL);
++	if (!pport->chans) {
++		devm_kfree(pctrl->dev, pctrl->ports);
++		return -ENOMEM;
++	}
++	for (i = 0; i < pport->chan_nrs; i++) {
++		pch = &pport->chans[i];
++		pch->flags |= DEVICE_ALLOC_DESC;
++		pch->nr = i;
++		pch->onoff = DMA_CH_OFF;
++		pch->rst = DMA_CHAN_RST;
++		pch->pkt_size = DMA_PKT_SIZE_DEFAULT;
++		pch->opt = NULL;
++		pch->lnr = -1;
++		pch->cis = 0;
++		pch->desc_configured = false;
++	}
++	return 0;
++}
++
++/* dma_ctrl_init - full body. */
++static int dma_ctrl_init(struct dma_ctrl *pctrl)
++{
++	u32 i, j;
++	int enable, ret;
++	struct dma_port *pport = NULL;
++	struct dmax_chan *pch = NULL;
++
++	dev_dbg(pctrl->dev,
++		"struct dma_ctrl size %zu port %zu chan %zu\n",
++		sizeof(*pctrl), sizeof(*pport), sizeof(*pch));
++	spin_lock_init(&pctrl->ctrl_lock);
++	bitmap_zero(pctrl->dma_int_status, MAX_DMA_CHAN_PER_PORT);
++	atomic_set(&pctrl->dma_in_process, 0);
++
++	dma_ctrl_reset(pctrl);
++
++	dma_ctrl_cfg(pctrl);
++
++	/*
++	 * dma_irq_chip_init MUST complete BEFORE the per-channel
++	 * devm_request_irq loop runs (else the irq_domain isn't yet wired and
++	 * pctrl->irq_base is undefined).
++	 */
++	ret = dma_irq_chip_init(pctrl);
++	if (ret)
++		return ret;
++
++	/*
++	 * tasklet_init BEFORE the devm_request_irq loop — a child IRQ
++	 * could fire (and dma_chan_interrupt schedule the tasklet) as soon
++	 * as request_irq returns.
++	 */
++	tasklet_init(&pctrl->dma_tasklet, do_dma_tasklet,
++		     (unsigned long)pctrl);
++
++	for (i = 0; i < pctrl->port_nrs; i++) {
++		pport = &pctrl->ports[i];
++		dma_set_port_controller_data(pport, pctrl);
++		dma_port_cfg(pport);
++
++		for (j = 0; j < pport->chan_nrs; j++) {
++			pch = &pport->chans[j];
++			dma_set_chan_controller_data(pch, pctrl);
++			dma_set_chan_port_data(pch, pport);
++			dma_chan_cfg(pch);
++			pch->irq = pctrl->irq_base + pch->nr;
++			ret = devm_request_irq(pctrl->dev, pch->irq,
++					       dma_chan_interrupt,
++					       IRQF_NO_THREAD |
++					       IRQF_NOBALANCING,
++					       dma_get_name_by_cid(pctrl->cid),
++					       (void *)pch);
++			if (ret) {
++				dev_err(pctrl->dev,
++					"Failed to register irq %d on chan %d %s\n",
++					pch->irq, pch->nr, pctrl->name);
++				return -ENODEV;
++			}
++		}
++	}
++
++	/*
++	 * Descriptor fetch-on-demand goes on LAST, after every port and
++	 * channel is configured — AVM 08.25 hdma.c:3026-3030. It used to sit
++	 * in dma_ctrl_cfg, i.e. before the loops, which leaves the controller
++	 * free to fetch descriptors out of channels that have not been
++	 * programmed yet.
++	 */
++	if ((pctrl->flags & DMA_FTOD))
++		enable = 1;
++	else
++		enable = 0;
++	dma_ctrl_desc_fetch_on_demand_cfg(pctrl, enable);
++
++	return 0;
++}
++
++/*
++ * the panic-on-failure call at :4360 replaced with dev_err + return
++ * PTR_ERR(membase).
++ */
++static int ltq_dma_probe(struct platform_device *pdev)
++{
++	const struct ltq_dma_soc_cfg *cfg;
++	int err;
++	int irq;
++	struct resource *memres;
++	struct dma_ctrl *pctrl;
++	unsigned int id;
++	int cidx;
++
++	/*
++	 * Layout asserts hosted here (rather than in dma_ctrl_init) to fire
++	 * exactly once early in probe. Descriptor sizes are silicon-binding
++	 * (16-byte 4-DW format) and MAX_DMA_CHAN_PER_PORT defines the bitmap
++	 * width inside struct dma_ctrl.
++	 */
++	BUILD_BUG_ON(sizeof(struct dma_rx_desc) != 16);
++	BUILD_BUG_ON(sizeof(struct dma_tx_desc) != 16);
++	BUILD_BUG_ON(MAX_DMA_CHAN_PER_PORT != 64);
++
++	memres = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!memres) {
++		dev_err(&pdev->dev, "failed to get dma resource\n");
++		return -ENODEV;
++	}
++
++	/*
++	 * One compatible describes four controllers that differ in their
++	 * fabric configuration, and the identity is silicon-encoded rather
++	 * than allocated, so both come from the register base.
++	 */
++	cfg = ltq_dma_soc_cfg_get(memres->start);
++	if (!cfg) {
++		dev_err(&pdev->dev, "unknown dma controller at %pa\n",
++			&memres->start);
++		return -ENODEV;
++	}
++	cidx = cfg->cid;
++
++	pdev->id = cidx;
++
++	if (pdev->id < 0 || pdev->id >= DMAMAX)
++		return -EINVAL;
++
++	pctrl = &ltq_dma_controller[pdev->id];
++
++	memset(pctrl, 0, sizeof(*pctrl));
++
++	pctrl->cid = pdev->id;
++	pctrl->name = dma_name[pctrl->cid];
++	pctrl->dev = &pdev->dev;
++
++	/* remap dma register range */
++	pctrl->membase = devm_ioremap_resource(&pdev->dev, memres);
++	if (IS_ERR(pctrl->membase)) {
++		dev_err(&pdev->dev, "failed to remap dma resource\n");
++		return PTR_ERR(pctrl->membase);
++	}
++
++	err = dma_set_mask(pctrl->dev, DMA_BIT_MASK(32));
++	if (err) {
++		err = dma_set_coherent_mask(pctrl->dev, DMA_BIT_MASK(32));
++		if (err) {
++			dev_err(&pdev->dev,
++				"No usable DMA configuration, aborting\n");
++			return err;
++		}
++	}
++
++	id = ltq_dma_r32(pctrl, DMA_ID);
++	pctrl->chans = MS(id, DMA_ID_CHNR);
++	pctrl->port_nrs = MS(id, DMA_ID_PRTNR);
++	pctrl->ver = MS(id, DMA_ID_REV);
++
++	err = dma_cfg_init(pctrl, cfg);
++	if (err)
++		return err;
++
++	err = dma_ctrl_init(pctrl);
++	if (err)
++		return err;
++
++	/* Link platform with driver data for retrieving */
++	platform_set_drvdata(pdev, pctrl);
++
++	irq = platform_get_irq(pdev, 0);
++
++	pr_info("probe entry cid=%d name=%s reg=0x%lx irq=%d\n",
++		cidx, pctrl->name, (unsigned long)memres->start, irq);
++
++	return 0;
++}
++
++/* 1. */
++
++/*
++ * Returns NULL when ltq_dma_controller[cid].dev is NULL (controller never
++ * bound by ltq_dma_probe).
++ *
++ * DMA2RX only binds when the xrx500.dtsi dma2rx node is present; absent that
++ * node ltq_dma_controller[DMA2RX] .dev stays NULL and this function still
++ * returns NULL for DMA2RX cids.
++ */
++static struct dma_ctrl *dma_lookup_ctrl(int cid)
++{
++	if (cid <= DMA0 || cid > DMA2RX)
++		return NULL;
++	if (cid >= DMAMAX)
++		return NULL;
++	if (!ltq_dma_controller[cid].dev)
++		return NULL;
++	return &ltq_dma_controller[cid];
++}
++
++/*
++ * Decodes the 32-bit encoded channel handle, validates the controller is
++ * bound and the (pid, nid) pair resolves to a real per-channel slot.
++ *
++ * Returns NULL on any failure (caller logs / returns -EINVAL upstream).
++ */
++static struct dmax_chan *dma_chan_l2p(u32 chan)
++{
++	int cid = _DMA_CONTROLLER(chan);
++	int pid = _DMA_PORT(chan);
++	int nid = _DMA_CHANNEL(chan);
++	struct dma_ctrl *pctrl;
++	struct dma_port *pport;
++	int i;
++
++	pctrl = dma_lookup_ctrl(cid);
++	if (!pctrl)
++		return NULL;
++	if (pid < 0 || pid >= (int)pctrl->port_nrs)
++		return NULL;
++	pport = &pctrl->ports[pid];
++	if (!pport->chans)
++		return NULL;
++	for (i = 0; i < pport->chan_nrs; i++) {
++		if (pport->chans[i].nr == nid)
++			return &pport->chans[i];
++	}
++	return NULL;
++}
++
++/*
++ * dma_chan_in_use — small inline helper used to enforce post-request
++ * preconditions on the per-channel APIs. Matches AVM hdma.c:387-389.
++ */
++static inline bool dma_chan_in_use(struct dmax_chan *pch)
++{
++	return (pch->flags & CHAN_IN_USE) ? true : false;
++}
++
++int ltq_request_dma(u32 chan, const char *device_id)
++{
++	int cid = _DMA_CONTROLLER(chan);
++	int pid = _DMA_PORT(chan);
++	int nid = _DMA_CHANNEL(chan);
++	struct dma_ctrl *pctrl;
++	struct dma_port *pport;
++	struct dmax_chan *pch = NULL;
++	int i;
++
++	pctrl = dma_lookup_ctrl(cid);
++	if (!pctrl)
++		return -EINVAL;
++
++	if (pid < 0 || pid >= (int)pctrl->port_nrs)
++		return -EINVAL;
++	pport = &pctrl->ports[pid];
++	if (!pport->chans)
++		return -EINVAL;
++	for (i = 0; i < pport->chan_nrs; i++) {
++		if (pport->chans[i].nr == nid) {
++			pch = &pport->chans[i];
++			break;
++		}
++	}
++	if (!pch)
++		return -ENODEV;
++
++	if (!device_id)
++		pr_warn("%s: no device id given for %s chan %d\n", __func__,
++			dma_get_name_by_cid(cid), nid);
++
++	mutex_lock(&pch->ch_lock);
++	if (dma_chan_in_use(pch)) {
++		mutex_unlock(&pch->ch_lock);
++		pr_err("%s chan %d already in use\n",
++		       dma_get_name_by_cid(cid), nid);
++		return -EBUSY;
++	}
++	pch->flags |= CHAN_IN_USE;
++	pch->lnr = chan;
++	pch->device_id = device_id;
++	mutex_unlock(&pch->ch_lock);
++
++	pr_debug("%s chan %d is allocated for %s\n", dma_get_name_by_cid(cid),
++		 nid, device_id ? device_id : "(unnamed)");
++	return 0;
++}
++
++/*
++ * ltq_free_dma — AVM hdma.c:2268-2281 verbatim. Inverse of ltq_request_dma:
++ * clears CHAN_IN_USE, resets lnr / device_id. No silicon-side teardown
++ * here — callers must have already invoked ltq_dma_chan_close +
++ * ltq_dma_chan_desc_free per the API contract documented in lantiq_dmax.h.
++ */
++int ltq_free_dma(u32 chan)
++{
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	mutex_lock(&pch->ch_lock);
++	pch->flags &= ~CHAN_IN_USE;
++	pch->lnr = -1;
++	pch->device_id = NULL;
++	mutex_unlock(&pch->ch_lock);
++	return 0;
++}
++
++/*
++ * dma_chan_on / ltq_dma_chan_on — AVM hdma.c:734-756 verbatim. The
++ * desc_configured WARN_ON in the public wrapper preserves AVM's "no on
++ * without descriptors" contract — callers must invoke ltq_dma_chan_desc_cfg
++ * (or equivalent) before chan_on.
++ */
++static void dma_chan_on(struct dmax_chan *pch)
++{
++	unsigned long flags;
++	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	ltq_dma_w32_mask(pctrl, 0, DMA_CCTRL_ON, DMA_CCTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++	pch->onoff = DMA_CH_ON;
++}
++
++int ltq_dma_chan_on(u32 chan)
++{
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	/* If descriptors not configured, not allow to turn on channel. */
++	if (WARN_ON(!pch || !pch->desc_configured))
++		return -EINVAL;
++	dma_chan_on(pch);
++	return 0;
++}
++
++/*
++ * dma_chan_off / ltq_dma_chan_off — AVM hdma.c:758-788 verbatim. Spins up
++ * to ~10k iterations waiting for the DMA_CCTRL_ON bit to self-clear; logs
++ * (but does not fail) on timeout — silicon may take longer if a long
++ * descriptor is mid-burst.
++ */
++static void dma_chan_off(struct dmax_chan *pch)
++{
++	u32 reg;
++	int i = 10000;
++	unsigned long flags;
++	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	ltq_dma_w32_mask(pctrl, DMA_CCTRL_ON, 0, DMA_CCTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++
++	/* Wait for channel off to complete. */
++	while (((reg = ltq_dma_r32(pctrl, DMA_CCTRL)) & DMA_CCTRL_ON) && i--)
++		;
++	if (i == 0)
++		dev_err(pctrl->dev, "%s chan %d off failed\n",
++			pctrl->name, pch->nr);
++	pch->onoff = DMA_CH_OFF;
++}
++
++int ltq_dma_chan_off(u32 chan)
++{
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	dma_chan_off(pch);
++	return 0;
++}
++
++/*
++ * dma_chan_reset / ltq_dma_chan_reset — AVM hdma.c:935-970. dma_chan_off
++ * is invoked first so any in-flight burst finishes cleanly before the
++ * reset pulse. Resets curr_desc / prev_desc back to 0 and re-arms the
++ * silicon CDBA / CDLEN registers with the cached descriptor ring.
++ *
++ * Callers that need a ring re-seed must do it via the descriptor-cfg path
++ * explicitly.
++ */
++int ltq_dma_chan_reset(u32 chan)
++{
++	int i = 10000;
++	unsigned long flags;
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++	struct dma_ctrl *pctrl;
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	pctrl = dma_chan_get_controller(pch);
++
++	dma_chan_off(pch);
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	ltq_dma_w32_mask(pctrl, 0, DMA_CCTRL_RST, DMA_CCTRL);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++	/* Wait for the RST bit to self-clear. */
++	while ((ltq_dma_r32(pctrl, DMA_CCTRL) & DMA_CCTRL_RST) && i--)
++		;
++	if (i == 0)
++		dev_err(pctrl->dev, "%s chan %d reset failed\n",
++			pctrl->name, pch->nr);
++	pch->rst = 1;
++	/* Re-arm CDBA / CDLEN with the cached descriptor ring base. */
++	if (pch->desc_phys && pch->desc_len) {
++		spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++		ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++		ltq_dma_w32(pctrl, pch->desc_phys, DMA_CDBA);
++		ltq_dma_w32(pctrl, pch->desc_len, DMA_CDLEN);
++		spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++	}
++	pch->curr_desc = 0;
++	pch->prev_desc = 0;
++	pch->desc_configured = false;
++	return 0;
++}
++
++/*
++ * Writes DMA_CI_DEFAULT (= DMA_CI_EOP | DMA_CI_DESCPT) to the per-channel
++ * DMA_CIE — NOT DMA_CI_ALL (DUR/CHOFF/RDERR would generate spurious IRQs at
++ * high traffic). Then sets BIT(cn & 0x1f) in the top-level DMA_IRNEN (cn<=31)
++ * or DMA_IRNEN1 (cn>=32) so the GIC delivers the chained IRQ.
++ */
++static void dma_chan_irq_enable(struct dmax_chan *pch)
++{
++	unsigned long flags;
++	u32 reg_off;
++	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	ltq_dma_w32(pctrl, DMA_CI_DEFAULT, DMA_CIE);
++	reg_off = (pch->nr >= 32) ? DMA_IRNEN1 : DMA_IRNEN;
++	ltq_dma_w32_mask(pctrl, 0, BIT(pch->nr & 0x1f), reg_off);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++int ltq_dma_chan_irq_enable(u32 chan)
++{
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	dma_chan_irq_enable(pch);
++	return 0;
++}
++
++/*
++ * Do not clear the top-level DMA_IRNEN channel bit. The vendor's
++ * dma_chan_irq_disable writes only DMA_CIE = 0; IRNEN is owned by the genirq
++ * irqchip, which sets it for all channels at controller init. Clearing CIE
++ * alone silences the channel, and leaving IRNEN set cannot raise a spurious
++ * interrupt.
++ */
++static void dma_chan_irq_disable(struct dmax_chan *pch)
++{
++	unsigned long flags;
++	struct dma_ctrl *pctrl = dma_chan_get_controller(pch);
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	ltq_dma_w32(pctrl, 0, DMA_CIE);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++}
++
++int ltq_dma_chan_irq_disable(u32 chan)
++{
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	dma_chan_irq_disable(pch);
++	return 0;
++}
++
++/*
++ * Composition: chan_on + (for RX) irq_enable. TX channels intentionally do
++ * NOT enable IRQ at open time — AVM-verbatim contract preserved.
++ */
++static void dma_chan_open(struct dmax_chan *pch)
++{
++	/* chan on, then enable irq (RX only — AVM verbatim). */
++	dma_chan_on(pch);
++	if (dma_chan_rx(pch))
++		dma_chan_irq_enable(pch);
++}
++
++int ltq_dma_chan_open(u32 chan)
++{
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!pch || !pch->desc_configured))
++		return -EINVAL;
++	dma_chan_open(pch);
++	return 0;
++}
++
++/*
++ * dma_chan_close / ltq_dma_chan_close — AVM hdma.c:1039-1054 verbatim.
++ * Composition: chan_off + irq_disable (unconditional for both directions
++ * — TX too, since TX may have been later promoted to IRQ-enabled via the
++ * direct ltq_dma_chan_irq_enable path).
++ */
++static void dma_chan_close(struct dmax_chan *pch)
++{
++	dma_chan_off(pch);
++	dma_chan_irq_disable(pch);
++}
++
++int ltq_dma_chan_close(u32 chan)
++{
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	dma_chan_close(pch);
++	return 0;
++}
++
++/*
++ * Upper bound on physical addresses this driver may take a CKSEG1 alias of.
++ *
++ * The uncached window on this SoC is the first 256 MiB of DRAM and nothing
++ * more. Kernel VA 0xA0000000-0xBFFFFFFF is mapped uncached onto physical
++ * 0x20000000-0x3FFFFFFF, of which only the lower half is DRAM; the upper
++ * half is the SoC's register space, appearing there at its nominal address
++ * plus 0x20000000. So the alias of a page above PHYS_OFFSET + SZ_256M is a
++ * register address, and writing a descriptor ring through it either takes a
++ * data bus error on an unpopulated hole or -- worse, because nothing faults
++ * -- lands in whatever registers are decoded there while the DMA engine
++ * goes on reading the untouched DRAM page.
++ *
++ * This bound is therefore a property of the uncached window, NOT the top of
++ * DRAM. Do not "fix" it by raising it to the board's RAM size: on a board
++ * with more than 256 MiB that trades a loud, diagnosable probe failure for
++ * register corruption. If rings need to come from somewhere the buddy
++ * allocator will not reach, reserve a low region in DT and carve from it --
++ * the way cbm-std-pool and cbm-jbo-pool already work.
++ *
++ * The same window bounds every coherent allocation on the platform and is
++ * enforced generically in arch/mips/mm/dma-noncoherent.c; this check stays
++ * because this driver aliases addresses by hand rather than using what the
++ * allocator returned.
++ */
++#define HDMA_UNCAC_DRAM_LIMIT	(PHYS_OFFSET + SZ_256M)
++
++/*
++ * arch_dma_set_uncached() on MIPS is __pa(addr) + UNCAC_BASE
++ * (arch/mips/mm/dma-noncoherent.c), and on this platform __pa() yields the
++ * FULL physical address because PHYS_OFFSET is 0x20000000
++ * (mach-intel-mips/spaces.h). So the "uncached" pointer the allocator returns
++ * is 0xa0000000 + 0x2xxxxxxx = 0xC2xxxxxx — past CKSEG1 and inside the
++ * TLB-mapped vmalloc/ioremap window (VMALLOC_START = CKSEG2 = 0xc0000000).
++ * Note the spaces.h route cannot work: arch_dma_set_uncached ADDS UNCAC_BASE,
++ * so a PHYS_OFFSET-correcting UNCAC_BASE would have to be 0x80000000 and
++ * would collide with CAC_BASE.
++ *
++ * The GRX500 aliases DDR at physical 0, so CKSEG1ADDR(phys) is an uncached
++ * window onto the very same DRAM page; the guard below accepts exactly the
++ * range over which that alias is a view of DRAM and nothing else.
++ */
++int ltq_dma_chan_desc_alloc(u32 chan, u32 desc_num)
++{
++	struct dma_ctrl *pctrl;
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++	dma_addr_t phys;
++	void *vaddr;
++	size_t bytes;
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	pctrl = dma_chan_get_controller(pch);
++
++	if (desc_num == 0 || desc_num > DMA_MAX_DESC_NUM) {
++		dev_err(pctrl->dev,
++			"%s: invalid desc_num %u (max %u)\n",
++			pch->device_id ? pch->device_id : "(unnamed)",
++			desc_num, DMA_MAX_DESC_NUM);
++		return -EINVAL;
++	}
++
++	if (pch->desc_base) {
++		dev_err(pctrl->dev,
++			"%s chan %d desc already allocated\n",
++			pch->device_id ? pch->device_id : "(unnamed)",
++			pch->nr);
++		return -EINVAL;
++	}
++
++	bytes = (size_t)desc_num * pctrl->desc_size;
++	vaddr = dma_alloc_coherent(pctrl->dev, bytes, &phys, GFP_KERNEL);
++	if (!vaddr)
++		return -ENOMEM;
++
++	if (phys < PHYS_OFFSET || phys + bytes > HDMA_UNCAC_DRAM_LIMIT) {
++		dev_err(pctrl->dev,
++			"desc ring 0x%llx+0x%zx outside the KSEG1-addressable DRAM window [0x%lx,0x%lx), refusing the ring\n",
++			(unsigned long long)phys, bytes,
++			(unsigned long)PHYS_OFFSET,
++			(unsigned long)HDMA_UNCAC_DRAM_LIMIT);
++		dma_free_coherent(pctrl->dev, bytes, vaddr, phys);
++		return -EINVAL;
++	}
++
++	pch->desc_alloc_va = vaddr;
++	pch->desc_base = (u32)CKSEG1ADDR((unsigned long)phys);
++	pch->desc_phys = phys;
++	pch->desc_len = desc_num;
++	pch->curr_desc = 0;
++	pch->prev_desc = 0;
++	dev_dbg(pctrl->dev,
++		"%s chan %d desc_base=0x%08x desc_phys=0x%llx desc_len=%u\n",
++		dma_get_name_by_cid(pctrl->cid), pch->nr, pch->desc_base,
++		(unsigned long long)pch->desc_phys, desc_num);
++	return 0;
++}
++
++/*
++ * Reverses ltq_dma_chan_desc_alloc with dma_free_coherent. Idempotent:
++ * returns 0 if desc_base is already NULL (e.g. double-free or
++ * free-before-alloc). Always clears the slot back to a zero state so a
++ * subsequent desc_alloc can re-bind.
++ *
++ * Handing dma_free_coherent the old 0xC2xxxxxx desc_base was a latent bad
++ * free: MIPS has no arch_dma_clear_uncached, so dma_direct_free falls into
++ * `if (is_vmalloc_addr(cpu_addr)) vunmap(cpu_addr)` and that address IS in
++ * the vmalloc range, so it would vunmap an area that was never mapped (WARN).
++ * Unreachable until now only because hdma_port_disable never ran for the one
++ * CBM-managed port; the deq-7..9 ports added alongside eth1-3 do tear down.
++ */
++int ltq_dma_chan_desc_free(u32 chan)
++{
++	struct dma_ctrl *pctrl;
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++	size_t bytes;
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	pctrl = dma_chan_get_controller(pch);
++
++	if (!pch->desc_base)
++		return 0;
++
++	/*
++	 * desc_alloc_va NULL with desc_base set means this channel does not OWN
++	 * the ring, and there is exactly one way to get there: dma_p2p_cfg()
++	 * copies the RX channel's desc_base/desc_phys/desc_len onto the TX
++	 * channel of a peripheral-to-peripheral pair, without an allocation of
++	 * its own. Freeing here would double-free the RX channel's ring, so drop
++	 * the slot without freeing.
++	 *
++	 * The CBM-managed egress channels do NOT reach this branch: they never
++	 * allocate a ring, and ltq_dma_chan_desc_cfg() (which points them at the
++	 * DQM MMIO window) writes desc_phys, not desc_base, so desc_base stays 0
++	 * and the idempotent guard above returns first.
++	 */
++	if (!pch->desc_alloc_va) {
++		pch->desc_base = 0;
++		pch->desc_phys = 0;
++		pch->desc_len = 0;
++		pch->curr_desc = 0;
++		pch->prev_desc = 0;
++		pch->desc_configured = false;
++		return 0;
++	}
++
++	bytes = (size_t)pch->desc_len * pctrl->desc_size;
++	dma_free_coherent(pctrl->dev, bytes, pch->desc_alloc_va, pch->desc_phys);
++	pch->desc_alloc_va = NULL;
++	pch->desc_base = 0;
++	pch->desc_phys = 0;
++	pch->desc_len = 0;
++	pch->curr_desc = 0;
++	pch->prev_desc = 0;
++	pch->desc_configured = false;
++	return 0;
++}
++
++/*
++ * ltq_dma_chan_pseudo_irq_handler_callback_cfg — AVM hdma.c:2107-2122
++ * verbatim.
++ */
++int ltq_dma_chan_pseudo_irq_handler_callback_cfg(u32 chan,
++						 intr_handler_t handler,
++						 void *priv)
++{
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!handler || !pch))
++		return -EINVAL;
++
++	mutex_lock(&pch->ch_lock);
++	pch->intr_handler = handler;
++	pch->priv = priv;
++	mutex_unlock(&pch->ch_lock);
++	return 0;
++}
++
++/*
++ * The DMA_CS-select-before-CDBA/CDLEN-write ordering is silicon-mandatory —
++ * silicon requires DMA_CS to point at the channel before per-channel register
++ * writes take effect.
++ */
++int ltq_dma_chan_desc_cfg(u32 chan, dma_addr_t desc_base, int desc_num)
++{
++	unsigned long flags;
++	struct dma_ctrl *pctrl;
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!pch))
++		return -EINVAL;
++	pctrl = dma_chan_get_controller(pch);
++
++	if (desc_num <= 0 || desc_num > DMA_MAX_DESC_NUM) {
++		dev_err(pctrl->dev,
++			"%s: desc_num %d out of range (1..%u)\n",
++			pch->device_id ? pch->device_id : "(unnamed)",
++			desc_num, DMA_MAX_DESC_NUM);
++		return -EINVAL;
++	}
++
++	mutex_lock(&pch->ch_lock);
++	pch->flags |= DMA_HW_DESC;
++	pch->desc_len = desc_num;
++	pch->desc_phys = desc_base;
++	mutex_unlock(&pch->ch_lock);
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	ltq_dma_w32(pctrl, desc_base, DMA_CDBA);
++	ltq_dma_w32(pctrl, desc_num, DMA_CDLEN);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++
++	pch->desc_configured = true;
++	return 0;
++}
++
++/*
++ * ltq_dma_chan_get_curr_desc_addr - returns the physical address of the
++ * descriptor currently being processed by silicon on the selected channel.
++ *
++ * Returns the dma_addr_t value read from DMA_CDPTNR, or 0 on lookup
++ * failure (callers must check pch validity via prior ltq_request_dma).
++ */
++dma_addr_t ltq_dma_chan_get_curr_desc_addr(u32 chan)
++{
++	unsigned long flags;
++	dma_addr_t cur;
++	struct dma_ctrl *pctrl;
++	struct dmax_chan *pch = dma_chan_l2p(chan);
++
++	if (WARN_ON(!pch))
++		return 0;
++	pctrl = dma_chan_get_controller(pch);
++
++	spin_lock_irqsave(&pctrl->ctrl_lock, flags);
++	ltq_dma_w32(pctrl, pch->nr, DMA_CS);
++	cur = (dma_addr_t)ltq_dma_r32(pctrl, DMA_CDPTNR);
++	spin_unlock_irqrestore(&pctrl->ctrl_lock, flags);
++	return cur;
++}
++
++/*
++ * The AVM-legacy "lantiq,dma-grx500" compatible is also absent (renamed
++ * wholesale).
++ */
++static const struct of_device_id ltq_dma_match[] = {
++	{ .compatible = "lantiq,xrx500-dma" },
++	{},
++};
++
++static struct platform_driver ltq_dma_driver = {
++	.probe = ltq_dma_probe,
++	.driver = {
++		.name = "xrx500-dma",
++		.of_match_table = ltq_dma_match,
++	},
++};
++
++static int __init ltq_dma_init(void)
++{
++	return platform_driver_register(&ltq_dma_driver);
++}
++postcore_initcall(ltq_dma_init);
++
++/*
++ *   AVM cbm_config.c:40-49 (DEQUEUE, TX-egress) — CBM tmu_port=7 row:
++ *     { .type = DQM_DMA_TYPE, .tmu_port = 7, .tmu_queue = 17,
++ *       .tmu_queue_nos = 1, .dma_ctrl = 2, .dma_chan = 2, ... }
++ *   AVM cbm.c:4514-4539 (dequeue_dma_port_init):
++ *     sprintf(dma_ctrl, "DMA%dTX", dma_hw_num);
++ *     chan = _DMA_C(cqm_dma_get_controller(dma_ctrl), 0, dma_chan_num);
++ *   Substituting (dma_hw_num=2, dma_chan_num=2) yields
++ *     _DMA_C(DMA2TX_controller, 0, 2) == lantiq_dmax.h:303
++ *     DMA2TX_CBM_P7_CLASS2 — empirical (not name-heuristic) evidence
++ *     that DMA2TX channel 2 services CBM port 7 TX-egress.
++ *
++ * AVM cbm_config.c:289-306 (ENQUEUE, RX-admit) lists two CBM tmu_port=7
++ * entries: _DMA_C(DMA1RX, 0, 0) (std buf) and _DMA_C(DMA1RX, 0, 16) (jumbo).
++ * To add them later, append: { .cid = DMA1RX, .pid = DMA1RX_PORT, .nid =
++ * DMA_CHANNEL_0, ... }, { .cid = DMA1RX, .pid = DMA1RX_PORT, .nid =
++ * DMA_CHANNEL_16, ... }, with citation cbm_config.c:289-306 +
++ * cbm.c:4459-4496.
++ */
++struct port7_chan_desc {
++	u32 cid;
++	u32 pid;
++	u32 nid;
++	const char *label;
++	u32 cbm_deq;
++};
++
++static const struct port7_chan_desc port7_channels[] = {
++	{ .cid = DMA2TX, .pid = DMA2TX_PORT, .nid = DMA_CHANNEL_2,
++	  .label = "DMA2TX_CBM_P7_CLASS2", .cbm_deq = 7 },
++};
++
++static const struct port7_chan_desc port8_channels[] = {
++	{ .cid = DMA2TX, .pid = DMA2TX_PORT, .nid = DMA_CHANNEL_3,
++	  .label = "DMA2TX_CBM_P8_CLASS3", .cbm_deq = 8 },
++};
++
++static const struct port7_chan_desc port9_channels[] = {
++	{ .cid = DMA2TX, .pid = DMA2TX_PORT, .nid = DMA_CHANNEL_4,
++	  .label = "DMA2TX_CBM_P9_CLASS4", .cbm_deq = 9 },
++};
++
++static const struct port7_chan_desc port10_channels[] = {
++	{ .cid = DMA2TX, .pid = DMA2TX_PORT, .nid = DMA_CHANNEL_5,
++	  .label = "DMA2TX_CBM_P10_CLASS5", .cbm_deq = 10 },
++};
++
++/*
++ * The WAN port (dp 15) egresses via CBM dequeue port 19 on a DIFFERENT
++ * CONTROLLER, not merely a different channel: AVM cbm_config.c's row for
++ * tmu_port 19 carries dma_ctrl = 1 (DMA1TX @ 0x1a100000, on the GSWIP-R side
++ * of the SoC) where every LAN row carries 2 (DMA2TX @ 0x1c100000). The
++ * channel number is 15, and the vendor names the pair in its own header:
++ * DMA1TX_GSWIP_R_WAN_CBMP19_CLASS15 (dma/lantiq_dmax.h).
++ *
++ * The two controllers are not interchangeable - DMA1TX runs desc-in-sram=1,
++ * polling-cnt=108 and lab-cnt=2, none of which DMA2TX uses - but that is a DT
++ * matter and both nodes are already described; nothing here needs to know.
++ */
++static const struct port7_chan_desc port19_channels[] = {
++	{ .cid = DMA1TX, .pid = DMA1TX_PORT, .nid = DMA_CHANNEL_15,
++	  .label = "DMA1TX_GSWIP_R_WAN_CBMP19_CLASS15", .cbm_deq = 19 },
++};
++
++/*
++ * hdma_port_chan_tbl — the per-CBM-dequeue-port channel table, or NULL for a
++ * dequeue port this driver does not serve.
++ */
++static const struct port7_chan_desc *hdma_port_chan_tbl(int port_id, size_t *n)
++{
++	switch (port_id) {
++	case 7:
++		*n = ARRAY_SIZE(port7_channels);
++		return port7_channels;
++	case 8:
++		*n = ARRAY_SIZE(port8_channels);
++		return port8_channels;
++	case 9:
++		*n = ARRAY_SIZE(port9_channels);
++		return port9_channels;
++	case 10:
++		*n = ARRAY_SIZE(port10_channels);
++		return port10_channels;
++	case 19:
++		*n = ARRAY_SIZE(port19_channels);
++		return port19_channels;
++	default:
++		return NULL;
++	}
++}
++
++/*
++ * The CBM DQM descriptor window is laid out per dequeue port and is
++ * controller-independent (the vendor computes it in setup_DMA_channel, two
++ * descriptors per port), so the same arithmetic serves the WAN port
++ * unchanged.
++ */
++#define CBM_DMADESC_PHYS_BASE   0x1e500000U  /* DT cbm dma_desc window */
++#define CBM_DESC0_0_EGP_5_OFF   0x40000U     /* cbm_regs.h DESC0_0_EGP_5 */
++#define CBM_DQM_DESC_NUM        2U           /* AVM: 2 ping-pong descriptors */
++#define CBM_DQM_DESC_PHYS(deq) \
++	((dma_addr_t)(CBM_DMADESC_PHYS_BASE + CBM_DESC0_0_EGP_5_OFF + \
++		      ((u32)((deq) - 5) * 0x1000U)))
++
++/*
++ * Opens the DMA channel(s) the CBM dequeue port @port_id owns, per
++ * hdma_port_chan_tbl().
++ */
++#define HDMA_PORT_DESC_NUM 32
++
++/*
++ * Once a CBM-managed DMA2TX egress channel is armed, keep it armed: the CBM
++ * dequeue port owns the descriptor window, and tearing the channel down
++ * leaves the port pointing at descriptors nothing will refill.
++ */
++#define HDMA_CBM_DEQ_FIRST 7
++#define HDMA_CBM_DEQ_LAST  19
++
++static u32 g_hdma_deq_armed;
++
++static bool hdma_deq_armed(int port_id)
++{
++	if (port_id < HDMA_CBM_DEQ_FIRST || port_id > HDMA_CBM_DEQ_LAST)
++		return false;
++	return !!(g_hdma_deq_armed & BIT(port_id - HDMA_CBM_DEQ_FIRST));
++}
++
++static void hdma_deq_set_armed(int port_id)
++{
++	if (port_id < HDMA_CBM_DEQ_FIRST || port_id > HDMA_CBM_DEQ_LAST)
++		return;
++	g_hdma_deq_armed |= BIT(port_id - HDMA_CBM_DEQ_FIRST);
++}
++
++extern int init_cbm_dqm_dma_port(int dqp);
++
++/*
++ * hdma_ig192_toe_dma3_reset - reset-parity for the TOE DMA controller (AVM
++ * cid DMA3 @ ssx0+0x300000 = phys 0x1E300000).
++ *
++ * Faithful replication of the AVM probe hardware effects using the same
++ * static primitives, with a hand-built pctrl carrying DMA3's DT props
++ * (4.9 lantiq/xrx500.dtsi:114-131): pkt-arb=2(pkt) burst=16 polling-cnt=24
++ * chan-fc=0 desc-fod=0 desc-in-sram=1 drb=0 byte-en=1 txendi=3 rxendi=3.
++ * The AVM dma_cfg_init DMA3/DMA4 "port_nrs--" quirk (AVM:4139) is
++ * replicated; ports/chans are then configured exactly as dma_ctrl_init's
++ * nested loop would. Deliberate non-hardware deltas: no devm (plain
++ * kzalloc, never freed — builtin), no request_irq / tasklet (channels
++ * stay DMA_CH_OFF and IRNEN bits are masked by dma_chan_cfg, so no IRQ
++ * can fire; AVM's request_irq writes no device register).
++ */
++int hdma_ig192_toe_dma3_reset(void)
++{
++	struct dma_ctrl *pctrl = &ltq_dma_controller[DMA3];
++	struct dma_port *pport;
++	struct dmax_chan *pch;
++	u32 id;
++	int i, j;
++
++	if (pctrl->membase) {
++		pr_info("hdma: TOE/DMA3 already initialized, skipping\n");
++		return 0;
++	}
++
++	pctrl->membase = ioremap(0x1E300000, 0x1000);
++	if (!pctrl->membase) {
++		pr_err("hdma: TOE/DMA3 ioremap failed\n");
++		return -ENOMEM;
++	}
++	pctrl->cid = DMA3;
++	pctrl->name = dma_name[DMA3];
++	pctrl->dev = NULL;	/* no platform device — pr_* logging only */
++	spin_lock_init(&pctrl->ctrl_lock);
++	bitmap_zero(pctrl->dma_int_status, MAX_DMA_CHAN_PER_PORT);
++	atomic_set(&pctrl->dma_in_process, 0);
++
++	id = ltq_dma_r32(pctrl, DMA_ID);
++	if (id == 0 || id == 0xFFFFFFFFu) {
++		pr_err("hdma: TOE/DMA3 DMA_ID reads 0x%08x (clock off?), aborting reset\n",
++		       id);
++		iounmap(pctrl->membase);
++		pctrl->membase = NULL;
++		return -ENODEV;
++	}
++	pctrl->chans = MS(id, DMA_ID_CHNR);
++	pctrl->port_nrs = MS(id, DMA_ID_PRTNR);
++	pctrl->ver = MS(id, DMA_ID_REV);
++	/* AVM hdma.c:4139: DMA3/DMA4 report one port more than they expose */
++	if (pctrl->port_nrs)
++		pctrl->port_nrs--;
++	pr_info("hdma: TOE/DMA3 DMA_ID=0x%08x chans=%d ports=%d(post-dec) ver=%d\n",
++		id, pctrl->chans, pctrl->port_nrs, pctrl->ver);
++
++	/* DMA3 DT props, 4.9 lantiq/xrx500.dtsi:114-131 */
++	pctrl->flags = DMA_CTL_64BIT | DMA_DESC_IN_SRAM | DMA_EN_BYTE_EN;
++	pctrl->arb_type = DMA_ARB_PKT;
++	pctrl->pollcnt = 24;
++	pctrl->labcnt = 0;
++	pctrl->orrc = 0;
++	pctrl->budget = 20;
++	pctrl->burst_mask = DMA_4DW_DESC_MASK;
++	pctrl->desc_size = DMA_4DW_DESC_SIZE;
++
++	if (pctrl->port_nrs) {
++		pctrl->ports = kcalloc(pctrl->port_nrs, sizeof(*pport),
++				       GFP_KERNEL);
++		if (!pctrl->ports)
++			return -ENOMEM;
++		pport = &pctrl->ports[0];
++		pport->chan_nrs = pctrl->chans;
++		pport->pid = 0;
++		pport->name = dma_name[DMA3];
++		pport->rxendi = 3;
++		pport->txendi = 3;
++		pport->rxbl = burst_len_to_burst_cfg(16);
++		pport->txbl = burst_len_to_burst_cfg(16);
++		pport->txwgt = DMA_TX_PORT_DEFAULT_WEIGHT;
++		pport->pkt_drop = DMA_PKT_DROP_DISABLE;
++		pport->flush_memcpy = 0;	/* AVM:4298 DMA3/DMA4 */
++		pport->chans = kcalloc(pport->chan_nrs, sizeof(*pch),
++				       GFP_KERNEL);
++		if (!pport->chans)
++			return -ENOMEM;
++		for (i = 0; i < pport->chan_nrs; i++) {
++			pch = &pport->chans[i];
++			pch->nr = i;
++			pch->onoff = DMA_CH_OFF;
++			pch->rst = DMA_CHAN_RST;
++			pch->pkt_size = DMA_PKT_SIZE_DEFAULT;
++			pch->lnr = -1;
++		}
++	}
++
++	/* The AVM dma_ctrl_init hardware sequence */
++	dma_ctrl_reset(pctrl);
++	dma_ctrl_cfg(pctrl);
++	for (i = 0; i < pctrl->port_nrs; i++) {
++		pport = &pctrl->ports[i];
++		dma_set_port_controller_data(pport, pctrl);
++		dma_port_cfg(pport);
++		for (j = 0; j < pport->chan_nrs; j++) {
++			pch = &pport->chans[j];
++			dma_set_chan_controller_data(pch, pctrl);
++			dma_set_chan_port_data(pch, pport);
++			dma_chan_cfg(pch);
++		}
++	}
++
++	pr_info("hdma: TOE/DMA3 reset done: DMA_CTRL=0x%08x CPOLL=0x%08x\n",
++		ltq_dma_r32(pctrl, DMA_CTRL), ltq_dma_r32(pctrl, DMA_CPOLL));
++	return 0;
++}
++EXPORT_SYMBOL_GPL(hdma_ig192_toe_dma3_reset);
++
++int hdma_port_enable(int port_id)
++{
++	const struct port7_chan_desc *tbl;
++	size_t n, i;
++	int ret;
++	u32 chan;
++	struct dmax_chan *pch;
++
++	if (hdma_deq_armed(port_id))
++		return 0;
++
++	tbl = hdma_port_chan_tbl(port_id, &n);
++	if (!tbl)
++		return -EINVAL;
++
++	for (i = 0; i < n; i++) {
++		const struct port7_chan_desc *e = &tbl[i];
++
++		chan = _DMA_C(e->cid, e->pid, e->nid);
++		ret = ltq_request_dma(chan, e->label);
++		if (ret) {
++			pr_err("hdma_port_enable(%d): ltq_request_dma(%s) failed: %d\n",
++			       port_id, e->label, ret);
++			return ret;
++		}
++
++		if (e->cbm_deq) {
++
++			ret = init_cbm_dqm_dma_port(e->cbm_deq);
++			if (ret) {
++				pr_err("hdma_port_enable(%d): init_cbm_dqm_dma_port(%d) failed: %d\n",
++				       port_id, e->cbm_deq, ret);
++				goto err_release;
++			}
++
++			ret = ltq_dma_chan_desc_cfg(chan,
++						    CBM_DQM_DESC_PHYS(e->cbm_deq),
++						    CBM_DQM_DESC_NUM);
++			if (ret) {
++				pr_err("hdma_port_enable(%d): ltq_dma_chan_desc_cfg(%s, DQM-window) failed: %d\n",
++				       port_id, e->label, ret);
++				goto err_release;
++			}
++			pr_info("hdma_port_enable(%d): %s CBM-managed, desc@phys 0x%08x x%u\n",
++				port_id, e->label,
++				(u32)CBM_DQM_DESC_PHYS(e->cbm_deq),
++				CBM_DQM_DESC_NUM);
++			goto chan_on;
++		}
++
++		ret = ltq_dma_chan_desc_alloc(chan, HDMA_PORT_DESC_NUM);
++		if (ret) {
++			pr_err("hdma_port_enable(%d): ltq_dma_chan_desc_alloc(%s) failed: %d\n",
++			       port_id, e->label, ret);
++			goto err_release;
++		}
++		pch = dma_chan_l2p(chan);
++		if (!pch) {
++			pr_err("hdma_port_enable(%d): dma_chan_l2p(%s) returned NULL\n",
++			       port_id, e->label);
++			ret = -EINVAL;
++			goto err_release;
++		}
++		ret = ltq_dma_chan_desc_cfg(chan, pch->desc_phys,
++					    HDMA_PORT_DESC_NUM);
++		if (ret) {
++			pr_err("hdma_port_enable(%d): ltq_dma_chan_desc_cfg(%s) failed: %d\n",
++			       port_id, e->label, ret);
++			goto err_release;
++		}
++chan_on:
++		ltq_dma_chan_irq_disable(chan);
++		ret = ltq_dma_chan_open(chan);
++		if (ret) {
++			pr_err("hdma_port_enable(%d): ltq_dma_chan_open(%s) failed: %d\n",
++			       port_id, e->label, ret);
++			goto err_release;
++		}
++		pr_info("hdma_port_enable(%d): opened %s (cid=%u pid=%u nid=%u)\n",
++			port_id, e->label, e->cid, e->pid, e->nid);
++	}
++
++	hdma_deq_set_armed(port_id);
++	return 0;
++
++err_release:
++	while (1) {
++		const struct port7_chan_desc *e = &tbl[i];
++		u32 c = _DMA_C(e->cid, e->pid, e->nid);
++
++		ltq_dma_chan_close(c);
++		ltq_dma_chan_desc_free(c);
++		ltq_free_dma(c);
++		if (i == 0)
++			break;
++		i--;
++	}
++	return ret;
++}
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma.h b/drivers/net/ethernet/lantiq/dma/hdma.h
+new file mode 100644
+index 000000000000..1f198dd85a00
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/dma/hdma.h
+@@ -0,0 +1,536 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2014 ~ 2015 Lei Chuanhua <chuanhua.lei@lantiq.com>
++ * Copyright (C) 2016 ~ 2017 Intel Corporation.
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/dma/intel/hdma.h.
++ *
++ * Intra-module declarations for the xRX500 DMA driver.
++ */
++#ifndef LTQ_HDMA_H
++#define LTQ_HDMA_H
++#include <linux/types.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/interrupt.h>
++#include <linux/bitmap.h>
++#include <linux/atomic.h>
++#include <linux/dma-mapping.h>
++#include <linux/device.h>
++
++#include "lantiq_dmax.h"
++
++#define DMA_CHAN_MAGIC -1
++
++#define DMA_FLUSH_MEMCPY 1
++#define DMA_CHAN_RST 1
++
++enum dma_global_poll {
++	DMA_CHAN_GLOBAL_POLLING_DIS = 0,
++	DMA_CHAN_GLOBAL_POLLING_EN,
++};
++
++enum dma_chan_on_off {
++	DMA_CH_OFF = 0,
++	DMA_CH_ON = 1,
++};
++
++enum dma_port_txwgt {
++	DMA_PORT_TXWGT0 = 0,
++	DMA_PORT_TXWGT1,
++	DMA_PORT_TXWGT2,
++	DMA_PORT_TXWGT3,
++	DMA_PORT_TXWGT4,
++	DMA_PORT_TXWGT5,
++	DMA_PORT_TXWGT6,
++	DMA_PORT_TXWGT7,
++	DMA_PORT_TXWGTMAX,
++};
++
++enum dma_chan_txwgt {
++	DMA_CHAN_TXWGT0 = 0,
++	DMA_CHAN_TXWGT1,
++	DMA_CHAN_TXWGT2,
++	DMA_CHAN_TXWGT3,
++#define DMA_V22_TXWGTMAX DMA_CHAN_TXWGT3
++	DMA_CHAN_TXWGT4,
++	DMA_CHAN_TXWGT5,
++	DMA_CHAN_TXWGT6,
++	DMA_CHAN_TXWGT7,
++	DMA_CHAN_TXWGTMAX,
++};
++
++enum dma_arb {
++	DMA_ARB_BURST = 0,
++	DMA_ARB_MUL_BURST,
++	DMA_ARB_PKT,
++	DMA_ARB_MAX,
++};
++
++#define DMA_VER_31 0x31
++#define DMA_VER_30 0x30
++#define DMA_VER_22 0x0A
++
++#define DMA_ORRC_MAX_CNT 31
++
++#define DMA_ARB_MUL_BURST_DEFAULT 4
++
++#define DMA_IRQ_BUDGET 20
++
++#define DMA_GLOBAL_POLLING_DEFAULT_INTERVAL 4
++
++#define DMA_MAX_DESC_NUM 4095
++#define DMAV3_MAX_DESC_NUM 8191
++
++#define DMA_MAX_PKT_SIZE 65535
++
++#define DMA_PKT_SIZE_DEFAULT 2048
++
++#define DMA_TX_PORT_DEFAULT_WEIGHT 1
++/* Default Port Transmit weight value */
++#define DMA_TX_CHAN_DEFAULT_WEIGHT 1
++
++#define DMA_4DW_DESC_SIZE 16
++#define DMA_4DW_DESC_MASK 0x7
++#define DMA_2DW_DESC_SIZE 8
++#define DMA_2DW_DESC_MASK 0x3
++
++#define DMA_CHAN_HDRM_MAX 255
++#define DMA_CHAN_BOFF_MAX 255
++#define DMA_CHAN_COAL_MAX 255
++
++enum {
++	DMA_CTRL_UNINITIALIZED = 0,
++	DMA_CTRL_INITIALIZED,
++};
++
++#ifdef CONFIG_CPU_BIG_ENDIAN
++#define DMA_DEFAULT_ENDIAN DMA_ENDIAN_TYPE3
++#else
++#define DMA_DEFAULT_ENDIAN DMA_ENDIAN_TYPE0
++#endif
++
++#define DMA_DEFAULT_BURST DMA_BURSTL_16DW
++#define DMA_DEFAULT_PKDROP DMA_PKT_DROP_DISABLE
++#define DMA_DEFAULT_DESC_LEN 1
++
++#define DMA_OWN 1
++#define CPU_OWN 0
++#define DESC_OWN_DMA 0x80000000
++#define DESC_CPT_SET 0x40000000
++#define DESC_SOP_SET 0x20000000
++
++/*
++ * Forward declarations — struct dma_ctrl & struct dma_port are
++ * back-pointed-to by struct dmax_chan, so the chain demands forward
++ * decls before the full definitions.
++ */
++struct dma_ctrl;
++struct dma_port;
++
++struct dmax_chan {
++	struct dma_ctrl *controller;
++	struct dma_port *port; /* back pointer */
++	int nr; /* Channel number */
++#define DMA_TX_CH 0x1
++#define DMA_RX_CH 0x2
++#define DEVICE_ALLOC_DESC 0x4 /* Client allocate descriptor itself */
++#define CHAN_IN_USE 0x8 /* Channel is in use already */
++#define DEVICE_CTRL_CHAN 0x10 /* Device handle all dma actions itself */
++#define DMA_HW_DESC 0x20 /* CBM or other hardware descriptor */
++	u32 flags; /* central way or channel based way */
++	enum dma_chan_on_off onoff;
++	int rst;
++	int irq; /*!< DMA channel IRQ number */
++	void *data;
++	int lpbk_en;
++	int lpbk_ch_nr;
++	int pden;
++	int curr_desc;
++	int prev_desc;
++	dma_addr_t desc_phys; /* Descriptor base physical address */
++	/*
++	 * CPU-side view of the descriptor ring. On this platform it is the
++	 * CKSEG1 uncached alias of @desc_phys, NOT the pointer
++	 * dma_alloc_coherent returned — see ltq_dma_chan_desc_alloc().
++	 */
++	u32 desc_base;
++	/*
++	 * The raw dma_alloc_coherent() return value, kept ONLY as the cookie
++	 * dma_free_coherent() has to be handed back in ltq_dma_chan_desc_free().
++	 * Never dereferenced: on a PHYS_OFFSET platform it is arithmetically
++	 * wrong (see ltq_dma_chan_desc_alloc()).
++	 */
++	void *desc_alloc_va;
++	int desc_len;
++	enum dma_chan_txwgt txwgt;
++	int pkt_size;
++	int p2pcpy;
++	int global_buffer_len; /* Used for peri_to_peri */
++	struct mutex ch_lock;
++	const char *device_id;
++	spinlock_t irq_lock; /* shared resource exclusive in irq context */
++	void **opt; /* Dynamic allocate */
++	buffer_alloc_t alloc;
++	buffer_free_t free;
++	intr_handler_t intr_handler;
++	u32 cis; /* Record channel interrupt status for later usage */
++	int lnr; /* Logical channel number */
++	u32 nonarb_cnt;
++	u32 arb_cnt;
++	u32 hdrm_len;
++	u32 boff_len;
++	u32 coal_len;
++	bool sw_poll;
++	bool data_endian_en;
++	u32 data_endian;
++	bool desc_endian_en;
++	u32 desc_endian;
++	bool desc_configured;
++	void *priv; /* Client specific info */
++};
++
++struct dma_port {
++	struct dma_ctrl *controller; /* back pointer */
++	int pid;
++	const char *name;
++	enum dma_endian rxendi;
++	enum dma_endian txendi;
++	enum dma_burst rxbl;
++	enum dma_burst txbl;
++	enum dma_port_txwgt txwgt;
++	enum dma_pkt_drop pkt_drop;
++	int flush_memcpy; /* change to flags */
++	int chan_nrs; /* For the current port */
++	struct dmax_chan *chans; /* Dynamic allocate */
++	spinlock_t port_lock;
++};
++
++struct dma_ctrl {
++	int cid;
++	const char *name;
++#define DMA_CTL_64BIT 0x1
++#define DMA_FLCTL 0x2
++#define DMA_FTOD 0x4
++#define DMA_DESC_IN_SRAM 0x8
++#define DMA_DRB 0x10
++#define DMA_EN_BYTE_EN 0x20
++	u32 flags;
++	void __iomem *membase;
++	u32 chained_irq;
++	u32 irq_base;
++	u32 port_nrs; /* For the current controller */
++	u32 chans;
++	u32 ver;
++	struct dma_port *ports; /* Dynamic allocate */
++	u32 arb_type;
++	u32 labcnt; /* Look ahead buffer counter */
++	u32 pollcnt;
++	u32 orrc; /* Outstanding read count */
++	spinlock_t ctrl_lock; /* DMA controller register exclusive */
++	struct tasklet_struct dma_tasklet;
++	DECLARE_BITMAP(dma_int_status, MAX_DMA_CHAN_PER_PORT);
++	atomic_t dma_in_process;
++	u32 burst_mask;
++	u32 desc_size;
++	struct device *dev;
++	u32 budget;
++};
++
++/*
++ * 4-DW silicon descriptor — AVM include/linux/dma/lantiq_dmax.h:386-571.
++ *
++ * Both endian variants ported verbatim. CONFIG_XBAR_LE selects a third
++ * intermediate variant for BE CPUs talking to LE crossbars; preserved
++ * here for completeness even though FRITZ!Box 7560 (LE) does not engage it.
++ */
++#ifdef CONFIG_CPU_BIG_ENDIAN
++
++#ifdef CONFIG_XBAR_LE
++/* Four DWs descriptor format */
++struct dma_rx_desc {
++	union {
++		struct {
++			u32 resv : 3;
++			u32 tunnel_id : 4;
++			u32 flow_id : 8;
++			u32 eth_type : 2;
++			u32 dest_id : 15;
++		} __packed field;
++		u32 all;
++	} __packed dw0;
++	union {
++		struct {
++			u32 session_id : 12;
++			u32 tcp_err : 1;
++			u32 nat : 1;
++			u32 dec : 1;
++			u32 enc : 1;
++			u32 mpe2 : 1;
++			u32 mpe1 : 1;
++			u32 color : 2;
++			u32 ep : 4;
++			u32 resv : 4;
++			u32 cla : 4;
++		} __packed field;
++		u32 all;
++	} __packed dw1;
++	dma_addr_t data_pointer; /* dw2 */
++	union {
++		struct {
++			u32 own : 1;
++			u32 c : 1;
++			u32 sop : 1;
++			u32 eop : 1;
++			u32 dic : 1;
++			u32 pdu : 1;
++			u32 byte_offset : 3;
++			u32 qid : 4;
++			u32 mpoa_pt : 1;
++			u32 mpoa_mode : 2;
++			u32 data_len : 16;
++		} __packed field;
++		u32 all;
++	} __packed status; /* dw3 */
++} __packed __aligned(16);
++
++struct dma_tx_desc {
++	union {
++		struct {
++			u32 resv : 3;
++			u32 tunnel_id : 4;
++			u32 flow_id : 8;
++			u32 eth_type : 2;
++			u32 dest_id : 15;
++		} __packed field;
++		u32 all;
++	} __packed dw0;
++	union {
++		struct {
++			u32 session_id : 12;
++			u32 tcp_err : 1;
++			u32 nat : 1;
++			u32 dec : 1;
++			u32 enc : 1;
++			u32 mpe2 : 1;
++			u32 mpe1 : 1;
++			u32 color : 2;
++			u32 ep : 4;
++			u32 resv : 4;
++			u32 cla : 4;
++		} __packed field;
++		u32 all;
++	} __packed dw1;
++	dma_addr_t data_pointer; /* dw2 */
++	union {
++		struct {
++			u32 own : 1;
++			u32 c : 1;
++			u32 sop : 1;
++			u32 eop : 1;
++			u32 dic : 1;
++			u32 pdu : 1;
++			u32 byte_offset : 3;
++			u32 qid : 4;
++			u32 mpoa_pt : 1;
++			u32 mpoa_mode : 2;
++			u32 data_len : 16;
++		} __packed field;
++		u32 all;
++	} __packed status; /* dw3 */
++} __packed __aligned(16);
++
++#else /* Normal big endian */
++/* Four DWs descriptor format */
++struct dma_rx_desc {
++	union {
++		struct {
++			u32 session_id : 12;
++			u32 tcp_err : 1;
++			u32 nat : 1;
++			u32 dec : 1;
++			u32 enc : 1;
++			u32 mpe2 : 1;
++			u32 mpe1 : 1;
++			u32 color : 2;
++			u32 ep : 4;
++			u32 resv : 4;
++			u32 cla : 4;
++		} __packed field;
++		u32 all;
++	} __packed dw1;
++	union {
++		struct {
++			u32 resv : 3;
++			u32 tunnel_id : 4;
++			u32 flow_id : 8;
++			u32 eth_type : 2;
++			u32 dest_id : 15;
++		} __packed field;
++		u32 all;
++	} __packed dw0;
++	union {
++		struct {
++			u32 own : 1;
++			u32 c : 1;
++			u32 sop : 1;
++			u32 eop : 1;
++			u32 dic : 1;
++			u32 pdu : 1;
++			u32 byte_offset : 3;
++			u32 qid : 4;
++			u32 mpoa_pt : 1;
++			u32 mpoa_mode : 2;
++			u32 data_len : 16;
++		} __packed field;
++		u32 all;
++	} __packed status; /* dw3 */
++	dma_addr_t data_pointer; /* dw2 */
++} __packed __aligned(16);
++
++struct dma_tx_desc {
++	union {
++		struct {
++			u32 session_id : 12;
++			u32 tcp_err : 1;
++			u32 nat : 1;
++			u32 dec : 1;
++			u32 enc : 1;
++			u32 mpe2 : 1;
++			u32 mpe1 : 1;
++			u32 color : 2;
++			u32 ep : 4;
++			u32 resv : 4;
++			u32 cla : 4;
++		} __packed field;
++		u32 all;
++	} __packed dw1;
++	union {
++		struct {
++			u32 resv : 3;
++			u32 tunnel_id : 4;
++			u32 flow_id : 8;
++			u32 eth_type : 2;
++			u32 dest_id : 15;
++		} __packed field;
++		u32 all;
++	} __packed dw0;
++	union {
++		struct {
++			u32 own : 1;
++			u32 c : 1;
++			u32 sop : 1;
++			u32 eop : 1;
++			u32 dic : 1;
++			u32 pdu : 1;
++			u32 byte_offset : 3;
++			u32 qid : 4;
++			u32 mpoa_pt : 1;
++			u32 mpoa_mode : 2;
++			u32 data_len : 16;
++		} __packed field;
++		u32 all;
++	} __packed status; /* dw3 */
++	dma_addr_t data_pointer; /* dw2 */
++} __packed __aligned(16);
++
++#endif /* CONFIG_XBAR_LE */
++
++#else /* little endian */
++/* Four DWs descriptor format */
++struct dma_rx_desc {
++	union {
++		struct {
++			u32 dest_id : 15;
++			u32 eth_type : 2;
++			u32 flow_id : 8;
++			u32 tunnel_id : 4;
++			u32 resv : 3;
++		} __packed field;
++		u32 all;
++	} __packed dw0;
++	union {
++		struct {
++			u32 cla : 4;
++			u32 resv : 4;
++			u32 ep : 4;
++			u32 color : 2;
++			u32 mpe1 : 1;
++			u32 mpe2 : 1;
++			u32 enc : 1;
++			u32 dec : 1;
++			u32 nat : 1;
++			u32 tcp_err : 1;
++			u32 session_id : 12;
++		} __packed field;
++		u32 all;
++	} __packed dw1;
++	dma_addr_t data_pointer; /* dw2 */
++	union {
++		struct {
++			u32 data_len : 16;
++			u32 mpoa_mode : 2;
++			u32 mpoa_pt : 1;
++			u32 qid : 4;
++			u32 byte_offset : 3;
++			u32 pdu : 1;
++			u32 dic : 1;
++			u32 eop : 1;
++			u32 sop : 1;
++			u32 c : 1;
++			u32 own : 1;
++		} __packed field;
++		u32 all;
++	} __packed status; /* dw3 */
++} __packed __aligned(16);
++
++struct dma_tx_desc {
++	union {
++		struct {
++			u32 dest_id : 15;
++			u32 eth_type : 2;
++			u32 flow_id : 8;
++			u32 tunnel_id : 4;
++			u32 resv : 3;
++		} __packed field;
++		u32 all;
++	} __packed dw0;
++	union {
++		struct {
++			u32 cla : 4;
++			u32 resv : 4;
++			u32 ep : 4;
++			u32 color : 2;
++			u32 mpe1 : 1;
++			u32 mpe2 : 1;
++			u32 enc : 1;
++			u32 dec : 1;
++			u32 nat : 1;
++			u32 tcp_err : 1;
++			u32 session_id : 12;
++		} __packed field;
++		u32 all;
++	} __packed dw1;
++	dma_addr_t data_pointer; /* dw2 */
++	union {
++		struct {
++			u32 data_len : 16;
++			u32 mpoa_mode : 2;
++			u32 mpoa_pt : 1;
++			u32 qid : 4;
++			u32 byte_offset : 3;
++			u32 pdu : 1;
++			u32 dic : 1;
++			u32 eop : 1;
++			u32 sop : 1;
++			u32 c : 1;
++			u32 own : 1;
++		} __packed field;
++		u32 all;
++	} __packed status; /* dw3 */
++} __packed __aligned(16);
++
++#endif /* CONFIG_CPU_BIG_ENDIAN */
++
++#endif /* LTQ_HDMA_H */
+diff --git a/drivers/net/ethernet/lantiq/dma/hdma_regs.h b/drivers/net/ethernet/lantiq/dma/hdma_regs.h
+new file mode 100644
+index 000000000000..5ab499ce05d0
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/dma/hdma_regs.h
+@@ -0,0 +1,210 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2014 ~ 2015 Lei Chuanhua <chuanhua.lei@lantiq.com>
++ * Copyright (C) 2016 ~ 2017 Intel Corporation.
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/dma/intel/hdma.c.
++ *
++ * xRX500 DMA controller register offsets and field encodings.
++ */
++#ifndef __XRX500_HDMA_REGS_H
++#define __XRX500_HDMA_REGS_H
++
++#include <linux/bits.h>
++#include <linux/types.h>
++
++/* Field shift/mask helpers — AVM hdma.c:28-29 verbatim. */
++#define MS(_v, _f) (((_v) & (_f)) >> _f##_S)
++#define SM(_v, _f) (((_v) << _f##_S) & (_f))
++
++#define DMA_CLC 0x0000
++
++#define DMA_ID 0x0008
++#define DMA_ID_REV 0xFFu
++#define DMA_ID_REV_S 0
++#define DMA_ID_ID 0xFF00u
++#define DMA_ID_ID_S 8
++#define DMA_ID_PRTNR 0xF0000u
++#define DMA_ID_PRTNR_S 16
++#define DMA_ID_CHNR 0x7F00000u
++#define DMA_ID_CHNR_S 20
++
++#define DMA_CTRL 0x0010
++#define DMA_CTRL_RST BIT(0)
++#define DMA_CTRL_DSRAM_PATH BIT(1)
++#define DMA_CTRL_CH_FL BIT(6)
++#define DMA_CTRL_DS_FOD BIT(7)
++#define DMA_CTRL_DRB BIT(8)
++#define DMA_CTRL_ENBE BIT(9)
++#define DMA_CTRL_PRELOAD_INT_S 10
++#define DMA_CTRL_PRELOAD_INT 0x0C00u
++#define DMA_CTRL_PRELOAD_EN BIT(12)
++#define DMA_CTRL_MBRST_CNT_S 16
++#define DMA_CTRL_MBRST_CNT 0x3FF0000u
++#define DMA_CTRL_MBRSTARB BIT(30)
++#define DMA_CTRL_PKTARB BIT(31)
++
++#define DMA_CPOLL 0x0014
++/*
++ * CPOLL has no standalone enable bit below bit 31: CPOLL_CNT occupies bits
++ * 4-15, so a poll count of 8 reads back as 0x80 (hdma.c:58-61).
++ */
++#define DMA_CPOLL_CNT_S 4
++#define DMA_CPOLL_CNT 0xFFF0u
++#define DMA_CPOLL_EN BIT(31)
++
++#define DMA_CGBL 0x0030
++#define DMA_CGBL_GBL_S 0
++#define DMA_CGBL_GBL 0xFFFFu
++
++#define DMA_CS 0x0018
++#define DMA_CS_MASK 0x3Fu
++
++#define DMA_CCTRL 0x001C
++#define DMA_CCTRL_ON BIT(0)
++#define DMA_CCTRL_RST BIT(1)
++#define DMA_CCTRL_CH_POLL_EN BIT(2)	/* DMA V3 */
++#define DMA_CCTRL_DIR_TX BIT(8)
++#define DMA_CCTRL_CLASS_S 9
++#define DMA_CCTRL_CLASS 0xE00u
++#define DMA_CCTRL_PRTNR_S 12
++#define DMA_CCTRL_PRTNR 0xF000u
++#define DMA_CCTRL_TXWGT_S 16
++#define DMA_CCTRL_TXWGT 0x30000u
++#define DMA_CCTRL_CLASSH_S 18
++#define DMA_CCTRL_CLASSH 0xC0000u
++#define DMA_CCTRL_TXWGT2 BIT(20)	/* DMA V3 */
++#define DMA_CCTRL_PDEN BIT(23)
++#define DMA_CCTRL_P2PCPY BIT(24)
++#define DMA_CCTRL_LBEN BIT(25)
++#define DMA_CCTRL_LBCHNR_S 26
++#define DMA_CCTRL_LBCHNR 0xFC000000u
++#define DMA_MAX_CLASS 31 /* 5 bits */
++
++#define DMA_CDBA 0x0020
++
++#define DMA_CDLEN 0x0024
++#define DMA_CDLEN_CDLEN_S 0
++#define DMA_CDLEN_CDLEN 0xFFFu
++
++#define DMA_CIS 0x0028
++#define DMA_CIE 0x002C
++
++#define DMA_CI_EOP BIT(1)
++#define DMA_CI_DUR BIT(2)
++#define DMA_CI_DESCPT BIT(3)
++#define DMA_CI_CHOFF BIT(4)
++#define DMA_CI_RDERR BIT(5)
++#define DMA_CI_ALL (DMA_CI_EOP | DMA_CI_DUR | DMA_CI_DESCPT | \
++		    DMA_CI_CHOFF | DMA_CI_RDERR)
++
++#define DMA_CI_DEFAULT (DMA_CI_EOP | DMA_CI_DESCPT)
++
++#define DMA_CDPTNR 0x0034
++#define DMA_PS 0x0040
++#define DMA_PS_PS_S 0
++#define DMA_PS_PS 0xFu
++
++#define DMA_PCTRL 0x0044
++#define DMA_PCTRL_RXBL16 BIT(0)
++#define DMA_PCTRL_TXBL16 BIT(1)
++#define DMA_PCTRL_RXBL_S 2
++#define DMA_PCTRL_RXBL 0xCu
++#define DMA_PCTRL_TXBL_S 4
++#define DMA_PCTRL_TXBL 0x30u
++#define DMA_PCTRL_PDEN BIT(6)
++#define DMA_PCTRL_RXBL32 BIT(7)
++#define DMA_PCTRL_PDEN_S 6
++#define DMA_PCTRL_RXENDI 0x300u
++#define DMA_PCTRL_RXENDI_S 8
++#define DMA_PCTRL_TXENDI 0xC00u
++#define DMA_PCTRL_TXENDI_S 10
++#define DMA_PCTRL_TXWGT 0x7000u
++#define DMA_PCTRL_TXWGT_S 12
++#define DMA_PCTRL_TXBL32 BIT(15)
++#define DMA_PCTRL_MEM_FLUSH BIT(16)
++/*
++ * Bit 29 of the per-channel control word is DMA_DBG_P2D_RME in DMA_PCTRL
++ * (hdma.c:140), not a writable DMA_CTRL bit.
++ */
++#define DMA_DBG_P2D_CLS 0x1E0000u
++#define DMA_DBG_P2D_CLS_S 17
++#define DMA_DBG_P2D_ACK BIT(21)
++#define DMA_DBG_D2P_CLS 0x3C00000u
++#define DMA_DBG_D2P_CLS_S 22
++#define DMA_DBG_D2P_ACK BIT(26)
++#define DMA_DBG_P2D_REQ BIT(27)
++#define DMA_DBG_D2P_REQ BIT(28)
++#define DMA_DBG_P2D_RME BIT(29)
++#define DMA_DBG_D2P_XME BIT(30)
++#define DMA_DBG_P2D_JMB BIT(31)
++
++#define DMA_CPDCNT 0x0080
++
++#define DMA_IRNEN 0x00F4
++#define DMA_IRNCR 0x00F8
++#define DMA_IRNICR 0x00FC
++#define DMA_IRNEN1 0x00E8
++#define DMA_IRNCR1 0x00EC
++#define DMA_IRNICR1 0x00F0
++
++/* DMA V3.0 new registers — AVM hdma.c:154-209 verbatim. */
++#define DMA_C_DP_TICK 0x100
++
++#define DMA_C_DP_TICK_TIKNARB_S 0
++#define DMA_C_DP_TICK_TIKNARB 0xFFFFu
++#define DMA_C_DP_TICK_TIKARB_S 16
++#define DMA_C_DP_TICK_TIKARB 0xFFFF0000u
++
++#define DMA_C_HDRM 0x110
++
++#define DMA_C_HDRM_HDR_LEN_S 0
++#define DMA_C_HDRM_HDR_LEN 0xFFu
++#define DMA_C_HDRM_EN BIT(31)
++
++#define DMA_C_BOFF 0x120
++
++#define DMA_C_BOFF_BOF_LEN_S 0
++#define DMA_C_BOFF_BOF_LEN 0xFFu
++#define DMA_C_BOFF_EN BIT(31)
++
++#define DMA_C_INTCO 0x140
++#define DMA_C_INTCO_COAL_LEN_S 0
++#define DMA_C_INTCO_COAL_LEN 0xFFu
++#define DMA_C_INTCO_TO_LEN 0xFF00u
++#define DMA_C_INTCO_TO_LEN_S 8
++#define DMA_C_INTCO_EN BIT(31)
++#define DMA_C_INTCO_TO_EN BIT(30)
++#define DMA_C_INTCO_TO_ST BIT(29)
++#define DMA_C_INTCO_TO 0x1FFF0000
++#define DMA_C_INTCO_TO_S 16
++
++#define DMA_C_INTCO_PEND 0x0000FF00
++#define DMA_C_INTCO_PEND_S 8
++
++#define DMA_C_SWPOLL 0x150
++#define DMA_C_SWPOLL_MUX BIT(30)
++#define DMA_C_SWPOLL_EN BIT(31)
++
++#define DMA_ORRC 0x190
++#define DMA_ORRC_ORRCNT_S 4
++
++#define DMA_ORRC_ORRCNT 0x1F0u
++#define DMA_ORRC_EN BIT(31)
++
++#define DMA_LOG_CH 0x194
++#define DMA_LOG_CH_NR_S 0
++#define DMA_LOG_CH_NR 0x3Fu
++
++#define DMA_C_ENDIAN 0x200
++
++#define DMA_C_END_DATAENDI_S 0
++#define DMA_C_END_DATAENDI 0x3u
++#define DMA_C_END_DE_EN BIT(7)
++
++#define DMA_C_END_DESENDI_S 8
++#define DMA_C_END_DESENDI 0x300u
++#define DMA_C_END_DES_EN BIT(16)
++
++#endif /* __XRX500_HDMA_REGS_H */
+diff --git a/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h b/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h
+new file mode 100644
+index 000000000000..7f98e0d2b809
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/dma/lantiq_dmax.h
+@@ -0,0 +1,317 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copyright (C) 2014 ~ 2015 Lei Chuanhua <chuanhua.lei@lantiq.com>
++ * Copyright (C) 2016 ~ 2017 Intel Corporation.
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * include/linux/dma/lantiq_dmax.h.
++ *
++ * DMA controller, port and channel encoding shared with the CBM and netdev
++ * translation units.
++ */
++#ifndef LANTIQ_DMAX_H
++#define LANTIQ_DMAX_H
++#include <linux/types.h>
++#include <linux/interrupt.h>
++
++/*
++ * DMA controller, port and channel encoding: 32 bits total as the
++ * following layout:
++ *  controller | port  | channel number
++ *  31.......24|23...16|15...........0
++ *
++ * AVM lantiq_dmax.h:54-105 — verbatim. Silicon-honoured encoding;
++ * never re-bias the shifts or widths or callers' channel handles break.
++ */
++#define _DMA_CHANBITS 16
++#define _DMA_PORTBITS 8
++#define _DMA_CTRLBITS 8
++
++#define _DMA_CHANMASK ((1 << _DMA_CHANBITS) - 1)
++#define _DMA_PORTMASK ((1 << _DMA_PORTBITS) - 1)
++#define _DMA_CTRLMASK ((1 << _DMA_CTRLBITS) - 1)
++
++#define _DMA_CHANSHIFT 0
++#define _DMA_PORTSHIFT (_DMA_CHANSHIFT + _DMA_CHANBITS)
++#define _DMA_CTRLSHIFT (_DMA_PORTSHIFT + _DMA_PORTBITS)
++
++#define _DMA_C(controller, port, channel)	\
++	(((controller) << _DMA_CTRLSHIFT) |	\
++	 ((port) << _DMA_PORTSHIFT) |		\
++	 ((channel) << _DMA_CHANSHIFT))
++
++#define _DMA_CONTROLLER(nr) (((nr) >> _DMA_CTRLSHIFT) & _DMA_CTRLMASK)
++#define _DMA_PORT(nr) (((nr) >> _DMA_PORTSHIFT) & _DMA_PORTMASK)
++#define _DMA_CHANNEL(nr) (((nr) >> _DMA_CHANSHIFT) & _DMA_CHANMASK)
++
++#define MAX_DMA_CHAN_PER_PORT 64
++#define MAX_DMA_PORT_PER_CTRL 4
++
++/*
++ * enum dma_controller — keeps the full 7-entry numbering verbatim from AVM
++ * lantiq_dmax.h:82-91 because the cid value is silicon-encoded (top 8 bits of
++ * the _DMA_C() handle) and dma_name[] (hdma.c) indexes by cid.
++ */
++enum dma_controller {
++	DMA0 = 0,
++	DMA1TX,
++	DMA1RX,
++	DMA2TX,
++	DMA2RX,
++	DMA3,
++	DMA4,
++	DMAMAX,
++};
++
++enum dma_ctrl_port {
++	DMA1TX_PORT = 0,
++	DMA1RX_PORT = 0,
++	DMA2TX_PORT = 0,
++	DMA2RX_PORT = 0,
++};
++
++enum dma_endian {
++	DMA_ENDIAN_TYPE0 = 0,
++	DMA_ENDIAN_TYPE1,
++	DMA_ENDIAN_TYPE2,
++	DMA_ENDIAN_TYPE3,
++	DMA_ENDIAN_MAX,
++};
++
++enum dma_burst {
++	DMA_BURSTL_2DW = 1,
++	DMA_BURSTL_4DW = 2,
++	DMA_BURSTL_8DW = 3,
++	DMA_BURSTL_16DW = 16,
++	DMA_BURSTL_32DW = 32,
++};
++
++enum dma_pkt_drop {
++	DMA_PKT_DROP_DISABLE = 0,
++	DMA_PKT_DROP_ENABLE,
++};
++
++enum dma_channel {
++	DMA_CHANNEL_0 = 0,
++	DMA_CHANNEL_1,
++	DMA_CHANNEL_2,
++	DMA_CHANNEL_3,
++	DMA_CHANNEL_4,
++	DMA_CHANNEL_5,
++	DMA_CHANNEL_6,
++	DMA_CHANNEL_7,
++	DMA_CHANNEL_8,
++	DMA_CHANNEL_9,
++	DMA_CHANNEL_10,
++	DMA_CHANNEL_11,
++	DMA_CHANNEL_12,
++	DMA_CHANNEL_13,
++	DMA_CHANNEL_14,
++	DMA_CHANNEL_15,
++	DMA_CHANNEL_16,
++	DMA_CHANNEL_17,
++	DMA_CHANNEL_18,
++	DMA_CHANNEL_19,
++	DMA_CHANNEL_20,
++	DMA_CHANNEL_21,
++	DMA_CHANNEL_22,
++	DMA_CHANNEL_23,
++	DMA_CHANNEL_24,
++	DMA_CHANNEL_25,
++	DMA_CHANNEL_26,
++	DMA_CHANNEL_27,
++	DMA_CHANNEL_28,
++	DMA_CHANNEL_29,
++	DMA_CHANNEL_30,
++	DMA_CHANNEL_31,
++	DMA_CHANNEL_32,
++	DMA_CHANNEL_33,
++	DMA_CHANNEL_34,
++	DMA_CHANNEL_35,
++	DMA_CHANNEL_36,
++	DMA_CHANNEL_37,
++	DMA_CHANNEL_38,
++	DMA_CHANNEL_39,
++	DMA_CHANNEL_40,
++	DMA_CHANNEL_41,
++	DMA_CHANNEL_42,
++	DMA_CHANNEL_43,
++	DMA_CHANNEL_44,
++	DMA_CHANNEL_45,
++	DMA_CHANNEL_46,
++	DMA_CHANNEL_47,
++	DMA_CHANNEL_48,
++	DMA_CHANNEL_49,
++	DMA_CHANNEL_50,
++	DMA_CHANNEL_51,
++	DMA_CHANNEL_52,
++	DMA_CHANNEL_53,
++	DMA_CHANNEL_54,
++	DMA_CHANNEL_55,
++	DMA_CHANNEL_56,
++	DMA_CHANNEL_57,
++	DMA_CHANNEL_58,
++	DMA_CHANNEL_59,
++	DMA_CHANNEL_60,
++	DMA_CHANNEL_61,
++	DMA_CHANNEL_62,
++	DMA_CHANNEL_63,
++};
++
++/*
++ * Per-controller channel handles — verbatim from AVM lantiq_dmax.h: lines
++ * 240-262 (DMA1TX), 265-292 (DMA1RX), 295-310 (DMA2TX), 313-326 (DMA2RX).
++ */
++
++#ifndef SINGLE_RX_CH0_ONLY
++#define SINGLE_RX_CH0_ONLY 1
++#endif
++
++/* DMA1TX */
++#define DMA1TX_LAN_SWITCH_CLASS0	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_0)
++
++#define DMA1TX_LAN_SWITCH_CLASS1	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_1)
++#define DMA1TX_LAN_SWITCH_CLASS2	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_2)
++#define DMA1TX_LAN_SWITCH_CLASS3	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_3)
++
++#define DMA1TX_CHAN4_RESERV _DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_4)
++#define DMA1TX_LOOP_FCS_REGEN _DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_5)
++#define DMA1TX_CHAN6_RESERV _DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_6)
++
++#define DMA1TX_EXT_WLAN_PCIE_CLASS7	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_7)
++#define DMA1TX_INTERNAL_WLAN_CLASS8	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_8)
++
++#define DMA1TX_USB_LAN_CLASS9 _DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_9)
++#define DMA1TX_USB_LAN_CLASS10 _DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_10)
++#define DMA1TX_CHAN11_RESERV _DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_11)
++#define DMA1TX_USB_WAN_CLASS12 _DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_12)
++
++#define DMA1TX_DSL_WAN_CBMP18_CLASS13	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_13)
++#define DMA1TX_DMA1RX_CH14_CLASS14	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_14)
++#define DMA1TX_GSWIP_R_WAN_CBMP19_CLASS15	\
++	_DMA_C(DMA1TX, DMA1TX_PORT, DMA_CHANNEL_15)
++
++/* DMA1RX */
++#define DMA1RX_TMU_CLASS0 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_0)
++#define DMA1RX_TMU_CLASS1 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_1)
++/*
++ * EQM port 8 std-buf RX-admit channel on A21 silicon (FRITZ!Box 7560). The
++ * cbm_config.c row encodes the un-remapped std channel 15, but AVM sets
++ * cbm_rev=2 unconditionally (cbm.c:5597) before configure_ports(), which
++ * activates the A21 std-channel remap in conf_eqm_dma_port (cbm.c:5297-5302):
++ * for dma_ctrl==1 (DMA1RX), `dma_chnl = (dma_chnl == 0) ? 0 : 5`. So std
++ * channel 15 is rewritten to 5 — AVM arms DMA1RX channel 5 for EQM port 8,
++ * not 15. Use this post-remap handle, NOT DMA1RX_CBM_P8_CLASS15.
++ */
++#define DMA1RX_CBM_P8_CLASS5 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_5)
++#define DMA1RX_CBM_P10_CLASS9 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_9)
++#define DMA1RX_CBM_P11_CLASS10 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_10)
++#define DMA1RX_CBM_P12_CLASS11 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_11)
++#define DMA1RX_CBM_P13_CLASS12 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_12)
++#define DMA1RX_CBM_P14_CLASS13 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_13)
++#define DMA1RX_DMA1TX_CH14_CLASS14	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_14)
++#define DMA1RX_CBM_P8_CLASS15 _DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_15)
++#define DMA1RX_CBM_P8_CLASS16_JUMBO	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_16)
++#define DMA1RX_CBM_P10_CLASS25_JUMBO	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_25)
++#define DMA1RX_CBM_P11_CLASS26_JUMBO	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_26)
++#define DMA1RX_CBM_P12_CLASS27_JUMBO	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_27)
++#define DMA1RX_CBM_P13_CLASS28_JUMBO	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_28)
++#define DMA1RX_CBM_P14_CLASS29_JUMBO	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_29)
++#define DMA1RX_CBM_P7_CLASS6_JUMBO	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_6)
++#define DMA1RX_CBM_P8_CLASS11_JUMBO	\
++	_DMA_C(DMA1RX, DMA1RX_PORT, DMA_CHANNEL_11)
++
++/* DMA2TX */
++#define DMA2TX_CBM_P6_CLASS0 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_0)
++#define DMA2TX_CBM_P6_CLASS1 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_1)
++#define DMA2TX_CBM_P7_CLASS2 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_2)
++#define DMA2TX_CBM_P8_CLASS3 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_3)
++#define DMA2TX_CBM_P9_CLASS4 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_4)
++#define DMA2TX_CBM_P10_CLASS5 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_5)
++#define DMA2TX_CBM_P11_CLASS6 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_6)
++#define DMA2TX_CBM_P12_CLASS9 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_9)
++#define DMA2TX_CBM_P13_CLASS10 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_10)
++#define DMA2TX_CBM_P14_CLASS11 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_11)
++#define DMA2TX_CBM_P15_CLASS12 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_12)
++#define DMA2TX_CBM_P16_CLASS13 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_13)
++#define DMA2TX_CBM_P17_CLASS14 _DMA_C(DMA2TX, DMA2TX_PORT, DMA_CHANNEL_14)
++
++/* DMA2RX */
++#define DMA2RX_GSWIP_R_CLASS0 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_0)
++#define DMA2RX_GSWIP_R_CLASS1 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_1)
++#define DMA2RX_GSWIP_R_CLASS2 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_2)
++#define DMA2RX_GSWIP_R_CLASS3 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_3)
++
++#define DMA2RX_GSWIP_R_CLASS4 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_4)
++#define DMA2RX_GSWIP_R_CLASS5 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_5)
++#define DMA2RX_GSWIP_R_CLASS6 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_6)
++
++#define DMA2RX_CBMP5_CLASS14 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_14)
++#define DMA2RX_CBMP6_CLASS15 _DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_15)
++#define DMA2RX_CBMP5_CLASS30_JUMBO	\
++	_DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_30)
++#define DMA2RX_CBMP6_CLASS31_JUMBO	\
++	_DMA_C(DMA2RX, DMA2RX_PORT, DMA_CHANNEL_31)
++
++enum dma_pseudo_irq {
++	RCV_INT = 1,
++	TX_BUF_FULL_INT = 2,
++	TRANSMIT_CPT_INT = 4,
++};
++
++/*
++ * Buffer / IRQ callback typedefs — verbatim from AVM lantiq_dmax.h.
++ */
++typedef char *(*buffer_alloc_t)(int len, int *byte_offset, void **opt);
++typedef int (*buffer_free_t)(char *dataptr, void *opt);
++typedef int (*intr_handler_t)(u32 lnr, void *priv, int flags);
++
++int ltq_request_dma(u32 chan, const char *device_id);
++int ltq_free_dma(u32 chan);
++int ltq_dma_chan_on(u32 chan);
++int ltq_dma_chan_off(u32 chan);
++int ltq_dma_chan_open(u32 chan);
++int ltq_dma_chan_close(u32 chan);
++int ltq_dma_chan_reset(u32 chan);
++int ltq_dma_chan_desc_alloc(u32 chan, u32 desc_num);
++int ltq_dma_chan_desc_free(u32 chan);
++int ltq_dma_chan_irq_enable(u32 chan);
++int ltq_dma_chan_irq_disable(u32 chan);
++int ltq_dma_chan_pseudo_irq_handler_callback_cfg(u32 chan,
++						 intr_handler_t handler,
++						 void *priv);
++int ltq_dma_chan_desc_cfg(u32 chan, dma_addr_t desc_base, int desc_num);
++dma_addr_t ltq_dma_chan_get_curr_desc_addr(u32 chan);
++
++/*
++ * Controller identity of the register window based at @base, or a negative
++ * error for an address that is not a controller of this family. The identity
++ * is encoded in the top byte of every channel handle, so a driver that holds
++ * only a phandle to a controller needs this to name a channel on it.
++ */
++int ltq_dma_ctrl_id_by_phys(phys_addr_t base);
++
++/*
++ * Opens the per-controller channel set CBM EQM port_id is wired to.
++ */
++int hdma_port_enable(int port_id);
++
++int hdma_ig192_toe_dma3_reset(void);
++
++#endif /* LANTIQ_DMAX_H */

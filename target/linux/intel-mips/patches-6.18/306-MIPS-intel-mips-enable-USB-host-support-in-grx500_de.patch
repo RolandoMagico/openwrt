@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 22:23:37 +0200
+Subject: MIPS: intel-mips: enable USB host support in grx500_defconfig
+
+The whole USB menu was off. Turn on the host stack the FRITZ!Box 7560's
+port needs: the dwc3 core in host mode, xhci-plat underneath it, the
+generic PHY framework and the new GRX500 USB PHY, and the Lantiq reset
+controller the PHY's reset line comes from.
+
+RESET_LANTIQ has no prompt outside COMPILE_TEST and defaults to
+SOC_TYPE_XWAY, which INTEL_MIPS does not select, so it is reachable only
+by selection. PHY_INTEL_GRX500_USB now selects it in its own right;
+stating it here as well keeps the dependency visible to anyone reading
+the defconfig.
+
+REGULATOR and REGULATOR_FIXED_VOLTAGE are both required, and neither is
+reachable by select: VBUS on this board is a regulator-fixed on a GPIO,
+and a driver that consumes a supply only calls the consumer API. Left
+off, they fail in two different ways, which is worth stating separately
+because the symptoms share no diagnostic:
+
+ - REGULATOR=n replaces the consumer API with stubs.
+   devm_regulator_get_optional() then answers -ENODEV unconditionally,
+   which is indistinguishable from a board that declares no
+   vbus-supply at all, so the PHY takes its "port power is fixed"
+   branch; regulator_enable() returns 0 without touching the line.
+   The PHY probes clean, the controller starts, and the port is dead
+   with nothing logged above dev_dbg. This is the dangerous one: it
+   looks exactly like a VBUS wiring fault.
+
+ - REGULATOR=y with REGULATOR_FIXED_VOLTAGE=n leaves the vbus-supply
+   node in DT with no driver to register a provider for it.
+   of_regulator_dev_lookup() finds the node, finds no regulator_dev
+   and returns -EPROBE_DEFER (drivers/regulator/of_regulator.c), and
+   _regulator_get_common() passes any error other than -ENODEV through
+   unchanged, so the PHY defers forever instead. Visibly stuck, not
+   silent.
+
+Nothing in the polarity handling depends on this choice. The gpiolib-of
+quirk that makes enable-active-high, rather than the phandle's flag
+cell, define the line's polarity for regulator-fixed nodes is compiled
+out along with REGULATOR_FIXED_VOLTAGE, but it only ever runs on the
+path where the symbol is on -- it is a statement about what the DT
+means, not a third reason to enable it. The board DTS states both
+consistently regardless.
+
+USB_XHCI_PLATFORM and GENERIC_PHY are implied by USB_DWC3 and
+PHY_INTEL_GRX500_USB respectively and are stated anyway, as
+CONFIG_PHY_INTEL_GRX500_PCIE's neighbours already are, because a
+defconfig that names what it depends on survives being read.
+
+No mass-storage stack. SCSI, BLK_DEV_SD, USB_STORAGE, the NLS
+codepages and VFAT/EXT4 are all absent, deliberately: what a router
+image mounts off a stick is a packaging decision, and OpenWrt makes it
+with modules. The kernel-side milestone is enumeration.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index 98f812230054..6f35d44c323b 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -96,9 +96,16 @@ CONFIG_PINCTRL_EQUILIBRIUM=y
+ CONFIG_POWER_RESET=y
+ CONFIG_POWER_RESET_SYSCON=y
+ # CONFIG_HWMON is not set
++CONFIG_REGULATOR=y
++CONFIG_REGULATOR_FIXED_VOLTAGE=y
+ # CONFIG_VGA_CONSOLE is not set
+ # CONFIG_HID is not set
+-# CONFIG_USB_SUPPORT is not set
++CONFIG_USB_SUPPORT=y
++CONFIG_USB=y
++CONFIG_USB_XHCI_HCD=y
++CONFIG_USB_XHCI_PLATFORM=y
++CONFIG_USB_DWC3=y
++CONFIG_USB_DWC3_HOST=y
+ CONFIG_NEW_LEDS=y
+ CONFIG_LEDS_CLASS=y
+ CONFIG_LEDS_GPIO=y
+@@ -110,7 +117,11 @@ CONFIG_LEDS_TRIGGER_NETDEV=y
+ # CONFIG_MIPS_PLATFORM_DEVICES is not set
+ CONFIG_INTEL_CGU_CLK=y
+ # CONFIG_IOMMU_SUPPORT is not set
++CONFIG_GENERIC_PHY=y
+ CONFIG_PHY_INTEL_GRX500_PCIE=y
++CONFIG_PHY_INTEL_GRX500_USB=y
++CONFIG_RESET_CONTROLLER=y
++CONFIG_RESET_LANTIQ=y
+ # CONFIG_MANDATORY_FILE_LOCKING is not set
+ CONFIG_QUOTA=y
+ # CONFIG_PRINT_QUOTA_WARNING is not set

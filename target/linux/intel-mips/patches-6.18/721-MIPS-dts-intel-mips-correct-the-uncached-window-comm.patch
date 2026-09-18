@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 06:05:28 +0200
+Subject: MIPS: dts: intel-mips: correct the uncached-window comments
+
+Two comment blocks in this board file state the old, wrong bound on the
+uncached alias as measured fact: the memory node's list of limits that
+survive the 512 MiB width, and the WARNING on the reserved regions.
+
+Both said the alias ends at PHYS_OFFSET + 0x12310000. It ends at
+PHYS_OFFSET + SZ_256M. That address is the CPC -- the first populated
+block in the register space rather than the start of it -- and bounding
+at it admitted 35 MiB of physical addresses whose alias faults on the
+unpopulated holes and reaches live registers elsewhere. The comments now
+describe the window itself: VA 0xA0000000-0xBFFFFFFF is mapped uncached
+onto physical 0x20000000-0x3FFFFFFF, of which only the lower half is
+DRAM.
+
+The rule both blocks exist to state is unchanged and still holds. Every
+region reserved here and in seale_avm.dtsi is below 0x30000000 -- though
+only just, since the bootcore window ends exactly there, which the
+WARNING now says so that nobody grows one of them upwards.
+
+What the comment does not claim is how ordinary allocations are kept
+inside the window, because at this commit nothing does. It names the
+memory node's width as the lever, which the next commit pulls.
+
+The alternative -- sizing ZONE_DMA to the window and having dma-direct
+allocate coherent memory from it -- is parked rather than taken. It
+moved ordinary GFP_KERNEL allocations above 0x30000000 and exposed a
+latent linear-alias defect in module function pointers, which blocked
+boot; and it silently changed the FRITZ!Box 7560's zone layout, turning
+that board's entire memory into ZONE_DMA, which is an unvalidated change
+to the one board this platform is proven on.
+
+A third statement in the same block had gone stale earlier and is
+corrected with them: the shm RNG seed at 0x3dfb0000 is described as
+being out of range of the memory node, which stopped being true when the
+node widened to 512 MiB. It is inside the node and above the bound; what
+makes it safe is that it is no-map and nothing here maps it.
+
+Comments only. The built DTB is byte-for-byte identical.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index ce4799246b02..69588093bfe1 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -52,13 +52,23 @@ avm-hw-revision {
+ 	 *
+ 	 * Two bounds that did NOT move and still apply at 512 MiB:
+ 	 *
+-	 * The uncached KSEG1 alias of DRAM ends at PHYS_OFFSET + 0x12310000 =
+-	 * 0x32310000 (~291 MiB), measured. Cached RAM is fine across the
+-	 * whole node -- under EVA's SegCtl, KSEG0 maps 0x80000000 to
+-	 * 0x20000000 and covers all 512 MiB -- but general
+-	 * dma_alloc_coherent() consumers must stay below 0x32310000. hdma is
+-	 * already re-bound to that aperture; a new uncached consumer is what
+-	 * would break here first, not the node width. The CBM pools at
++	 * The uncached alias of DRAM covers the first 256 MiB only, and stops
++	 * at PHYS_OFFSET + SZ_256M = 0x30000000. The SegCtl maps kernel VA
++	 * 0xA0000000-0xBFFFFFFF uncached onto physical 0x20000000-0x3FFFFFFF,
++	 * and only the lower half of that is DRAM; the upper half is the
++	 * SoC's register space. Cached RAM is fine across the whole node --
++	 * KSEG0 maps 0x80000000 to 0x20000000 and covers all 512 MiB -- but
++	 * anything taking an uncached alias must stay below 0x30000000. hdma,
++	 * which aliases addresses by hand, carries the same bound itself; for
++	 * every other consumer it is the width of this memory node that has
++	 * to keep allocations inside the window, since an ordinary GFP_KERNEL
++	 * page can otherwise come from anywhere in it.
++	 *
++	 * An earlier revision of this comment put the line at PHYS_OFFSET +
++	 * 0x12310000. That address is the CPC -- the first *populated* block
++	 * in the register space rather than the start of it -- and bounding
++	 * at it admitted 35 MiB whose alias faults on the unpopulated holes
++	 * and lands in live registers elsewhere. The CBM pools at
+ 	 * 0x23800000..0x25200000 that seale_avm.dtsi reserves cannot move,
+ 	 * only be extended past.
+ 	 */

@@ -1,0 +1,638 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 20:31:35 +0200
+Subject: net: lantiq: xrx500-cbm: let the tagging driver own the switch header
+
+The conduit built the eight-byte switch header itself and sent every
+frame out one port fixed at probe. With the switch ports being network
+devices of their own, the tagging driver writes that header and records
+the port it chose in the socket buffer, so the conduit's job on transmit
+is to copy the frame exactly as it was handed over and to send it
+through the egress resources of the port named for it.
+
+Those resources are separate per port - a dequeue port, a
+traffic-management queue and a DMA channel each - so the conduit is
+allocated one transmit queue per port it serves and decodes the port out
+of the queue mapping. The queue is load bearing rather than decorative:
+the core skips the selection callback entirely on a device with a single
+transmit queue and then overwrites the mapping with zero, which would
+send every frame out the first port with no error anywhere. Queue zero
+is reserved for a frame that names no port, which is any frame from the
+local stack; such a frame has no switch header in front of it, the
+switch would read its first eight bytes as one, and there is nothing
+sensible to do with it but count it and drop it.
+
+Back pressure now stops and releases every queue rather than the first,
+which on a multi-queue device is not the same thing.
+
+On receive the header stays in front of the frame. The helper that
+classifies an Ethernet frame consumes the header together with the first
+six bytes behind it, which is exactly the offset the tagging driver
+expects to find the header at, and on a device serving a switch the same
+helper answers with the protocol that routes the frame there. The source
+port is still decoded, but only to be counted.
+
+The conduit's maximum transmission unit grows by the header, because the
+switch layer sizes the conduit from a port's own ceiling plus the
+tagging overhead and refuses to bring a port up if the conduit cannot
+carry it.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500-cbm.c b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+index 37748c457d52..9743b2edcf9c 100644
+--- a/drivers/net/ethernet/lantiq/xrx500-cbm.c
++++ b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+@@ -79,11 +79,13 @@
+ #define XRX500_CBM_JBO_SEG_SIZE		8192U
+ 
+ /*
+- * The switch enforces a 1500 byte payload ceiling on this core; raising the
+- * MAC frame-length limit does not move it. The conduit advertises the
+- * enforced value rather than what the segment arithmetic would allow.
++ * The switch enforces a 1500 byte payload ceiling on a front-panel port;
++ * raising the MAC frame-length limit does not move it. The conduit carries
++ * that plus the switch header the tagging driver prepends, which is what the
++ * switch layer sets its own ceiling from. Neither is what the segment
++ * arithmetic would allow.
+  */
+-#define XRX500_CBM_MAX_MTU		ETH_DATA_LEN
++#define XRX500_CBM_MAX_MTU		(ETH_DATA_LEN + PMAC_TX_HDR_LEN)
+ 
+ /* Buffer-manager register windows */
+ 
+@@ -356,6 +358,16 @@ static const struct xrx500_cbm_egress xrx500_cbm_egress_wan[] = {
+ 	{ .dp_port = 15, .deq_port = 19, .tmu_qid = 28, .dma_chan = 15 },
+ };
+ 
++/*
++ * Transmit queue zero carries no port. A frame reaches this device either
++ * from the tagging driver, which records the port it is for in the socket
++ * buffer, or from the local stack, which does not and whose frame therefore
++ * has no switch header in front of it. The first case selects one of the
++ * queues above zero, one per port; the second stays on queue zero, which has
++ * nowhere to send it.
++ */
++#define XRX500_CBM_TXQ_NONE		0
++
+ /**
+  * struct xrx500_cbm_macro - what one switch macro's conduit serves.
+  * @eg:  egress rows, one per front-panel port of the macro.
+@@ -376,18 +388,18 @@ static const struct xrx500_cbm_macro xrx500_cbm_macros[] = {
+ /* Wire format */
+ 
+ /*
+- * Eight-byte switch header prepended to a transmitted frame.
+- *
+- * Byte 3 carries, from its most significant bit down: the egress-port-map
+- * enable, one reserved bit, the timestamp disable, and the class enable. So
+- * the two bits this driver sets are bit 7 and bit 4. Byte 4 bit 6 redirects to
+- * the second switch instance, which no port served here needs. Bytes 6 and 7
+- * hold the sixteen-bit egress-port map: byte 7 covers ports up to seven and
+- * byte 6 the ports above them.
++ * Eight-byte switch header prepended to a transmitted frame. The tagging
++ * driver writes it; the conduit needs only its length, to size the segment
++ * and the minimum frame, and to know that the frame it is handed already
++ * carries it.
+  */
+ #define PMAC_TX_HDR_LEN			8
+-#define PMAC_TX_B3_PORT_MAP_EN		BIT(7)
+-#define PMAC_TX_B3_CLASS_EN		BIT(4)
++
++/*
++ * The switch discards a frame whose Ethernet part is below the minimum
++ * length, and the header does not count towards it.
++ */
++#define XRX500_CBM_MIN_FRAME		(ETH_ZLEN + PMAC_TX_HDR_LEN)
+ 
+ /*
+  * Enqueue descriptor word order in the CPU ingress-port window:
+@@ -511,6 +523,8 @@ struct xrx500_cbm_pool {
+  * @stops:      times the transmit queue was stopped for back pressure.
+  * @wakes:      times the restart poll released the queue.
+  * @polls:      restart-poll invocations.
++ * @noport:     frames offered without a port, which is every frame that did
++ *              not come from a switch port's own network device.
+  *
+  * @pops minus @rollbacks is the number of segments handed to the hardware. On
+  * a healthy path that difference grows without bound while the manager's own
+@@ -525,6 +539,7 @@ struct xrx500_cbm_stats {
+ 	u64 stops;
+ 	u64 wakes;
+ 	u64 polls;
++	u64 noport;
+ };
+ 
+ /**
+@@ -607,7 +622,8 @@ struct xrx500_cbm_rx {
+  *               names for this conduit.
+  * @std:         standard segment pool.
+  * @jbo:         jumbo segment pool.
+- * @eg:          egress resources of the datapath port this conduit serves.
++ * @eg:          egress resources, one row per port this conduit serves.
++ * @eg_num:      rows in @eg.
+  * @restart:     back-pressure release poll.
+  * @stats:       transmit accounting.
+  * @force_empty: remaining synthetic pool-empty answers, for exercising the
+@@ -635,7 +651,8 @@ struct xrx500_cbm {
+ 	struct xrx500_cbm_pool std;
+ 	struct xrx500_cbm_pool jbo;
+ 
+-	struct xrx500_cbm_egress eg;
++	const struct xrx500_cbm_egress *eg;
++	unsigned int eg_num;
+ 
+ 	struct timer_list restart;
+ 
+@@ -967,16 +984,18 @@ static int tmu_config_cmd(struct xrx500_cbm *priv, u32 cmd)
+ /**
+  * xrx500_cbm_tmu_egress_path() - build the egress path of one dequeue port.
+  * @priv: driver state.
++ * @eg:   egress resources of the port.
+  *
+  * One scheduler block, one queue, no shaper and no weight. That is the only
+  * topology this datapath needs. The egress-port number equals the dequeue
+  * port number and the scheduler block id is the queue id less the reserved
+  * base.
+  */
+-static int xrx500_cbm_tmu_egress_path(struct xrx500_cbm *priv)
++static int xrx500_cbm_tmu_egress_path(struct xrx500_cbm *priv,
++				      const struct xrx500_cbm_egress *eg)
+ {
+-	u32 epn = priv->eg.deq_port;
+-	u32 qid = priv->eg.tmu_qid;
++	u32 epn = eg->deq_port;
++	u32 qid = eg->tmu_qid;
+ 	u32 sbid = qid - TMU_SBID_BASE;
+ 	u32 sbin = sbid << TMU_SBIN_SHIFT;
+ 	int ret;
+@@ -1293,9 +1312,10 @@ static void xrx500_cbm_dqm_cpu_port(struct xrx500_cbm *priv, u32 pid)
+ }
+ 
+ /**
+- * xrx500_cbm_dqm_dma_port() - bring up the DMA egress port that drains this
+- *                             conduit's datapath port.
+- * @priv:      driver state.
++ * xrx500_cbm_dqm_dma_port() - bring up the DMA egress port that drains one of
++ *                             this conduit's datapath ports.
++ * @priv:       driver state.
++ * @eg:         egress resources of the port.
+  * @clear_desc: also clear the port's two staging descriptors.
+  *
+  * The port is configured with the dequeue request and per-port counting
+@@ -1307,9 +1327,11 @@ static void xrx500_cbm_dqm_cpu_port(struct xrx500_cbm *priv, u32 pid)
+  * window while the channel is live wedges the bus. They are therefore cleared
+  * only when this driver owns the channel and has turned it off first.
+  */
+-static void xrx500_cbm_dqm_dma_port(struct xrx500_cbm *priv, bool clear_desc)
++static void xrx500_cbm_dqm_dma_port(struct xrx500_cbm *priv,
++				    const struct xrx500_cbm_egress *eg,
++				    bool clear_desc)
+ {
+-	u32 deq = priv->eg.deq_port;
++	u32 deq = eg->deq_port;
+ 	u32 cfg;
+ 	int i;
+ 
+@@ -1406,55 +1428,58 @@ static void xrx500_cbm_managers_enable(struct xrx500_cbm *priv)
+  * A transmit channel bound to that port must be given this address and a
+  * length of two; it cannot be given a ring in DRAM.
+  */
+-static phys_addr_t xrx500_cbm_deq_desc_pa(struct xrx500_cbm *priv)
++static phys_addr_t xrx500_cbm_deq_desc_pa(struct xrx500_cbm *priv,
++					  const struct xrx500_cbm_egress *eg)
+ {
+ 	return priv->dma_desc_pa + CBM_DESC_EGP_5 +
+-	       (phys_addr_t)(priv->eg.deq_port - 5) * CBM_DESC_PORT_STRIDE;
++	       (phys_addr_t)(eg->deq_port - 5) * CBM_DESC_PORT_STRIDE;
+ }
+ 
+ /**
+  * xrx500_cbm_dma_chan_check() - compare the channel against this driver's own
+  *                               resource table.
+  * @priv: driver state.
++ * @eg:   egress resources of the port the channel drains.
+  *
+  * Reading the controller's own registers is safe at any time. Reading the
+  * descriptor-staging window while the channel is live is not, and nothing
+  * here does it.
+  */
+-static void xrx500_cbm_dma_chan_check(struct xrx500_cbm *priv)
++static void xrx500_cbm_dma_chan_check(struct xrx500_cbm *priv,
++				      const struct xrx500_cbm_egress *eg)
+ {
+-	phys_addr_t want = xrx500_cbm_deq_desc_pa(priv);
++	phys_addr_t want = xrx500_cbm_deq_desc_pa(priv, eg);
+ 	u32 cctrl, cdba, cdlen;
+ 
+-	cbm_w32(priv->dma, DMA_CS, priv->eg.dma_chan);
++	cbm_w32(priv->dma, DMA_CS, eg->dma_chan);
+ 	cctrl = cbm_r32(priv->dma, DMA_CCTRL);
+ 	cdba = cbm_r32(priv->dma, DMA_CDBA);
+ 	cdlen = cbm_r32(priv->dma, DMA_CDLEN);
+ 
+ 	dev_info(priv->dev,
+ 		 "channel %u: control 0x%08x base 0x%08x length %u\n",
+-		 priv->eg.dma_chan, cctrl, cdba, cdlen);
++		 eg->dma_chan, cctrl, cdba, cdlen);
+ 
+ 	if (cdba != (u32)want)
+ 		dev_warn(priv->dev,
+ 			 "channel %u descriptor base 0x%08x, expected 0x%08x\n",
+-			 priv->eg.dma_chan, cdba, (u32)want);
++			 eg->dma_chan, cdba, (u32)want);
+ 	if (cdlen != CBM_DESC_PER_DMA_PORT)
+ 		dev_warn(priv->dev,
+ 			 "channel %u descriptor length %u, expected %u\n",
+-			 priv->eg.dma_chan, cdlen, CBM_DESC_PER_DMA_PORT);
++			 eg->dma_chan, cdlen, CBM_DESC_PER_DMA_PORT);
+ 	if (!(cctrl & DMA_CCTRL_ON))
+-		dev_warn(priv->dev, "channel %u is off\n",
+-			 priv->eg.dma_chan);
++		dev_warn(priv->dev, "channel %u is off\n", eg->dma_chan);
+ 	if (!(cctrl & DMA_CCTRL_DIR_TX))
+ 		dev_warn(priv->dev, "channel %u is not a transmit channel\n",
+-			 priv->eg.dma_chan);
++			 eg->dma_chan);
+ }
+ 
+ /**
+  * xrx500_cbm_dma_chan_setup() - point the channel at its dequeue port and
+  *                               switch it on.
+  * @priv: driver state.
++ * @eg:   egress resources of the port the channel drains.
+  *
+  * The channel class equals the channel number for these bindings; the field
+  * is split across two ranges of the control register. Interrupts are left
+@@ -1466,10 +1491,11 @@ static void xrx500_cbm_dma_chan_check(struct xrx500_cbm *priv)
+  */
+ #define XRX500_CBM_CHAN_OFF_TRIES	10000
+ 
+-static void xrx500_cbm_dma_chan_setup(struct xrx500_cbm *priv)
++static void xrx500_cbm_dma_chan_setup(struct xrx500_cbm *priv,
++				      const struct xrx500_cbm_egress *eg)
+ {
+-	u32 chan = priv->eg.dma_chan;
+-	phys_addr_t desc = xrx500_cbm_deq_desc_pa(priv);
++	u32 chan = eg->dma_chan;
++	phys_addr_t desc = xrx500_cbm_deq_desc_pa(priv, eg);
+ 	u32 cctrl;
+ 	int i;
+ 
+@@ -1494,7 +1520,7 @@ static void xrx500_cbm_dma_chan_setup(struct xrx500_cbm *priv)
+ 		return;
+ 	}
+ 
+-	xrx500_cbm_dqm_dma_port(priv, true);
++	xrx500_cbm_dqm_dma_port(priv, eg, true);
+ 
+ 	cbm_w32(priv->dma, DMA_CS, chan);
+ 	cbm_w32(priv->dma, DMA_CDBA, (u32)desc);
+@@ -1574,7 +1600,37 @@ static void xrx500_cbm_restart(struct timer_list *t)
+ 	}
+ 
+ 	priv->stats.wakes++;
+-	netif_wake_queue(priv->ndev);
++	netif_tx_wake_all_queues(priv->ndev);
++}
++
++/**
++ * xrx500_cbm_select_queue() - decode the port the tagging driver chose.
++ * @ndev:   the conduit.
++ * @skb:    frame to transmit.
++ * @sb_dev: unused.
++ *
++ * The tagging driver records the switch port in the socket buffer's queue
++ * mapping, and this turns that into the index of the row holding the port's
++ * dequeue port, traffic-management queue and DMA channel. A frame that names
++ * no port lands on the queue that has none.
++ *
++ * The core skips this callback altogether on a device with a single transmit
++ * queue and then overwrites the mapping with zero, which is why the conduit
++ * is allocated with one queue per port and one more.
++ */
++static u16 xrx500_cbm_select_queue(struct net_device *ndev,
++				   struct sk_buff *skb,
++				   struct net_device *sb_dev)
++{
++	struct xrx500_cbm *priv = netdev_priv(ndev);
++	u16 port = skb_get_queue_mapping(skb);
++	unsigned int i;
++
++	for (i = 0; i < priv->eg_num; i++)
++		if (priv->eg[i].dp_port == port)
++			return i + 1;
++
++	return XRX500_CBM_TXQ_NONE;
+ }
+ 
+ /**
+@@ -1582,6 +1638,11 @@ static void xrx500_cbm_restart(struct timer_list *t)
+  * @skb:  frame to transmit.
+  * @ndev: the conduit.
+  *
++ * The frame arrives with the switch header already in front of it and is
++ * copied into the segment exactly as handed over; which port it leaves by is
++ * in that header, and the egress resources it travels through come from the
++ * queue the frame was placed on.
++ *
+  * There is no transmit completion on this path. The frame is copied into a
+  * hardware-owned segment, one descriptor is written, and the socket buffer is
+  * released immediately: the driver never owns the frame past the enqueue and
+@@ -1595,7 +1656,7 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 				   struct net_device *ndev)
+ {
+ 	struct xrx500_cbm *priv = netdev_priv(ndev);
+-	u32 hdr_len = PMAC_TX_HDR_LEN;
++	const struct xrx500_cbm_egress *eg;
+ 	unsigned long flags;
+ 	u32 seg_pa = 0;
+ 	u32 data_pa;
+@@ -1603,6 +1664,7 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 	u32 dw1, dw3;
+ 	u32 desc;
+ 	u32 pid;
++	u16 queue;
+ 	u8 *buf;
+ 
+ 	/*
+@@ -1614,16 +1676,29 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 	BUILD_BUG_ON(XRX500_CBM_TX_OFFSET + PMAC_TX_HDR_LEN +
+ 		     VLAN_ETH_FRAME_LEN > XRX500_CBM_STD_SEG_SIZE);
+ 
++	/*
++	 * A frame from the local stack carries no switch header and names no
++	 * port, and the switch would read its first eight bytes as one. The
++	 * conduit is the processor's end of a switch datapath, not an
++	 * interface of its own, so there is nowhere to send it.
++	 */
++	queue = skb_get_queue_mapping(skb);
++	if (queue == XRX500_CBM_TXQ_NONE || queue > priv->eg_num) {
++		priv->stats.noport++;
++		goto drop;
++	}
++	eg = &priv->eg[queue - 1];
++
+ 	if (skb_linearize(skb))
+ 		goto drop;
+ 
+-	/* The switch discards frames below the minimum Ethernet length. */
+-	if (skb->len < ETH_ZLEN && skb_padto(skb, ETH_ZLEN))
++	if (skb->len < XRX500_CBM_MIN_FRAME &&
++	    skb_padto(skb, XRX500_CBM_MIN_FRAME))
+ 		goto drop_nofree;
+-	if (skb->len < ETH_ZLEN)
+-		skb_put(skb, ETH_ZLEN - skb->len);
++	if (skb->len < XRX500_CBM_MIN_FRAME)
++		skb_put(skb, XRX500_CBM_MIN_FRAME - skb->len);
+ 
+-	total = skb->len + hdr_len;
++	total = skb->len;
+ 	if (XRX500_CBM_TX_OFFSET + total > XRX500_CBM_STD_SEG_SIZE)
+ 		goto drop;
+ 
+@@ -1649,7 +1724,7 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 		 */
+ 		if (!seg_pa) {
+ 			priv->stats.stops++;
+-			netif_stop_queue(ndev);
++			netif_tx_stop_all_queues(ndev);
+ 			mod_timer(&priv->restart,
+ 				  jiffies + XRX500_CBM_RESTART_DELAY);
+ 			spin_unlock_irqrestore(&xrx500_cbm_tx_lock, flags);
+@@ -1659,20 +1734,7 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 		goto drop;
+ 	}
+ 
+-	/*
+-	 * Switch header: explicit egress-port map, class field enabled, source
+-	 * port zero for the CPU port, and the target port's bit in the map.
+-	 * Ports above seven live in the map's high byte.
+-	 */
+-	memset(buf + XRX500_CBM_TX_OFFSET, 0, hdr_len);
+-	buf[XRX500_CBM_TX_OFFSET + 3] = PMAC_TX_B3_PORT_MAP_EN |
+-					PMAC_TX_B3_CLASS_EN;
+-	if (priv->eg.dp_port <= 7)
+-		buf[XRX500_CBM_TX_OFFSET + 7] = 1U << priv->eg.dp_port;
+-	else
+-		buf[XRX500_CBM_TX_OFFSET + 6] = 1U << (priv->eg.dp_port - 8);
+-
+-	memcpy(buf + XRX500_CBM_TX_OFFSET + hdr_len, skb->data, skb->len);
++	memcpy(buf + XRX500_CBM_TX_OFFSET, skb->data, skb->len);
+ 
+ 	/*
+ 	 * The segment pool is a reserved region carried with no kernel page
+@@ -1683,7 +1745,7 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 
+ 	data_pa = seg_pa + XRX500_CBM_TX_OFFSET;
+ 
+-	dw1 = ((priv->eg.dp_port << CBM_TXD_DW1_EP_SHIFT) &
++	dw1 = ((eg->dp_port << CBM_TXD_DW1_EP_SHIFT) &
+ 	       CBM_TXD_DW1_EP_MASK) |
+ 	      (CBM_TXD_DW1_COLOR_GREEN << CBM_TXD_DW1_COLOR_SHIFT);
+ 	dw3 = CBM_TXD_DW3_SOP | CBM_TXD_DW3_EOP |
+@@ -1814,9 +1876,11 @@ static bool xrx500_cbm_rxd_sane(const struct xrx500_cbm_rx *rx, u32 ctl)
+  * architecture an unaligned network header is a fault rather than a slowdown,
+  * so the copy is what makes the alignment right.
+  *
+- * The source port arrives in the switch header, not in the descriptor, so the
+- * header is kept in the socket buffer until it is consumed here. A switch
+- * tagger takes that over once the ports are network devices of their own.
++ * The frame is handed up with the switch header still in front of it: the
++ * tagging driver reads the source port out of it and pulls it, and the helper
++ * that classifies an Ethernet frame consumes exactly the header plus the
++ * first six bytes behind it, which is the offset that driver expects to find
++ * it at. The source port is decoded here only to be counted.
+  */
+ static void xrx500_cbm_rx_one(struct xrx500_cbm *priv, unsigned int idx,
+ 			      const struct xrx500_cbm_rxd *d)
+@@ -1856,7 +1920,6 @@ static void xrx500_cbm_rx_one(struct xrx500_cbm *priv, unsigned int idx,
+ 	}
+ 
+ 	memcpy(skb_put(skb, len), frame, len);
+-	skb_pull(skb, PMAC_RX_HDR_LEN);
+ 	dev_sw_netstats_rx_add(ndev, len - PMAC_RX_HDR_LEN);
+ 
+ 	/*
+@@ -1865,7 +1928,9 @@ static void xrx500_cbm_rx_one(struct xrx500_cbm *priv, unsigned int idx,
+ 	 * header, but it does not store the protocol; a socket buffer that
+ 	 * reaches the stack without one matches no protocol handler and is
+ 	 * dropped there, which counts against the device rather than against
+-	 * anything this driver can see.
++	 * anything this driver can see. On a device serving a switch it
++	 * answers with the protocol that routes the frame to the tagging
++	 * driver instead of reading one out of the frame.
+ 	 */
+ 	skb->protocol = eth_type_trans(skb, ndev);
+ 	rx->stats.delivered++;
+@@ -2185,7 +2250,7 @@ static int xrx500_cbm_open(struct net_device *ndev)
+ 		napi_schedule(&priv->rx.napi);
+ 	}
+ 
+-	netif_start_queue(ndev);
++	netif_tx_start_all_queues(ndev);
+ 	/*
+ 	 * The conduit's link is the switch's CPU port, which has no
+ 	 * negotiation and is up whenever the datapath is.
+@@ -2199,7 +2264,7 @@ static int xrx500_cbm_stop(struct net_device *ndev)
+ 	struct xrx500_cbm *priv = netdev_priv(ndev);
+ 
+ 	netif_carrier_off(ndev);
+-	netif_stop_queue(ndev);
++	netif_tx_stop_all_queues(ndev);
+ 
+ 	/*
+ 	 * The release poll rearms itself, and it cannot be shut down here:
+@@ -2235,6 +2300,7 @@ static const struct net_device_ops xrx500_cbm_netdev_ops = {
+ 	.ndo_open = xrx500_cbm_open,
+ 	.ndo_stop = xrx500_cbm_stop,
+ 	.ndo_start_xmit = xrx500_cbm_xmit,
++	.ndo_select_queue = xrx500_cbm_select_queue,
+ 	.ndo_set_mac_address = eth_mac_addr,
+ 	.ndo_validate_addr = eth_validate_addr,
+ };
+@@ -2253,12 +2319,13 @@ static int xrx500_cbm_set_report(const char *val,
+ 	guard(mutex)(&xrx500_cbm_lock);
+ 	list_for_each_entry(priv, &xrx500_cbm_conduits, node)
+ 		netdev_info(priv->ndev,
+-			    "free=%u pops=%llu rollbacks=%llu outstanding=%llu empty=%llu stops=%llu wakes=%llu polls=%llu\n",
++			    "free=%u pops=%llu rollbacks=%llu outstanding=%llu empty=%llu stops=%llu wakes=%llu polls=%llu noport=%llu\n",
+ 			    xrx500_cbm_free_segs(priv),
+ 			    priv->stats.pops, priv->stats.rollbacks,
+ 			    priv->stats.pops - priv->stats.rollbacks,
+ 			    priv->stats.pool_empty, priv->stats.stops,
+-			    priv->stats.wakes, priv->stats.polls);
++			    priv->stats.wakes, priv->stats.polls,
++			    priv->stats.noport);
+ 	return 0;
+ }
+ 
+@@ -2530,7 +2597,12 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	}
+ 	macro = &xrx500_cbm_macros[index];
+ 
+-	ndev = alloc_etherdev(sizeof(*priv));
++	/*
++	 * One transmit queue per port the conduit serves, plus the queue that
++	 * carries no port. A single-queue device would never reach the queue
++	 * callback and every frame would go to the first port.
++	 */
++	ndev = alloc_etherdev_mqs(sizeof(*priv), macro->num + 1, 1);
+ 	if (!ndev)
+ 		return -ENOMEM;
+ 
+@@ -2538,9 +2610,10 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	priv = netdev_priv(ndev);
+ 	priv->dev = dev;
+ 	priv->ndev = ndev;
++	priv->eg = macro->eg;
++	priv->eg_num = macro->num;
+ 	INIT_LIST_HEAD(&priv->node);
+ 	timer_setup(&priv->restart, xrx500_cbm_restart, 0);
+-	priv->eg = macro->eg[0];
+ 
+ 	/*
+ 	 * The windows and the segment pools belong to the buffer manager, and
+@@ -2630,24 +2703,37 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	for (i = 0; i < CBM_CPU_PORT_NUM; i++)
+ 		xrx500_cbm_eqm_cpu_port(priv, i);
+ 
+-	xrx500_cbm_dqm_dma_port(priv, false);
++	/*
++	 * Every port the conduit serves gets its own dequeue port, egress path
++	 * and queue-index entry, because the frame's egress port is chosen per
++	 * frame and the resources behind each are separate.
++	 */
++	for (i = 0; i < priv->eg_num; i++) {
++		const struct xrx500_cbm_egress *eg = &priv->eg[i];
++
++		xrx500_cbm_dqm_dma_port(priv, eg, false);
+ 
+-	ret = xrx500_cbm_tmu_egress_path(priv);
+-	if (ret) {
+-		if (ret != -EPROBE_DEFER)
+-			dev_err(dev, "egress path not built: %d\n", ret);
+-		goto err_free;
+-	}
++		ret = xrx500_cbm_tmu_egress_path(priv, eg);
++		if (ret) {
++			if (ret != -EPROBE_DEFER)
++				dev_err(dev,
++					"egress path for port %u not built: %d\n",
++					eg->dp_port, ret);
++			goto err_qidt;
++		}
+ 
+-	xrx500_cbm_qidt_set(priv, priv->eg.dp_port, (u8)priv->eg.tmu_qid);
++		xrx500_cbm_qidt_set(priv, eg->dp_port, (u8)eg->tmu_qid);
++	}
+ 
+ 	if (own_cbm)
+ 		xrx500_cbm_managers_enable(priv);
+ 
+-	if (own_dma_chan)
+-		xrx500_cbm_dma_chan_setup(priv);
+-	else
+-		xrx500_cbm_dma_chan_check(priv);
++	for (i = 0; i < priv->eg_num; i++) {
++		if (own_dma_chan)
++			xrx500_cbm_dma_chan_setup(priv, &priv->eg[i]);
++		else
++			xrx500_cbm_dma_chan_check(priv, &priv->eg[i]);
++	}
+ 
+ 	netif_napi_add(ndev, &priv->rx.napi, xrx500_cbm_rx_poll);
+ 
+@@ -2673,7 +2759,7 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	ndev->needed_headroom = 0;
+ 	ndev->min_mtu = ETH_MIN_MTU;
+ 	ndev->max_mtu = XRX500_CBM_MAX_MTU;
+-	ndev->mtu = XRX500_CBM_MAX_MTU;
++	ndev->mtu = ETH_DATA_LEN;
+ 	strscpy(ndev->name, "cbm%d", IFNAMSIZ);
+ 	eth_hw_addr_random(ndev);
+ 	netif_carrier_off(ndev);
+@@ -2688,15 +2774,19 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	scoped_guard(mutex, &xrx500_cbm_lock)
+ 		list_add_tail(&priv->node, &xrx500_cbm_conduits);
+ 
+-	dev_info(dev,
+-		 "%s serves datapath port %u: dequeue %u queue %u channel %u, %u free segments\n",
+-		 netdev_name(ndev), priv->eg.dp_port, priv->eg.deq_port,
+-		 priv->eg.tmu_qid, priv->eg.dma_chan,
++	for (i = 0; i < priv->eg_num; i++)
++		dev_info(dev,
++			 "%s port %u on queue %u: dequeue %u traffic queue %u channel %u\n",
++			 netdev_name(ndev), priv->eg[i].dp_port, i + 1,
++			 priv->eg[i].deq_port, priv->eg[i].tmu_qid,
++			 priv->eg[i].dma_chan);
++	dev_info(dev, "%s ready, %u free segments\n", netdev_name(ndev),
+ 		 xrx500_cbm_free_segs(priv));
+ 	return 0;
+ 
+ err_qidt:
+-	xrx500_cbm_qidt_set(priv, priv->eg.dp_port, 0);
++	for (i = 0; i < priv->eg_num; i++)
++		xrx500_cbm_qidt_set(priv, priv->eg[i].dp_port, 0);
+ err_free:
+ 	timer_shutdown_sync(&priv->restart);
+ 	free_netdev(ndev);
+@@ -2706,6 +2796,7 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ static void xrx500_cbm_remove(struct platform_device *pdev)
+ {
+ 	struct xrx500_cbm *priv = platform_get_drvdata(pdev);
++	unsigned int i;
+ 
+ 	mutex_lock(&xrx500_cbm_lock);
+ 	list_del(&priv->node);
+@@ -2728,7 +2819,8 @@ static void xrx500_cbm_remove(struct platform_device *pdev)
+ 							     NULL);
+ 
+ 	timer_shutdown_sync(&priv->restart);
+-	xrx500_cbm_qidt_set(priv, priv->eg.dp_port, 0);
++	for (i = 0; i < priv->eg_num; i++)
++		xrx500_cbm_qidt_set(priv, priv->eg[i].dp_port, 0);
+ 	free_netdev(priv->ndev);
+ }
+ 

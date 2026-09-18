@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:25:05 +0000
+Subject: net: ethernet: lantiq: CBM interrupt handling
+
+Add cbm_intr.c, the CBM interrupt layer. cbm_isr_0() serves the line the
+free-segment queue managers and the processor's own enqueue and dequeue
+ports raise on, with the read, dispatch and write-1-to-clear acknowledge
+discipline for the FSQM, EQM-CPU-port and DQM-CPU-port sub-sources. The
+free-segment managers report violations that have no other witness.
+
+Nothing builds this code yet. The buffer manager, the traffic manager
+and the DMA driver resolve symbols against each other, so they are wired
+into the build together once the last of them exists.
+
+Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+cqm/grx500/cbm.c interrupt code, which carries no copyright notice of
+its own; the file header names it as the origin.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+new file mode 100644
+index 000000000000..3c1b97adf0cc
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_intr.c
+@@ -0,0 +1,260 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c.
++ *
++ * CBM interrupt handling: the interrupt line the free-segment queue manager
++ * and the processor's own enqueue and dequeue ports raise on.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/smp.h>
++#include <linux/cpumask.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/ratelimit.h>
++#include <linux/bitops.h>
++#include <linux/string.h>
++#include <linux/dma-mapping.h>
++#include <linux/if_ether.h>
++
++#include "cbm.h"
++#include "cbm_regs.h"
++
++/* FSQM_IRNCR - local register-offset literal. */
++#define FSQM_IRNCR 0x10
++
++/*
++ * Forward declarations of sub-handlers (file-static).
++ *
++ * Declaring them up front lets the cbm_isr_<n> bodies appear in their
++ * natural top-down order while the sub-handler bodies live below.
++ */
++static void fsqm_intr_handler(int idx);
++static void igp_cpu_intr_handler(int pid);
++static void egp_cpu_intr_handler(int pid);
++
++/*
++ * Forward declarations matching the extern block in cbm.c. Identical C11
++ * §6.7p4 safe redeclaration as the cbm_set_val pattern in cbm_basic.c.
++ */
++irqreturn_t cbm_isr_0(int irq, void *dev_id);
++
++/* Sub-handlers */
++
++/*
++ * fsqm_intr_handler — port of AVM cqm/grx500/cbm.c:2198-2226.
++ *
++ * Reads the FSQM IRNCR, logs watermark events (bits 0..4 at pr_debug; the AVM
++ * original used LOGF_KLOG_ERR_ONCE for all of them but the plan's Step 4
++ * distinguishes "normal" watermark events from silicon-fatal ones), logs
++ * silicon-fatal events (RAM_VIOL / CMD_RAM_VIOL / CMD_OVERFLOW / ALLOC_NIL at
++ * pr_err_ratelimited), then write-clears the captured IRNCR value back to the
++ * same register.
++ *
++ * The captured value (not a fresh read) is written back so a second event
++ * that fires between the read and the clear is not silently lost — it remains
++ * visible in the IRNCR register and the IRQ stays asserted until the next ISR
++ * entry.
++ */
++static void fsqm_intr_handler(int idx)
++{
++	u32 fsqm_intr_stat;
++	int i;
++
++	if (idx < 0 || idx >= 2) {
++		pr_err_ratelimited("cbm: fsqm_intr_handler: invalid idx=%d\n",
++				   idx);
++		return;
++	}
++	if (!g_cbm_fsqm_base[idx]) {
++		pr_err_ratelimited("cbm: fsqm_intr_handler: g_cbm_fsqm_base[%d] NULL\n",
++				   idx);
++		return;
++	}
++
++	/* AVM cbm.c:2204 — read IRNCR at entry. */
++	fsqm_intr_stat = fsqm_r32(idx, FSQM_IRNCR);
++
++	pr_debug("cbm: fsqm[%d] status: 0x%x\n", idx, fsqm_intr_stat);
++
++	/* AVM cbm.c:2208-2213 — bits 0..4 watermark events. Plan Step 4:
++	 * "if bit 0..4 set, pr_debug 'fsqm[%d] watermark evt N'".
++	 */
++	for (i = 0; i < 5; i++) {
++		if (fsqm_intr_stat & BIT(i))
++			pr_debug("cbm: fsqm[%d] watermark[%d] intrt!\n",
++				 idx, i);
++	}
++
++	/*
++	 * AVM cbm.c:2214-2221 — silicon-fatal violations. Plan Step 4: "if
++	 * RAM_VIOL bit set, pr_err_ratelimited 'fsqm[%d] LLT_RAM violation'
++	 * (silicon-fatal, log loudly)".
++	 */
++	if (fsqm_intr_stat & FSQM_IRNEN_RAM_VIOL)
++		pr_err_ratelimited("cbm: fsqm[%d] LLT_RAM violation\n", idx);
++	if (fsqm_intr_stat & FSQM_IRNEN_CMD_RAM_VIOL)
++		pr_err_ratelimited("cbm: fsqm[%d] free command RAM violation\n",
++				   idx);
++	if (fsqm_intr_stat & FSQM_IRNEN_CMD_OVERFLOW)
++		pr_err_ratelimited("cbm: fsqm[%d] free command overflow\n",
++				   idx);
++	if (fsqm_intr_stat & FSQM_IRNEN_ALLOC_NIL)
++		pr_err_ratelimited("cbm: fsqm[%d] alloc command nil response\n",
++				   idx);
++
++	/*
++	 * AVM cbm.c:2222-2223 — write-clear by writing the CAPTURED value
++	 * back to IRNCR (W1C semantics).
++	 */
++	pr_debug("cbm: clear fsqm[%d] intr status\n", idx);
++	fsqm_w32(idx, FSQM_IRNCR, fsqm_intr_stat);
++}
++
++/*
++ * igp_cpu_intr_handler — port of AVM cqm/grx500/cbm.c:2246-2273.
++ *
++ * Reads CBM_EQM_CPU_PORT(pid, irncr) on the EQM window, logs the per-bit
++ * meanings (Packet Not Accept / WaterMark / Desc Ready / Pointer Ready),
++ * then writes the captured value back to W1C the register.
++ *
++ * The plan Step 5 chose pr_debug for the top-level summary; the per-bit
++ * ERR_ONCE lines retain pr_err_once for fault visibility.
++ */
++static void igp_cpu_intr_handler(int pid)
++{
++	u32 eqm_intr_stat;
++
++	if (!g_cbm_eqm_base) {
++		pr_err_ratelimited("cbm: igp_cpu_intr_handler: g_cbm_eqm_base NULL\n");
++		return;
++	}
++
++	/* AVM cbm.c:2250 — read on the EQM window (NOT g_cbm_base). */
++	eqm_intr_stat = cbm_eqm_r32(CBM_EQM_CPU_PORT(pid, irncr));
++
++	pr_debug("cbm: eqm cpu pid=%d irncr=0x%x\n", pid, eqm_intr_stat);
++
++	/* AVM cbm.c:2254-2265 — per-bit error reporting. */
++	if (eqm_intr_stat & BIT(0))
++		pr_err_once("cbm: igp pid=%d Packet Not Accept\n", pid);
++	if (eqm_intr_stat & BIT(1))
++		pr_err_once("cbm: igp pid=%d Low WaterMark Interrupt\n", pid);
++	if (eqm_intr_stat & BIT(2))
++		pr_err_once("cbm: igp pid=%d High WaterMark Interrupt\n", pid);
++	if (eqm_intr_stat & BIT(3))
++		pr_err_once("cbm: igp pid=%d Descriptor Ready for Enqueue\n",
++			    pid);
++	if (eqm_intr_stat & BIT(4))
++		pr_err_once("cbm: igp pid=%d Standard Pointer Ready\n", pid);
++	if (eqm_intr_stat & BIT(5))
++		pr_err_once("cbm: igp pid=%d Jumbo Pointer Ready\n", pid);
++
++	/* AVM cbm.c:2267-2269 — write-clear with captured value. */
++	pr_debug("cbm: clear igp intr status on pid=%d\n", pid);
++	cbm_eqm_w32(CBM_EQM_CPU_PORT(pid, irncr), eqm_intr_stat);
++}
++
++/*
++ * egp_cpu_intr_handler — port of AVM cqm/grx500/cbm.c:2275-2296.
++ *
++ * Reads CBM_DQM_CPU_PORT(pid, irncr) on the DQM window, logs the
++ * "Register ready for pointer free" bit, then write-clears.
++ *
++ * NOTE: AVM cbm.c:2290-2291 contains a bug — the AVM source writes to
++ * CBM_EQM_CPU_PORT(pid, irncr) on the DQM base, which is a typo (correct
++ * register is CBM_DQM_CPU_PORT).
++ */
++static void egp_cpu_intr_handler(int pid)
++{
++	u32 dqm_intr_stat;
++
++	if (!g_cbm_dqm_base) {
++		pr_err_ratelimited("cbm: egp_cpu_intr_handler: g_cbm_dqm_base NULL\n");
++		return;
++	}
++
++	/* AVM cbm.c:2279-2280 — read on the DQM window. */
++	dqm_intr_stat = cbm_dqm_r32(CBM_DQM_CPU_PORT(pid, irncr));
++
++	pr_debug("cbm: dqm cpu pid=%d irncr=0x%x\n", pid, dqm_intr_stat);
++
++	/* AVM cbm.c:2284-2287 — per-bit error reporting. */
++	if (dqm_intr_stat & BIT(0))
++		pr_err_once("cbm: egp pid=%d register ready for pointer free\n",
++			    pid);
++
++	/* AVM cbm.c:2289-2291 — write-clear with captured value (using the
++	 * corrected DQM port, not the AVM EQM-typo).
++	 */
++	pr_debug("cbm: clear egp intr status on pid=%d\n", pid);
++	cbm_dqm_w32(CBM_DQM_CPU_PORT(pid, irncr), dqm_intr_stat);
++}
++
++/*
++ * cbm_isr_0 - the manager's one interrupt line: the free-segment queue
++ * managers, and the processor's own enqueue and dequeue ports.
++ *
++ * Reads the three capture registers of the line at entry and write-clears all
++ * three at the end, so an event that arrives during the handler is not lost.
++ */
++irqreturn_t cbm_isr_0(int irq, void *dev_id)
++{
++	u32 cbm_irncr;
++	u32 igp_irncr;
++	u32 egp_irncr;
++
++	(void)irq;
++	(void)dev_id;
++
++	if (!g_cbm_base) {
++		pr_err_ratelimited("cbm: cbm_isr_0: g_cbm_base NULL\n");
++		return IRQ_NONE;
++	}
++
++	cbm_irncr = __raw_readl(g_cbm_base + CBM_INT_LINE(0, cbm_irncr));
++	igp_irncr = __raw_readl(g_cbm_base + CBM_INT_LINE(0, igp_irncr));
++	egp_irncr = __raw_readl(g_cbm_base + CBM_INT_LINE(0, egp_irncr));
++
++	pr_debug("cbm: isr0: cbm_irncr=0x%x igp_irncr=0x%x egp_irncr=0x%x\n",
++		 cbm_irncr, igp_irncr, egp_irncr);
++
++	/* (b) cbm_irncr dispatch — FSQM0 / FSQM1 / LS-trace. */
++	if (cbm_irncr != 0) {
++		if (cbm_irncr & 0x3)
++			pr_err_ratelimited("cbm: isr0: TMU interrupt triggered (impossible)\n");
++
++		/* AVM 2320-2330 — FSQM bits 4..7. The mask 0xF0 gates the
++		 * sub-dispatch; 0x30 -> FSQM0, 0xC0 -> FSQM1.
++		 */
++		if (cbm_irncr & 0xF0) {
++			if (cbm_irncr & 0x30) {
++				pr_debug("cbm: isr0: FSQM0 interrupt\n");
++				fsqm_intr_handler(0);
++			} else if (cbm_irncr & 0xC0) {
++				pr_debug("cbm: isr0: FSQM1 interrupt\n");
++				fsqm_intr_handler(1);
++			}
++		}
++	}
++
++	/* (c) igp_irncr dispatch — IGP CPU port 0. */
++	if (igp_irncr & 0x1)
++		igp_cpu_intr_handler(0);
++
++	/* (d) egp_irncr dispatch — EGP CPU port 0 (plan Step 2(d)). */
++	if (egp_irncr)
++		egp_cpu_intr_handler(0);
++
++	/* (e) Write-clear all three captured IRNCRs (AVM 2341-2346). */
++	pr_debug("cbm: isr0: clear cbm/igp/egp intr source\n");
++	__raw_writel(cbm_irncr, g_cbm_base + CBM_INT_LINE(0, cbm_irncr));
++	__raw_writel(igp_irncr, g_cbm_base + CBM_INT_LINE(0, igp_irncr));
++	__raw_writel(egp_irncr, g_cbm_base + CBM_INT_LINE(0, egp_irncr));
++
++	/* (f) Always IRQ_HANDLED on line 0 (AVM 2357). */
++	return IRQ_HANDLED;
++}

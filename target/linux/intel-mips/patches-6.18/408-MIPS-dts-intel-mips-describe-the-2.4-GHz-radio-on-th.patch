@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 19:43:36 +0200
+Subject: MIPS: dts: intel-mips: describe the 2.4 GHz radio on the FRITZ!Box
+ 7560
+
+The radio behind RC1 is an Atheros AR93xx whose EEPROM is blank, so it
+enumerates as 168c:abcd -- AR9300_DEVID_INVALID -- and carries no
+calibration data of its own. The data exists, in the board's urlader
+partition, and an OpenWrt hotplug script extracts it into
+ath9k-eeprom-pci-0001:01:00.0.bin. Getting ath9k to look for it there is
+what this node is for.
+
+ath9k_of_init() (drivers/net/wireless/ath/ath9k/init.c) does nothing at
+all unless the PCI device has a devicetree node: of_device_is_available()
+on a NULL np is false and the function returns immediately. Only with a
+node present, and only if that node carries "qca,no-eeprom", does it call
+ath9k_eeprom_request() for the file above and clear AH_USE_EEPROM.
+
+That flag is the whole mechanism. ath9k_hw_use_flash() is defined as its
+negation, and ar9300_eeprom_restore_internal() consults it to decide
+whether to take the ar9300_eeprom_restore_flash() path -- the one that
+reads the requested firmware blob -- or to fall through to reading the
+part's own EEPROM. Without the node the flag stays set, the fall-through
+is taken, and there is nothing there to read. The radio does not come up
+degraded; it does not come up.
+
+Two nodes are needed because the calibration is a property of the
+endpoint, not of the host bridge. The outer pcie@0 is the DesignWare root
+port, devfn 0 on bus 0; wifi@0,0 inside it is the endpoint, devfn 0 on
+bus 1. The PCI core matches devicetree nodes to devices by devfn alone,
+walking down from the host bridge node, so the addresses are what
+selects the device and the compatible string is documentation. The shape
+is the one lantiq boards already use for the same part -- see
+vr9_avm_fritz7430.dts in OpenWrt.
+
+Nothing else about the port changes: the reset gpio, the swap policy and
+the interrupt-map RC1 already has continue to apply. RC0 gets no
+equivalent -- the 5 GHz radio there enumerates with its real id,
+168c:003c, and is an ath10k part, whose calibration comes in by a
+different route.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+index 8d29b03f2b5a..060ca4b593c8 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -226,6 +226,33 @@ &pcie1 {
+ 	intel,inbound-swap = <1>;
+ 	intel,outbound-swap = <0>;
+ 	reset-gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
++
++	/*
++	 * The 2.4 GHz radio is an AR93xx whose EEPROM is blank, so it
++	 * enumerates as 168c:abcd (AR9300_DEVID_INVALID). ath9k_of_init()
++	 * only looks for calibration data in a file when the device has an
++	 * OF node carrying qca,no-eeprom, so without this node the driver
++	 * keeps AH_USE_EEPROM and the radio cannot come up at all -- there
++	 * is nothing on the part to fall back to.
++	 *
++	 * The outer node is the root port at devfn 0 on bus 0, the inner
++	 * one the endpoint at devfn 0 on bus 1; matching is by devfn, so
++	 * the compatible is documentation.
++	 */
++	pcie@0 {
++		reg = <0 0 0 0 0>;
++		#size-cells = <2>;
++		#address-cells = <3>;
++		device_type = "pci";
++		ranges;
++
++		wifi@0,0 {
++			compatible = "pci168c,abcd";
++			reg = <0 0 0 0 0>;
++			/* load from ath9k-eeprom-pci-0001:01:00.0.bin */
++			qca,no-eeprom;
++		};
++	};
+ };
+ 
+ /* VRX318 DSL companion -- see the inbound-swap note above. */

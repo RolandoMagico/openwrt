@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 25 Aug 2026 20:35:52 +0000
+Subject: MIPS: dts: intel-mips: describe what the CPU-launch firmware owns
+
+The secondary VPEs on this SoC are not started by Linux. AVM's resident
+stage-1 loader has already woken them by the time the kernel gains
+control and parks them in a wait loop, with EVA segmentation configured,
+waiting for a launch command in a mailbox at the very bottom of RAM. All
+three of the facts needed to use that mechanism were missing from the
+device tree.
+
+The first is the memory. Nothing below 0x20400000 belongs to Linux on an
+EVA-booted board: the mailbox sits at 0x20000000, the loader's reboot
+string at 0x20001000, the loader itself at 0x20010000, and four further
+megabytes of loader scratch at 0x20100000. Declaring none of them was
+survivable only for as long as nobody looked, because MIPS runs memblock
+bottom-up during early boot and the first early allocation -- the
+unflattened copy of the device tree, 13158 bytes -- lands squarely on the
+mailbox, with the allocations behind it walking into the loader's text.
+Read under our kernel, every CPU slot in that mailbox therefore contains
+device tree, and every CPU looks dead. The reservations are what make the
+mailbox readable at all; the rest of the series is downstream of them.
+
+The 4 MiB block at 0x20100000 is reserved because AVM reserves it, not
+because its contents are known. The stacks the parked VPEs are sitting on
+are a plausible tenant, which would make handing that range to the buddy
+allocator survivable right up until SMP starts working. Narrowing it is
+future work and needs hardware, not reasoning.
+
+The second is the doorbell. Each parked CPU is released by ringing one
+specific GIC shared interrupt, and which one is firmware truth rather
+than an allocation Linux is free to make -- 20, 21 and 85, the same three
+values the vendor's own device tree carries. They go on the cpu nodes as
+vmb-fw-ipi, and the property is documented in the MIPS cpus binding,
+which has unevaluatedProperties: false and would otherwise reject it.
+
+The third is that Linux must leave those three lines alone. The GIC
+driver's probe rewrites polarity, trigger and mask across every shared
+interrupt it can see, which would undo the firmware's configuration of
+exactly the lines the launch depends on. mti,reserved-list names them;
+the driver side of that property follows in the next commit.
+
+The reservations live in seale_avm.dtsi rather than xrx500.dtsi because
+a reservation cannot be stated without the memory node it comes out of,
+and easy350_anywan does not boot this way. The doorbells are SoC truth
+and go in xrx500.dtsi.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/mips/cpus.yaml b/Documentation/devicetree/bindings/mips/cpus.yaml
+index d3677f53f142..c151e66929f9 100644
+--- a/Documentation/devicetree/bindings/mips/cpus.yaml
++++ b/Documentation/devicetree/bindings/mips/cpus.yaml
+@@ -50,6 +50,17 @@ properties:
+ 
+   device_type: true
+ 
++  vmb-fw-ipi:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    description:
++      GIC shared interrupt number of the doorbell that releases this CPU from
++      the wait loop a resident firmware parked it in. Used on systems whose
++      secondary VPEs are launched through a firmware mailbox instead of by the
++      kernel itself, such as the Intel/Lantiq xRX500 (interAptiv). The value is
++      fixed by that firmware, and the same interrupts are normally listed in
++      the GIC's mti,reserved-list so that Linux leaves them configured as the
++      firmware left them.
++
+ allOf:
+   - $ref: /schemas/opp/opp-v1.yaml#
+   - if:
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+index 2900f83e4de4..fb7cf5cd43f7 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+@@ -41,6 +41,40 @@ reserved-memory {
+ 		#address-cells = <1>;
+ 		#size-cells = <1>;
+ 		ranges;
++
++		/*
++		 * The bottom of RAM belongs to the resident boot loader, not
++		 * to Linux. MIPS runs memblock bottom-up and
++		 * early_init_fdt_scan_reserved_mem() runs before
++		 * bootmem_init(), so without these no-map reservations the
++		 * first early allocations land on the firmware mailbox and on
++		 * the loader's own image.
++		 */
++		vmb_mailbox: vmb@20000000 {
++			reg = <0x20000000 0x1000>;
++			no-map;
++		};
++
++		avm_reboot_string: avm-reboot-string@20001000 {
++			reg = <0x20001000 0x200>;
++			no-map;
++		};
++
++		urlader: urlader@20010000 {
++			reg = <0x20010000 0x30000>;
++			no-map;
++		};
++
++		/*
++		 * Four megabytes immediately below the kernel load address;
++		 * the vendor reserves the same range for its own crash log. A
++		 * board that places ramoops inside this range must narrow
++		 * this node to match.
++		 */
++		avm_reserved: avm-reserved@20100000 {
++			reg = <0x20100000 0x400000>;
++			no-map;
++		};
+ 	};
+ };
+ 
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 55b31c68c630..8600e26d1548 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -90,6 +90,17 @@ ramoops@20100000 {
+ 			mem-type = <1>;
+ 		};
+ 
++		/*
++		 * The rest of the region seale_avm.dtsi reserves, whose first
++		 * megabyte the crash log above has taken.
++		 */
++		/delete-node/ avm-reserved@20100000;
++
++		avm-reserved@20200000 {
++			reg = <0x20200000 0x300000>;
++			no-map;
++		};
++
+ 		/*
+ 		 * Owned by the second CPU's boot loader (the vendor ships its
+ 		 * own device tree for that core); no-map so this kernel never
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index e32f4a73f4c3..fc41a0668e7b 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -31,18 +31,21 @@ cpu1: cpu@1 {
+ 			device_type = "cpu";
+ 			compatible = "mti,interaptiv";
+ 			reg = <1>;
++			vmb-fw-ipi = <20>;
+ 		};
+ 
+ 		cpu2: cpu@2 {
+ 			device_type = "cpu";
+ 			compatible = "mti,interaptiv";
+ 			reg = <2>;
++			vmb-fw-ipi = <21>;
+ 		};
+ 
+ 		cpu3: cpu@3 {
+ 			device_type = "cpu";
+ 			compatible = "mti,interaptiv";
+ 			reg = <3>;
++			vmb-fw-ipi = <85>;
+ 		};
+ 	};
+ 
+@@ -68,6 +71,12 @@ gic: gic@12320000 {
+ 		 */
+ 		interrupt-parent = <&cpu_intc>;
+ 		mti,reserved-ipi-vectors = <56 8>;
++
++		/*
++		 * The doorbells the CPU-launch firmware owns. They are shared
++		 * GIC interrupts and must stay out of the kernel's IPI pool.
++		 */
++		mti,reserved-list = <20 21 85>;
+ 	};
+ 
+ 	cgu: cgu@16200000 {

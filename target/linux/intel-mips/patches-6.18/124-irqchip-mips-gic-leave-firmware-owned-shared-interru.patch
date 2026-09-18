@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 25 Aug 2026 20:37:42 +0000
+Subject: irqchip/mips-gic: leave firmware-owned shared interrupts alone
+
+On systems where a firmware keeps running alongside Linux, some shared
+interrupts are not the kernel's to configure. The Intel/Lantiq xRX500 is
+one: its secondary CPUs sit parked in a firmware wait loop and are
+released by ringing one of three GIC shared interrupts, whose polarity,
+trigger and routing the firmware set up before Linux was entered.
+
+This driver does two things to a shared interrupt that are wrong for such
+a line. At probe it sweeps every shared interrupt it can see and forces
+polarity to active high, trigger to level and the mask off, which on the
+xRX500 turns three edge-triggered doorbells into level-triggered ones and
+loses the firmware's routing. And the interrupt domain will happily map
+any shared hwirq a device asks for, so a mistake in a device tree can
+silently point a driver at a doorbell.
+
+Add mti,reserved-list, naming shared interrupts the firmware owns. Listed
+lines are skipped in the probe sweep, refused by the domain, and removed
+from the pool the IPI allocator draws from. Without the property nothing
+changes: the bitmap stays empty and every test against it is false.
+
+The property name and its probe-sweep semantics come from the vendor
+kernel, which is already shipping both: its irq-mips-gic.c guards the
+polarity/trigger/mask loop with the same list, and the property appears
+in the device trees it ships for this SoC family and for the PRX300
+(xrx500.dtsi, prx300.dtsi in the FRITZ!Box 7590 GPL source releases,
+07.50 and 08.25). This implementation additionally refuses to map such a
+line into the domain and withholds it from the IPI allocator -- a
+deliberate superset, because running out of IPIs fails loudly while
+quietly stealing a line the firmware is still listening on does not.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/interrupt-controller/mti,gic.yaml b/Documentation/devicetree/bindings/interrupt-controller/mti,gic.yaml
+index 91bb3c2307a7..e898da702ea1 100644
+--- a/Documentation/devicetree/bindings/interrupt-controller/mti,gic.yaml
++++ b/Documentation/devicetree/bindings/interrupt-controller/mti,gic.yaml
+@@ -63,6 +63,20 @@ properties:
+       - minimum: 2
+         maximum: 254
+ 
++  mti,reserved-list:
++    description: |
++      Specifies shared interrupts that a firmware owns and that Linux must not
++      touch. Their polarity, trigger, mask and routing are configured before
++      Linux is entered, so the driver leaves them out of the reset it performs
++      over all other shared interrupts at probe, and refuses to map them into
++      the interrupt domain.
++    $ref: /schemas/types.yaml#/definitions/uint32-array
++    minItems: 1
++    uniqueItems: true
++    items:
++      minimum: 0
++      maximum: 255
++
+   timer:
+     type: object
+     description: |
+diff --git a/drivers/irqchip/irq-mips-gic.c b/drivers/irqchip/irq-mips-gic.c
+index d9405c7dfff2..16767bad0142 100644
+--- a/drivers/irqchip/irq-mips-gic.c
++++ b/drivers/irqchip/irq-mips-gic.c
+@@ -61,6 +61,15 @@ static DECLARE_BITMAP(ipi_resrv, GIC_MAX_INTRS);
+ static DECLARE_BITMAP(ipi_available, GIC_MAX_INTRS);
+ #endif /* CONFIG_GENERIC_IRQ_IPI */
+ 
++/*
++ * Shared interrupts named by mti,reserved-list: lines that some firmware
++ * still owns, already configured before Linux was entered and expected to
++ * stay that way. Both things this driver does to a shared interrupt it does
++ * not know about are wrong for these -- resetting polarity, trigger and mask
++ * at probe, and handing the line to whichever device asks for it.
++ */
++static DECLARE_BITMAP(fw_resrv, GIC_MAX_INTRS);
++
+ static struct gic_all_vpes_chip_data {
+ 	u32	map;
+ 	bool	mask;
+@@ -651,6 +660,9 @@ static int gic_irq_domain_map(struct irq_domain *d, unsigned int virq,
+ 	u32 map;
+ 
+ 	if (hwirq >= GIC_SHARED_HWIRQ_BASE) {
++		if (test_bit(GIC_HWIRQ_TO_SHARED(hwirq), fw_resrv))
++			return -EBUSY;
++
+ #ifdef CONFIG_GENERIC_IRQ_IPI
+ 		/* verify that shared irqs don't conflict with an IPI irq */
+ 		if (test_bit(GIC_HWIRQ_TO_SHARED(hwirq), ipi_resrv))
+@@ -888,6 +900,13 @@ static int gic_register_ipi_domain(struct device_node *node)
+ 
+ 	bitmap_copy(ipi_available, ipi_resrv, GIC_MAX_INTRS);
+ 
++	/*
++	 * Never hand a firmware-owned line to the IPI allocator. Running out
++	 * of IPIs is a loud, immediate failure; quietly stealing a line some
++	 * firmware is still listening on is not.
++	 */
++	bitmap_andnot(ipi_available, ipi_available, fw_resrv, GIC_MAX_INTRS);
++
+ 	return 0;
+ }
+ 
+@@ -900,6 +919,22 @@ static inline int gic_register_ipi_domain(struct device_node *node)
+ 
+ #endif /* !CONFIG_GENERIC_IRQ_IPI */
+ 
++static void __init gic_reserve_fw_intrs(struct device_node *node)
++{
++	u32 intr;
++
++	of_property_for_each_u32(node, "mti,reserved-list", intr) {
++		if (intr >= gic_shared_intrs) {
++			pr_warn("Ignoring out of range reserved interrupt %u\n",
++				intr);
++			continue;
++		}
++
++		__set_bit(intr, fw_resrv);
++		pr_info("Shared interrupt %u left to the firmware\n", intr);
++	}
++}
++
+ static int gic_cpu_startup(unsigned int cpu)
+ {
+ 	/* Enable or disable EIC */
+@@ -974,6 +1009,8 @@ static int __init gic_of_init(struct device_node *node,
+ 	gic_shared_intrs = FIELD_GET(GIC_CONFIG_NUMINTERRUPTS, gicconfig);
+ 	gic_shared_intrs = (gic_shared_intrs + 1) * 8;
+ 
++	gic_reserve_fw_intrs(node);
++
+ 	if (cpu_has_veic) {
+ 		/* Always use vector 1 in EIC mode */
+ 		gic_cpu_pin = 0;
+@@ -1010,6 +1047,8 @@ static int __init gic_of_init(struct device_node *node,
+ 	for (cl = 0; cl < nclusters; cl++) {
+ 		if (cl == cpu_cluster(&current_cpu_data)) {
+ 			for (i = 0; i < gic_shared_intrs; i++) {
++				if (test_bit(i, fw_resrv))
++					continue;
+ 				change_gic_pol(i, GIC_POL_ACTIVE_HIGH);
+ 				change_gic_trig(i, GIC_TRIG_LEVEL);
+ 				write_gic_rmask(i);
+@@ -1017,6 +1056,8 @@ static int __init gic_of_init(struct device_node *node,
+ 		} else if (mips_cps_numcores(cl) != 0) {
+ 			mips_cm_lock_other(cl, 0, 0, CM_GCR_Cx_OTHER_BLOCK_GLOBAL);
+ 			for (i = 0; i < gic_shared_intrs; i++) {
++				if (test_bit(i, fw_resrv))
++					continue;
+ 				change_gic_redir_pol(i, GIC_POL_ACTIVE_HIGH);
+ 				change_gic_redir_trig(i, GIC_TRIG_LEVEL);
+ 				write_gic_redir_rmask(i);

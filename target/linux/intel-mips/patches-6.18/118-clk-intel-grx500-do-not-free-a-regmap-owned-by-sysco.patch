@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 13:02:23 +0200
+Subject: clk: intel: grx500: do not free a regmap owned by syscon
+
+grx500_clk_init() takes the CGU regmap from syscon_node_to_regmap() and
+calls regmap_exit() on it if intel_clk_init() then fails. The regmap
+belongs to syscon: it is registered on the global syscon_list keyed by
+device_node and is never taken off it again, so freeing it leaves a
+dangling entry that the next lookup of the CGU node hands out.
+
+The blast radius here is small, and smaller than the same mistake in
+leds-lgm-sso.c that the previous commit removes. This is an __init
+CLK_OF_DECLARE path that runs once before any other consumer can ask
+for the CGU, and intel_clk_init() only fails on -ENOMEM, so the freed
+regmap is not reachable in practice today.
+
+That is an argument for leaving it, not a good one. The pattern is
+wrong wherever it appears, this tree is about to carry a patch removing
+it from a driver we did not write, and shipping that while our own
+driver does the same thing is not a position worth defending. There is
+nothing to unwind on this path in any case: intel_clk_init() allocates
+with devm and registers nothing before it can fail.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/clk/intel/clk-grx500.c b/drivers/clk/intel/clk-grx500.c
+index bcce6660fbcc..6ae36e27dc71 100644
+--- a/drivers/clk/intel/clk-grx500.c
++++ b/drivers/clk/intel/clk-grx500.c
+@@ -163,10 +163,8 @@ static void __init grx500_clk_init(struct device_node *np)
+ 		return;
+ 
+ 	ctx = intel_clk_init(np, map, CLK_NR_CLKS);
+-	if (IS_ERR(ctx)) {
+-		regmap_exit(map);
++	if (IS_ERR(ctx))
+ 		return;
+-	}
+ 
+ 	intel_clk_register_osc(ctx, grx500_osc_clks,
+ 			       ARRAY_SIZE(grx500_osc_clks));

@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 13:17:35 +0200
+Subject: net: dsa: lantiq: configure the xRX500 packet MAC
+
+The packet MAC that terminates the CPU side of each switch macro is not a
+device of its own: its registers are part of the switch's register window,
+and the reset the common function library issues at the start of setup()
+returns them to their defaults. Whatever configures it therefore has to run
+after that reset, which is what the per-model setup callback is for.
+
+Two tables and four control fields are programmed. Each transmit channel
+gets an ingress entry that says a header is present and takes every field
+of it from the default header the entry holds, so nothing a frame carries
+can name a port or a class of its own, and a frame the packet MAC finds
+broken is dropped rather than handed to the switch. Each destination port,
+traffic class and flow identifier gets an egress entry that puts a header
+on the frame the CPU receives and names the one receive channel this design
+uses; the entries are addressed by traffic class, which is what clearing
+the flag-select field selects, and that field is therefore written first.
+
+The short-frame length check has to end up off, or a frame from the CPU is
+dropped before the switch sees it. The vendor switch library turns it on and
+the vendor ethernet driver turns it back off again; only the second half is
+wanted here.
+
+The two macros differ in three of these. The macro that carries the external
+port pads short frames, raises the untagged frame limit because a frame
+crossing it has a tag added, and relays on behalf of destination ports beyond
+the CPU, so its egress table is programmed for all of them. Those differences
+sit in a per-model structure of this driver's own rather than in the shared
+one, because nothing outside this file has any use for them.
+
+Nothing reports what a table write did, so a read of the entry through the
+same window is the only way to see what landed.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index 8da6d092fe62..a936ad76c5e6 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -94,6 +94,54 @@
+ #define GSWIP_XRX500_R_MAX_PORTS		16
+ #define GSWIP_XRX500_R_EXT_PORT			15
+ 
++/* Packet MAC. It sits inside the switch's register window rather than being a
++ * device of its own, and the reset the common function library issues in
++ * setup() returns it to its defaults, so this model programs it from the
++ * per-model setup callback that runs afterwards.
++ */
++#define GSWIP_XRX500_PMAC_CTRL_0		0xD03
++#define  GSWIP_XRX500_PMAC_CTRL_0_PADEN		BIT(8)
++#define GSWIP_XRX500_PMAC_CTRL_2		0xD05
++#define  GSWIP_XRX500_PMAC_CTRL_2_LCHKS		GENMASK(1, 0)
++#define  GSWIP_XRX500_PMAC_CTRL_2_MLEN		BIT(3)
++#define GSWIP_XRX500_PMAC_CTRL_4		0xD07
++#define  GSWIP_XRX500_PMAC_CTRL_4_FLAGEN	BIT(0)
++#define GSWIP_XRX500_PMAC_TBL_VAL(x)		(0xD44 - (x))
++#define GSWIP_XRX500_PMAC_TBL_ADDR		0xD45
++#define GSWIP_XRX500_PMAC_TBL_CTRL		0xD46
++#define  GSWIP_XRX500_PMAC_TBL_CTRL_BAS		BIT(15)
++#define  GSWIP_XRX500_PMAC_TBL_CTRL_WRITE	BIT(5)
++#define  GSWIP_XRX500_PMAC_TBL_CTRL_TABLE	GENMASK(2, 0)
++#define GSWIP_XRX500_PMAC_TABLE_INGRESS		1
++#define GSWIP_XRX500_PMAC_TABLE_EGRESS		2
++
++/* Ingress table entry: the header the packet MAC assumes on a frame arriving
++ * from the CPU, and which of its fields to take from that header rather than
++ * from the descriptor.
++ */
++#define GSWIP_XRX500_PMAC_IG_PMAC_PRESENT	BIT(0)
++#define GSWIP_XRX500_PMAC_IG_SPID_DEFAULT	BIT(1)
++#define GSWIP_XRX500_PMAC_IG_SUBID_DEFAULT	BIT(2)
++#define GSWIP_XRX500_PMAC_IG_CLASS_ENA		BIT(3)
++#define GSWIP_XRX500_PMAC_IG_PMAP_ENA		BIT(4)
++#define GSWIP_XRX500_PMAC_IG_CLASS_DEFAULT	BIT(5)
++#define GSWIP_XRX500_PMAC_IG_PMAP_DEFAULT	BIT(6)
++#define GSWIP_XRX500_PMAC_IG_ERR_DISCARD	BIT(7)
++
++/* Egress table entry: what the packet MAC puts on a frame leaving towards
++ * the CPU, and which receive channel it leaves on.
++ */
++#define GSWIP_XRX500_PMAC_EG_PMAC_ENA		BIT(0)
++#define GSWIP_XRX500_PMAC_EG_TRAFFIC_CLASSES	16
++#define GSWIP_XRX500_PMAC_EG_FLOW_IDS		4
++
++/* Transmit channels the ingress table describes, and destination ports the
++ * egress table describes on each macro.
++ */
++#define GSWIP_XRX500_PMAC_CHANNELS		16
++#define GSWIP_XRX500_PMAC_EG_PORTS_CPU		1
++#define GSWIP_XRX500_PMAC_EG_PORTS_ALL		16
++
+ /* The WRED mode selector is two bits wide on this generation, where the
+  * common function library knows it as one.
+  */
+@@ -102,6 +150,23 @@
+ /* Register window of one switch macro, in 32-bit words. */
+ #define GSWIP_XRX500_MAX_REGISTER		0xFFF
+ 
++/**
++ * struct gswip_xrx500_model - what differs between the two switch macros
++ * @hw_info: the part of it the common function library reads
++ * @pmac_eg_ports: number of destination ports whose egress entries are
++ *	programmed. The first is the CPU; the macro that relays frames on
++ *	behalf of the accelerator paths has more.
++ * @pmac_pad: pad short frames on egress
++ * @pmac_long_untagged: allow the longer untagged frame the second macro
++ *	carries, because a frame crossing it has a tag added
++ */
++struct gswip_xrx500_model {
++	struct gswip_hw_info hw_info;
++	unsigned int pmac_eg_ports;
++	bool pmac_pad;
++	bool pmac_long_untagged;
++};
++
+ /**
+  * struct gswip_xrx500_gphy - one integrated PHY's firmware state
+  * @reset: reset line holding the PHY core
+@@ -132,6 +197,12 @@ struct gswip_xrx500 {
+ 	size_t fw_len;
+ };
+ 
++static const struct gswip_xrx500_model *
++gswip_xrx500_model(struct gswip_priv *priv)
++{
++	return container_of(priv->hw_info, struct gswip_xrx500_model, hw_info);
++}
++
+ static const struct gswip_mdio_layout gswip_xrx500_mdio_layout = {
+ 	.glob		= GSWIP_XRX500_GCTRL,
+ 	.ctrl		= GSWIP_XRX500_MDCTRL,
+@@ -509,9 +580,113 @@ static int gswip_xrx500_load_microcode(struct gswip_priv *priv)
+ 	return 0;
+ }
+ 
++/* Writes one packet MAC table entry. Neither the table nor the control
++ * registers report anything about a write, so a read of the entry through
++ * the same window is the only way to see what landed.
++ */
++static int gswip_xrx500_pmac_write(struct gswip_priv *priv, u8 table,
++				   u16 addr, const u16 val[5])
++{
++	unsigned int i;
++	int err;
++	u32 ctrl;
++
++	err = regmap_read_poll_timeout(priv->gswip,
++				       GSWIP_XRX500_PMAC_TBL_CTRL, ctrl,
++				       !(ctrl & GSWIP_XRX500_PMAC_TBL_CTRL_BAS),
++				       20, 50000);
++	if (err)
++		return err;
++
++	regmap_write(priv->gswip, GSWIP_XRX500_PMAC_TBL_ADDR, addr);
++	for (i = 0; i < 5; i++)
++		regmap_write(priv->gswip, GSWIP_XRX500_PMAC_TBL_VAL(i),
++			     val[i]);
++
++	regmap_write(priv->gswip, GSWIP_XRX500_PMAC_TBL_CTRL,
++		     GSWIP_XRX500_PMAC_TBL_CTRL_BAS |
++		     GSWIP_XRX500_PMAC_TBL_CTRL_WRITE |
++		     FIELD_PREP(GSWIP_XRX500_PMAC_TBL_CTRL_TABLE, table));
++
++	return regmap_read_poll_timeout(priv->gswip,
++					GSWIP_XRX500_PMAC_TBL_CTRL, ctrl,
++					!(ctrl & GSWIP_XRX500_PMAC_TBL_CTRL_BAS),
++					20, 50000);
++}
++
++/* One ingress entry per transmit channel. Every field comes from the default
++ * header this entry holds, the source port, the sub-interface id, the traffic
++ * class and the destination port map alike, so a malformed frame cannot claim
++ * to have arrived from a front port, and a frame the packet MAC finds broken
++ * is dropped rather than handed to the switch.
++ */
++static int gswip_xrx500_pmac_ingress(struct gswip_priv *priv)
++{
++	unsigned int chan;
++	int err;
++
++	for (chan = 0; chan < GSWIP_XRX500_PMAC_CHANNELS; chan++) {
++		u16 val[5] = {};
++
++		val[1] = ((((chan & 0x8) >> 3) * 2 + 1) << 8) | 0x90;
++		val[3] = BIT(chan & 0x7);
++		val[4] = GSWIP_XRX500_PMAC_IG_PMAC_PRESENT |
++			 GSWIP_XRX500_PMAC_IG_SPID_DEFAULT |
++			 GSWIP_XRX500_PMAC_IG_SUBID_DEFAULT |
++			 GSWIP_XRX500_PMAC_IG_CLASS_ENA |
++			 GSWIP_XRX500_PMAC_IG_PMAP_ENA |
++			 GSWIP_XRX500_PMAC_IG_CLASS_DEFAULT |
++			 GSWIP_XRX500_PMAC_IG_PMAP_DEFAULT |
++			 GSWIP_XRX500_PMAC_IG_ERR_DISCARD;
++
++		err = gswip_xrx500_pmac_write(priv,
++					      GSWIP_XRX500_PMAC_TABLE_INGRESS,
++					      chan, val);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++/* One egress entry per destination port, traffic class and flow identifier.
++ * Every frame leaving towards the CPU carries the header the tagging driver
++ * reads its source port from, and leaves on the one receive channel this
++ * design uses. The entry is addressed by traffic class, which is what the
++ * cleared flag-select in PMAC_CTRL_4 selects.
++ */
++static int gswip_xrx500_pmac_egress(struct gswip_priv *priv)
++{
++	const struct gswip_xrx500_model *model = gswip_xrx500_model(priv);
++	unsigned int port, tc, flow;
++	int err;
++
++	for (port = 0; port < model->pmac_eg_ports; port++) {
++		for (tc = 0; tc < GSWIP_XRX500_PMAC_EG_TRAFFIC_CLASSES; tc++) {
++			for (flow = 0; flow < GSWIP_XRX500_PMAC_EG_FLOW_IDS;
++			     flow++) {
++				u16 val[5] = {};
++				u16 addr = port | tc << 4 | flow << 8;
++
++				val[2] = GSWIP_XRX500_PMAC_EG_PMAC_ENA;
++
++				err = gswip_xrx500_pmac_write(priv,
++							      GSWIP_XRX500_PMAC_TABLE_EGRESS,
++							      addr, val);
++				if (err)
++					return err;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ static int gswip_xrx500_setup(struct dsa_switch *ds)
+ {
+ 	struct gswip_priv *priv = ds->priv;
++	const struct gswip_xrx500_model *model = gswip_xrx500_model(priv);
++	int err;
+ 
+ 	/* The queue manager's drop-policy selector is two bits wide here, and
+ 	 * this generation runs it at zero. Written after the common function
+@@ -526,7 +701,36 @@ static int gswip_xrx500_setup(struct dsa_switch *ds)
+ 	 * whenever it forwards for the switch.
+ 	 */
+ 
+-	return 0;
++	/* Address the egress table by traffic class rather than by the
++	 * processing flags of the accelerator paths, which this design does
++	 * not build. This has to be settled before the table is written,
++	 * because it decides what the entry addresses mean.
++	 */
++	regmap_clear_bits(priv->gswip, GSWIP_XRX500_PMAC_CTRL_4,
++			  GSWIP_XRX500_PMAC_CTRL_4_FLAGEN);
++
++	/* The short-frame length check drops a CPU frame before the switch
++	 * sees it, and has to end up off. The vendor switch library turns it
++	 * on and the vendor ethernet driver turns it back off; only the
++	 * second half is wanted here.
++	 */
++	regmap_clear_bits(priv->gswip, GSWIP_XRX500_PMAC_CTRL_2,
++			  GSWIP_XRX500_PMAC_CTRL_2_LCHKS);
++
++	regmap_write_bits(priv->gswip, GSWIP_XRX500_PMAC_CTRL_0,
++			  GSWIP_XRX500_PMAC_CTRL_0_PADEN,
++			  model->pmac_pad ?
++			  GSWIP_XRX500_PMAC_CTRL_0_PADEN : 0);
++	regmap_write_bits(priv->gswip, GSWIP_XRX500_PMAC_CTRL_2,
++			  GSWIP_XRX500_PMAC_CTRL_2_MLEN,
++			  model->pmac_long_untagged ?
++			  GSWIP_XRX500_PMAC_CTRL_2_MLEN : 0);
++
++	err = gswip_xrx500_pmac_ingress(priv);
++	if (err)
++		return err;
++
++	return gswip_xrx500_pmac_egress(priv);
+ }
+ 
+ static void gswip_xrx500_phylink_get_caps(struct dsa_switch *ds, int port,
+@@ -691,42 +895,55 @@ static void gswip_xrx500_shutdown(struct platform_device *pdev)
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
+-static const struct gswip_hw_info gswip_xrx500 = {
+-	.max_ports = GSWIP_XRX500_MAX_PORTS,
+-	.allowed_cpu_ports = BIT(0),
+-	/* No port has an xMII mode or delay register: the internal PHY ports
+-	 * attach over a fixed interface and the external one is not wired.
+-	 */
+-	.mii_cfg = { [0 ... GSWIP_MAX_PORTS - 1] = -1 },
+-	.mii_pcdu = { [0 ... GSWIP_MAX_PORTS - 1] = -1 },
+-	.mdio_layout = &gswip_xrx500_mdio_layout,
+-	.mac_ctrl = gswip_xrx500_mac_ctrl,
+-	.rmon_table = gswip_xrx500_rmon_table,
+-	.pce_microcode = &gswip_xrx500_pce_microcode,
+-	.pce_microcode_size = ARRAY_SIZE(gswip_xrx500_pce_microcode),
+-	.setup = gswip_xrx500_setup,
+-	.phylink_get_caps = gswip_xrx500_phylink_get_caps,
+-	.tag_protocol = DSA_TAG_PROTO_GSWIP3,
++static const struct gswip_xrx500_model gswip_xrx500 = {
++	.pmac_eg_ports = GSWIP_XRX500_PMAC_EG_PORTS_CPU,
++	.hw_info = {
++		.max_ports = GSWIP_XRX500_MAX_PORTS,
++		.allowed_cpu_ports = BIT(0),
++		/* No port has an xMII mode or delay register: the
++		 * internal PHY ports attach over a fixed interface and
++		 * the external one is not wired.
++		 */
++		.mii_cfg = { [0 ... GSWIP_MAX_PORTS - 1] = -1 },
++		.mii_pcdu = { [0 ... GSWIP_MAX_PORTS - 1] = -1 },
++		.mdio_layout = &gswip_xrx500_mdio_layout,
++		.mac_ctrl = gswip_xrx500_mac_ctrl,
++		.rmon_table = gswip_xrx500_rmon_table,
++		.pce_microcode = &gswip_xrx500_pce_microcode,
++		.pce_microcode_size = ARRAY_SIZE(gswip_xrx500_pce_microcode),
++		.setup = gswip_xrx500_setup,
++		.phylink_get_caps = gswip_xrx500_phylink_get_caps,
++		.tag_protocol = DSA_TAG_PROTO_GSWIP3,
++	},
+ };
+ 
+-static const struct gswip_hw_info gswip_xrx500_r = {
+-	.max_ports = GSWIP_XRX500_R_MAX_PORTS,
+-	.allowed_cpu_ports = BIT(0),
+-	.mii_cfg = { [0 ... GSWIP_MAX_PORTS - 1] = -1 },
+-	.mii_pcdu = { [0 ... GSWIP_MAX_PORTS - 1] = -1 },
+-	.mdio_layout = &gswip_xrx500_mdio_layout,
+-	.mac_ctrl = gswip_xrx500_mac_ctrl,
+-	.rmon_table = gswip_xrx500_rmon_table,
+-	.pce_microcode = &gswip_xrx500_pce_microcode,
+-	.pce_microcode_size = ARRAY_SIZE(gswip_xrx500_pce_microcode),
+-	.setup = gswip_xrx500_setup,
+-	.phylink_get_caps = gswip_xrx500_r_phylink_get_caps,
+-	.tag_protocol = DSA_TAG_PROTO_GSWIP3,
++static const struct gswip_xrx500_model gswip_xrx500_r = {
++	/* A frame crossing this macro has a tag added, so the untagged limit
++	 * is raised and short frames are padded.
++	 */
++	.pmac_eg_ports = GSWIP_XRX500_PMAC_EG_PORTS_ALL,
++	.pmac_pad = true,
++	.pmac_long_untagged = true,
++	.hw_info = {
++		.max_ports = GSWIP_XRX500_R_MAX_PORTS,
++		.allowed_cpu_ports = BIT(0),
++		.mii_cfg = { [0 ... GSWIP_MAX_PORTS - 1] = -1 },
++		.mii_pcdu = { [0 ... GSWIP_MAX_PORTS - 1] = -1 },
++		.mdio_layout = &gswip_xrx500_mdio_layout,
++		.mac_ctrl = gswip_xrx500_mac_ctrl,
++		.rmon_table = gswip_xrx500_rmon_table,
++		.pce_microcode = &gswip_xrx500_pce_microcode,
++		.pce_microcode_size = ARRAY_SIZE(gswip_xrx500_pce_microcode),
++		.setup = gswip_xrx500_setup,
++		.phylink_get_caps = gswip_xrx500_r_phylink_get_caps,
++		.tag_protocol = DSA_TAG_PROTO_GSWIP3,
++	},
+ };
+ 
+ static const struct of_device_id gswip_xrx500_of_match[] = {
+-	{ .compatible = "lantiq,xrx500-gswip", .data = &gswip_xrx500 },
+-	{ .compatible = "lantiq,xrx500-gswip-r", .data = &gswip_xrx500_r },
++	{ .compatible = "lantiq,xrx500-gswip", .data = &gswip_xrx500.hw_info },
++	{ .compatible = "lantiq,xrx500-gswip-r",
++	  .data = &gswip_xrx500_r.hw_info },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, gswip_xrx500_of_match);

@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 13:20:23 +0200
+Subject: net: dsa: lantiq: arm every port of the xRX500 WAN switch macro
+
+The macro that carries the external port needs two things the other does not.
+
+Its classification engine is told how far the flow table's common region
+reaches. The register carries the number of rows the engine keeps as the
+head of the table, the part that is not handed out per sub-interface, and
+it carries that number in units of four rows. The region matters here
+because it is the one this driver's rules live in - a port's rule is
+written at the row of its own port number, so every one of them is inside
+the first few rows - and the vendor driver writes this register on this
+macro and nowhere else. Name the row count the value stands for rather than
+writing the encoded byte; the value the register receives is unchanged.
+
+And every one of its ports is armed, because the vendor driver arms them all
+and says in its own source that every port here may and should be armed; the
+device tree describes only the ports that reach a socket, so the rest would
+otherwise stay off, and nothing in this driver knows what the fabric behind
+them expects.
+
+Nothing here writes a port's forwarding state. Its reset value is already
+forwarding, and the register that carries it also carries the special-tag and
+spoofing fields, so an unsolicited write there is indistinguishable from
+isolating the port.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index fe66779c3c95..0fd8bab440bf 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -143,6 +143,17 @@
+ #define GSWIP_XRX500_PMAC_EG_PORTS_CPU		1
+ #define GSWIP_XRX500_PMAC_EG_PORTS_ALL		16
+ 
++/* Number of rows the classification engine's flow table keeps as its common
++ * region, the head of the table that is not handed out per sub-interface
++ * and where the rules this driver addresses by port number sit. The
++ * register carries the count in units of four rows. Written on the macro
++ * that carries the external port; the other is left as it comes up.
++ */
++#define GSWIP_XRX500_PCE_TFCR_NUM		0x46F
++#define  GSWIP_XRX500_PCE_TFCR_NUM_NUM		GENMASK(7, 0)
++#define GSWIP_XRX500_PCE_TFCR_ROWS_R		512
++#define GSWIP_XRX500_PCE_TFCR_NUM_R		(GSWIP_XRX500_PCE_TFCR_ROWS_R / 4)
++
+ /* The WRED mode selector is two bits wide on this generation, where the
+  * common function library knows it as one.
+  */
+@@ -166,12 +177,18 @@
+  * @pmac_pad: pad short frames on egress
+  * @pmac_long_untagged: allow the longer untagged frame the second macro
+  *	carries, because a frame crossing it has a tag added
++ * @pce_tfcr_num: size of the flow table's common region in units of four
++ *	rows, 0 to leave the register alone
++ * @enable_all_ports: arm every port of the macro rather than only the ones
++ *	the device tree describes
+  */
+ struct gswip_xrx500_model {
+ 	struct gswip_hw_info hw_info;
+ 	unsigned int pmac_eg_ports;
+ 	bool pmac_pad;
+ 	bool pmac_long_untagged;
++	u8 pce_tfcr_num;
++	bool enable_all_ports;
+ };
+ 
+ /**
+@@ -733,6 +750,35 @@ static int gswip_xrx500_setup(struct dsa_switch *ds)
+ 			  model->pmac_long_untagged ?
+ 			  GSWIP_XRX500_PMAC_CTRL_2_MLEN : 0);
+ 
++	if (model->pce_tfcr_num)
++		regmap_write_bits(priv->gswip, GSWIP_XRX500_PCE_TFCR_NUM,
++				  GSWIP_XRX500_PCE_TFCR_NUM_NUM,
++				  model->pce_tfcr_num);
++
++	/* The vendor driver arms every port of this macro, and says in its
++	 * own source that every port may and should be armed here. The device
++	 * tree describes only the ports that reach a socket, so the rest
++	 * would otherwise stay off, and this driver has no way of knowing
++	 * what the fabric behind them expects.
++	 *
++	 * Nothing here writes a port's forwarding state. Its reset value is
++	 * already forwarding, and the register that carries it also carries
++	 * the special-tag and spoofing fields, so an unsolicited write there
++	 * looks exactly like a port that has been isolated.
++	 */
++	if (model->enable_all_ports) {
++		unsigned int port;
++
++		for (port = 0; port < priv->hw_info->max_ports; port++) {
++			regmap_set_bits(priv->gswip, GSWIP_FDMA_PCTRLp(port),
++					GSWIP_FDMA_PCTRL_EN);
++			regmap_set_bits(priv->gswip, GSWIP_SDMA_PCTRLp(port),
++					GSWIP_SDMA_PCTRL_EN);
++			regmap_write(priv->gswip, GSWIP_BM_PCFGp(port),
++				     GSWIP_BM_PCFG_CNTEN);
++		}
++	}
++
+ 	err = gswip_xrx500_pmac_ingress(priv);
+ 	if (err)
+ 		return err;
+@@ -942,6 +988,8 @@ static const struct gswip_xrx500_model gswip_xrx500_r = {
+ 	.pmac_eg_ports = GSWIP_XRX500_PMAC_EG_PORTS_ALL,
+ 	.pmac_pad = true,
+ 	.pmac_long_untagged = true,
++	.pce_tfcr_num = GSWIP_XRX500_PCE_TFCR_NUM_R,
++	.enable_all_ports = true,
+ 	.hw_info = {
+ 		.max_ports = GSWIP_XRX500_R_MAX_PORTS,
+ 		.allowed_cpu_ports = BIT(0),

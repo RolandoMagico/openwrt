@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 10:13:03 +0200
+Subject: net: dsa: lantiq: take the xRX500 egress port map from the frame
+
+The packet MAC's ingress table decides, field by field, whether to read a
+field of an incoming frame's header from the frame itself or from a
+default header the table entry holds. This driver set every one of those
+selectors, so the destination port map the tagging driver writes into
+each frame was discarded and the default map used instead.
+
+On the first switch macro that is invisible: the conduit picks its
+transmit channel by switch port number, so the default map for channel n
+names port n, which is the port the tag asked for anyway.
+
+The second macro has one external port, numbered fifteen, reached over
+channel fifteen. The default map was built as a bit in the low byte of
+the map, so channel fifteen named port seven - a port with no socket
+behind it, which this driver leaves disabled. Every frame the processor
+sent to the external port went there instead: unicast was dropped, and
+multicast fell through to the default multicast map, which is the
+processor port, so it came straight back as a receive with the default
+header's source port of zero.
+
+Take the port map, and the bit that enables it, from the frame. Make the
+default map name the port its channel serves for the case where a frame
+carries no map of its own, which is what the vendor driver writes for
+this macro. The source port, sub-interface id and traffic class keep
+coming from the default header: it names the processor port for all
+three, so a malformed frame cannot claim to have come from a front port.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index ce778408d754..d2aff6505cd2 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -116,14 +116,16 @@
+ #define GSWIP_XRX500_PMAC_TABLE_INGRESS		1
+ #define GSWIP_XRX500_PMAC_TABLE_EGRESS		2
+ 
+-/* Ingress table entry: the header the packet MAC assumes on a frame arriving
+- * from the CPU, and which of its fields to take from that header rather than
+- * from the descriptor.
++/* Ingress table entry: whether a frame arriving from the CPU carries a header
++ * at all, and, field by field, whether to take that field from the frame's own
++ * header or from the default header this entry holds. A bit set means the
++ * default; a bit clear means the frame.
+  */
+ #define GSWIP_XRX500_PMAC_IG_PMAC_PRESENT	BIT(0)
+ #define GSWIP_XRX500_PMAC_IG_SPID_DEFAULT	BIT(1)
+ #define GSWIP_XRX500_PMAC_IG_SUBID_DEFAULT	BIT(2)
+ #define GSWIP_XRX500_PMAC_IG_CLASS_ENA		BIT(3)
++/* Both port-map bits have to stay clear for the tag to reach the fabric. */
+ #define GSWIP_XRX500_PMAC_IG_PMAP_ENA		BIT(4)
+ #define GSWIP_XRX500_PMAC_IG_CLASS_DEFAULT	BIT(5)
+ #define GSWIP_XRX500_PMAC_IG_PMAP_DEFAULT	BIT(6)
+@@ -638,11 +640,20 @@ static int gswip_xrx500_pmac_write(struct gswip_priv *priv, u8 table,
+ 					20, 50000);
+ }
+ 
+-/* One ingress entry per transmit channel. Every field comes from the default
+- * header this entry holds, the source port, the sub-interface id, the traffic
+- * class and the destination port map alike, so a malformed frame cannot claim
+- * to have arrived from a front port, and a frame the packet MAC finds broken
+- * is dropped rather than handed to the switch.
++/* One ingress entry per transmit channel.
++ *
++ * The destination port map comes from the frame, because that is the field the
++ * tagging driver writes to say which port the frame is for; taking it from the
++ * default header instead would discard the tag's decision on every frame. The
++ * source port, the sub-interface id and the traffic class come from the default
++ * header, which names the processor port for all three, so a malformed frame
++ * cannot claim to have arrived from a front port. A frame the packet MAC finds
++ * broken is dropped rather than handed to the switch.
++ *
++ * The default map is only reached by a frame whose own header does not enable
++ * one. It has to name the port the channel serves, and it can: the network
++ * device selects its transmit channel by switch port number, so channel and
++ * destination port are the same number on both macros.
+  */
+ static int gswip_xrx500_pmac_ingress(struct gswip_priv *priv)
+ {
+@@ -653,14 +664,12 @@ static int gswip_xrx500_pmac_ingress(struct gswip_priv *priv)
+ 		u16 val[5] = {};
+ 
+ 		val[1] = ((((chan & 0x8) >> 3) * 2 + 1) << 8) | 0x90;
+-		val[3] = BIT(chan & 0x7);
++		val[3] = BIT(chan);
+ 		val[4] = GSWIP_XRX500_PMAC_IG_PMAC_PRESENT |
+ 			 GSWIP_XRX500_PMAC_IG_SPID_DEFAULT |
+ 			 GSWIP_XRX500_PMAC_IG_SUBID_DEFAULT |
+ 			 GSWIP_XRX500_PMAC_IG_CLASS_ENA |
+-			 GSWIP_XRX500_PMAC_IG_PMAP_ENA |
+ 			 GSWIP_XRX500_PMAC_IG_CLASS_DEFAULT |
+-			 GSWIP_XRX500_PMAC_IG_PMAP_DEFAULT |
+ 			 GSWIP_XRX500_PMAC_IG_ERR_DISCARD;
+ 
+ 		err = gswip_xrx500_pmac_write(priv,

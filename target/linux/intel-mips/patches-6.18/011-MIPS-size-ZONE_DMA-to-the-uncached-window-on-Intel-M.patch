@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 05:53:10 +0200
+Subject: MIPS: size ZONE_DMA to the uncached window on Intel MIPS
+
+There is no ISA bus on this SoC and nothing that needs the first 16 MiB
+of memory. What it does have is a constraint of exactly the shape
+ZONE_DMA exists to express: coherent allocations can only come from the
+first 256 MiB of DRAM, because that is all the uncached alias covers.
+Point the zone at that instead, and the allocator can place those
+allocations by itself rather than every driver finding the bound the
+hard way.
+
+MAX_DMA_ADDRESS gets a platform arm, in the shape the file already uses
+for SGI IP22/IP28. PAGE_OFFSET is 0x80000000 and PHYS_OFFSET is
+0x20000000 here, so PAGE_OFFSET + SZ_256M gives MAX_DMA_PFN 0x30000 and
+a ZONE_DMA of physical 0x20000000-0x2FFFFFFF -- the uncached window,
+exactly.
+
+The second half is easy to miss. dma-direct decides which zone to ask
+from by comparing a device's limit against zone_dma_limit, and that
+variable defaults to DMA_BIT_MASK(24) with a comment saying the arch
+must override it if its ZONE_DMA is somewhere else. MIPS never has. The
+default is accidentally correct on a platform whose MAX_DMA_ADDRESS is
+the ISA bound and whose PHYS_OFFSET is zero, and wrong on any other --
+so it silently became wrong here the moment the zone moved.
+
+Rather than assign a second constant that can drift from the first,
+derive it from MAX_DMA_PFN in the one place that consumes MAX_DMA_PFN.
+The two then cannot disagree by construction.
+
+That derivation is generic, so it is worth saying precisely who it
+touches. ZONE_DMA is only selected on MIPS by GENERIC_ISA_DMA where ISA
+DMA is not marked broken, which is four platforms: MACH_JAZZ, SNI_RM,
+MIPS_MALTA and this one. The first three, and Malta without EVA, have
+PHYS_OFFSET 0 and the ISA MAX_DMA_ADDRESS, so the derivation yields
+DMA_BIT_MASK(24) and nothing changes. Malta under EVA has PAGE_OFFSET 0
+and PHYS_OFFSET 0x80000000, where it yields 0x80FFFFFF -- which is where
+that config's ZONE_DMA genuinely is, against a default describing an
+address range containing no memory at all. IP22/IP28 mark ISA DMA broken
+and build with no ZONE_DMA, so the whole block compiles out.
+
+The vendor kernel makes the same move, and makes it family-wide rather
+than per board. AVM's 4.9 tree for this silicon enables CONFIG_ZONE_DMA
+on every GRX500 member -- it arrives by SOC_GRX500 selecting
+GENERIC_ISA_DMA, with CONFIG_ISA deliberately left unset so the ISA
+branch of the coherent-allocation path compiles out -- and sizes the
+zone to the window through a Kconfig knob, MAX_ZONEDMA_SIZE, whose range
+stops at 256 and which the shipping FRITZ!Box 7590 configuration sets to
+128. Nothing here needs a knob: one platform, and the whole window is
+the right answer for it. Taking all 256 MiB rather than the vendor's
+half is a strictly larger reserve, and it splits the zones exactly where
+the bound is rather than short of it.
+
+The same sizing then applies to the 256 MiB GRX350 boards, and costs
+them nothing: their DRAM ends at the top of the window, so ZONE_DMA is
+all of memory and ZONE_NORMAL is simply empty. Worth stating because it
+is the one place this could have been a silent change to a board that
+was already proven. The vendor ships the identical mechanism on those
+boards too -- 128 MiB there, which does split the zones -- so a zone
+split on this family is vendor-attested rather than invented, and what
+the GRX350 gets here is the degenerate case of it.
+
+This only makes the zone describe the window. It does not yet put
+anything in it -- a coherent allocation still lands wherever the buddy
+allocator happens to have pages, since no device on this SoC has a mask
+narrow enough to be routed to ZONE_DMA by itself.
+
+Assisted-by: Claude:claude-fable-5
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/include/asm/dma.h b/arch/mips/include/asm/dma.h
+index d6186e6bea7e..8fa4bd7fe2dd 100644
+--- a/arch/mips/include/asm/dma.h
++++ b/arch/mips/include/asm/dma.h
+@@ -14,6 +14,7 @@
+ #define _ASM_DMA_H
+ 
+ #include <asm/io.h>			/* need byte IO */
++#include <linux/sizes.h>
+ #include <linux/spinlock.h>		/* And spinlocks */
+ #include <linux/delay.h>
+ 
+@@ -87,6 +88,16 @@
+ #if defined(CONFIG_SGI_IP22) || defined(CONFIG_SGI_IP28)
+ /* don't care; ISA bus master won't work, ISA slave DMA supports 32bit addr */
+ #define MAX_DMA_ADDRESS		PAGE_OFFSET
++#elif defined(CONFIG_INTEL_MIPS)
++/*
++ * Nothing to do with ISA here. On the Intel MIPS (xRX500) family ZONE_DMA is
++ * made to describe the uncached window instead: the first 256 MiB of DRAM is
++ * the only part that has an uncached alias, so it is the only part a coherent
++ * allocation can come from. See arch/mips/mm/dma-noncoherent.c for the window
++ * itself. Sizing the zone to it lets the ordinary zone machinery place those
++ * allocations, rather than each driver discovering the bound the hard way.
++ */
++#define MAX_DMA_ADDRESS		(PAGE_OFFSET + SZ_256M)
+ #else
+ #define MAX_DMA_ADDRESS		(PAGE_OFFSET + 0x01000000)
+ #endif
+diff --git a/arch/mips/mm/init.c b/arch/mips/mm/init.c
+index 4d73dc6c3347..b7419dac9483 100644
+--- a/arch/mips/mm/init.c
++++ b/arch/mips/mm/init.c
+@@ -22,6 +22,7 @@
+ #include <linux/ptrace.h>
+ #include <linux/mman.h>
+ #include <linux/mm.h>
++#include <linux/dma-direct.h>
+ #include <linux/memblock.h>
+ #include <linux/highmem.h>
+ #include <linux/swap.h>
+@@ -406,6 +407,15 @@ void __init paging_init(void)
+ 
+ #ifdef CONFIG_ZONE_DMA
+ 	max_zone_pfns[ZONE_DMA] = MAX_DMA_PFN;
++	/*
++	 * Tell dma-direct where the zone it is about to be asked for actually
++	 * ends. Its default assumes the first 16 MiB of physical memory, which
++	 * is right only where MAX_DMA_ADDRESS is the ISA bound and PHYS_OFFSET
++	 * is zero. Deriving it from the same constant that sizes the zone keeps
++	 * the two from drifting apart, and is a no-op wherever that pair
++	 * already holds.
++	 */
++	zone_dma_limit = PFN_PHYS(MAX_DMA_PFN) - 1;
+ #endif
+ #ifdef CONFIG_ZONE_DMA32
+ 	max_zone_pfns[ZONE_DMA32] = MAX_DMA32_PFN;

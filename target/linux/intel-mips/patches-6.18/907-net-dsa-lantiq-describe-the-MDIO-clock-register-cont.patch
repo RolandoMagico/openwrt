@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 12:56:25 +0200
+Subject: net: dsa: lantiq: describe the MDIO clock register content per model
+
+The bus setup writes the MDIO clock divider with a hardcoded mask and value.
+That is complete for GSWIP-2.x, where the divider is the only field of the
+register the driver owns, but not for later models: those place the MDIO
+master enable in the same register, above the hardcoded mask, and the master
+has to be enabled before the bus is registered and the first transaction is
+issued. There is no callback between the two, so the value cannot be supplied
+from outside the common core.
+
+Carry the mask and the value in the per-model MDIO layout next to the register
+address, so a model that needs more than the divider says so as data.
+
+No functional change: the default layout carries the mask and value the code
+had inline.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.h b/drivers/net/dsa/lantiq/lantiq_gswip.h
+index f2339d3f8f47..998ed31174d0 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.h
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.h
+@@ -264,6 +264,8 @@
+  * @write: MDIO write data register
+  * @mdc_cfg0: MDC clock configuration 0, holding the auto-polling enables
+  * @mdc_cfg1: MDC clock configuration 1, holding the clock divider
++ * @mdc_cfg1_mask: bits of @mdc_cfg1 the bus setup owns
++ * @mdc_cfg1_val: value the bus setup writes into those bits
+  * @phy: per-port PHY address and link force register, -1 if the port has none
+  *
+  * GSWIP-2.x keeps these registers in an address region of their own and
+@@ -278,6 +280,8 @@ struct gswip_mdio_layout {
+ 	u16 write;
+ 	u16 mdc_cfg0;
+ 	u16 mdc_cfg1;
++	u16 mdc_cfg1_mask;
++	u16 mdc_cfg1_val;
+ 	s16 phy[GSWIP_MAX_PORTS];
+ };
+ 
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index e6ad07bcc309..968e20b76446 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -133,6 +133,8 @@ static const struct gswip_mdio_layout gswip_mdio_layout_2x = {
+ 	.write		= GSWIP_MDIO_WRITE,
+ 	.mdc_cfg0	= GSWIP_MDIO_MDC_CFG0,
+ 	.mdc_cfg1	= GSWIP_MDIO_MDC_CFG1,
++	.mdc_cfg1_mask	= 0xff,
++	.mdc_cfg1_val	= 0x09,
+ 	.phy		= {
+ 		GSWIP_MDIO_PHYp(0), GSWIP_MDIO_PHYp(1), GSWIP_MDIO_PHYp(2),
+ 		GSWIP_MDIO_PHYp(3), GSWIP_MDIO_PHYp(4), GSWIP_MDIO_PHYp(5),
+@@ -734,8 +736,14 @@ static int gswip_setup(struct dsa_switch *ds)
+ 	 */
+ 	regmap_write(priv->mdio, priv->mdio_layout->mdc_cfg0, 0x0);
+ 
+-	/* Configure the MDIO Clock 2.5 MHz */
+-	regmap_write_bits(priv->mdio, priv->mdio_layout->mdc_cfg1, 0xff, 0x09);
++	/* Configure the MDIO clock. On GSWIP-2.x the clock divider is the only
++	 * field the driver owns in this register; later models also carry the
++	 * MDIO master enable here, and it has to be set before the bus is
++	 * registered and the first transaction is issued.
++	 */
++	regmap_write_bits(priv->mdio, priv->mdio_layout->mdc_cfg1,
++			  priv->mdio_layout->mdc_cfg1_mask,
++			  priv->mdio_layout->mdc_cfg1_val);
+ 
+ 	/* bring up the mdio bus */
+ 	err = gswip_mdio(priv);

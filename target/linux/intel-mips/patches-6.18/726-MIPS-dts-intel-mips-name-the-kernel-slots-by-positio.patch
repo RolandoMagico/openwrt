@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 24 Aug 2026 12:13:16 +0200
+Subject: MIPS: dts: intel-mips: name the kernel slots by position
+
+Both boards carry two 8 MiB kernel slots, at 0x500000 and 0xd00000, and
+the boot-loader environment's linux_fs_start selects between them: 0
+picks the first, 1 the second, and the vendor kernel reads the same
+variable. Both slots are defined on every board of
+this family, at the same offsets, and the definitions are byte-identical
+between the FRITZ!Box 7560 and the FRITZ!Box 7590.
+
+The labels claimed to know which slot was in use -- "kernel" for the
+active one, "reserved-kernel" for the other -- and put them opposite ways
+round on the two boards. That cannot be right in a fixed-partitions map,
+because linux_fs_start is not a property of the board. It is runtime
+state that the boot loader may change on its own, so a map that pins a
+role is wrong for any unit whose selector has ever moved -- including a
+unit the map was correct for when it was written.
+
+Name the slots by position instead and let the code that writes them
+decide what to do about it. This also makes the two boards' partition
+maps identical except for the ubi size, which is what the hardware
+actually looks like.
+
+The FRITZ!Box 7590's comment additionally instructed the reader to assert
+linux_fs_start == 1 before flashing. Delete it: it documents an
+assumption this change removes.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+index 0b22a44335f3..abbf456943cd 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -201,15 +201,21 @@ partition@100000 {
+ 			read-only;
+ 		};
+ 
+-		/* Primary kernel slot. Written by sysupgrade. */
++		/*
++		 * The two 8 MiB kernel slots. The boot-loader environment
++		 * selects between them with linux_fs_start (0 boots the slot at
++		 * 0x500000, 1 the one at 0xd00000). That is runtime state the
++		 * boot loader may change on its own, so the labels name the
++		 * slots by position and nothing here may claim which one is
++		 * active.
++		 */
+ 		partition@500000 {
+-			label = "kernel";
++			label = "kernel0";
+ 			reg = <0x500000 0x800000>;
+ 		};
+ 
+-		/* AVM secondary/recovery kernel slot. Written by sysupgrade. */
+ 		partition@d00000 {
+-			label = "reserved-kernel";
++			label = "kernel1";
+ 			reg = <0xd00000 0x800000>;
+ 		};
+ 
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index eb2c42e04008..55b31c68c630 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -181,15 +181,19 @@ partition@100000 {
+ 			read-only;
+ 		};
+ 
+-		/* Inactive kernel slot 0. Written by sysupgrade. */
++		/*
++		 * Two 8 MiB kernel slots, named by position: which one is
++		 * active is boot-loader run-time state (its linux_fs_start
++		 * selects between them), so no label may claim to be the
++		 * active one.
++		 */
+ 		partition@500000 {
+-			label = "reserved-kernel";
++			label = "kernel0";
+ 			reg = <0x500000 0x800000>;
+ 		};
+ 
+-		/* Active kernel slot 1 -- the one EVA boots on this unit. */
+ 		partition@d00000 {
+-			label = "kernel";
++			label = "kernel1";
+ 			reg = <0xd00000 0x800000>;
+ 		};
+ 

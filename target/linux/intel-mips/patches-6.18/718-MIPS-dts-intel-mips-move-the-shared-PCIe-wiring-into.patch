@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 01:47:06 +0200
+Subject: MIPS: dts: intel-mips: move the shared PCIe wiring into the AVM dtsi
+
+The comment on this block named its own precondition: it would stay in
+the FRITZ!Box 7560's board file until a second board had actually
+enumerated a device behind one of these ports. The FRITZ!Box 7590 is
+about to, so it moves.
+
+Nothing about the moved half is board-specific. Both boards drive PERST#
+from gpio0 9 and gpio0 8, active low; both enable all three serdes PHYs
+with spread spectrum on; both swap inbound and leave outbound alone.
+That is not a coincidence between two boards either -- the vendor states
+these once, in a file every FRITZ!Box on this SoC includes, and no board
+file anywhere in its tree overrides any of it.
+
+The claim the move makes, stated so it can be checked later: every AVM
+board on this SoC puts a radio behind RC0 and RC1. The FRITZ!Box 7580 is
+the next board that would test it, and if one ever turns up with a port
+unused, a board file can disable it again -- the claim is about what
+this family does, not about what is possible.
+
+Two things deliberately do not move. RC2 stays per-board because what
+sits behind it differs -- a VRX318 on the FRITZ!Box 7560, a VRX518 on
+the FRITZ!Box 7590 -- and the two want opposite inbound byte swapping as
+a result, which is the single largest PCIe difference between the
+boards. And the FRITZ!Box 7560's ath9k endpoint node stays with the
+board that has the part; what it describes is a blank EEPROM on one
+specific radio, not a port. Its port is now enabled in the dtsi and the
+board file adds only the child, which dtc merges into the same node.
+
+The PHYs all three move together, RC2's included. They are three
+instances of one block with nothing board-specific to say, and a powered
+PHY with no root complex behind it does nothing.
+
+seale_avm.dtsi gains the gpio dt-bindings include the moved reset-gpios
+need. Both board files already pull it in ahead of this one, so nothing
+changes today; the include is there so the file does not depend on its
+includers for a macro it uses itself.
+
+The FRITZ!Box 7560's DTB is unchanged by this, byte for byte.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+index 0aecb66c3d94..2900f83e4de4 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+@@ -7,6 +7,8 @@
+  * per-board data is in the board .dts.
+  */
+ 
++#include <dt-bindings/gpio/gpio.h>
++
+ #include "xrx500.dtsi"
+ 
+ /*
+@@ -41,3 +43,38 @@ reserved-memory {
+ 		ranges;
+ 	};
+ };
++
++/*
++ * All three serdes PHYs and the two root complexes that carry radios. PERST#
++ * is active low on every port, spread-spectrum clocking is on, and inbound
++ * byte swapping is on because the SoC is big-endian and the DesignWare core
++ * is not.
++ */
++&pcie_phy0 {
++	status = "okay";
++	intel,ssc-enable = <1>;
++};
++
++&pcie_phy1 {
++	status = "okay";
++	intel,ssc-enable = <1>;
++};
++
++&pcie_phy2 {
++	status = "okay";
++	intel,ssc-enable = <1>;
++};
++
++&pcie0 {
++	status = "okay";
++	intel,inbound-swap = <1>;
++	intel,outbound-swap = <0>;
++	reset-gpios = <&gpio0 9 GPIO_ACTIVE_LOW>;
++};
++
++&pcie1 {
++	status = "okay";
++	intel,inbound-swap = <1>;
++	intel,outbound-swap = <0>;
++	reset-gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
++};
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+index 330f344e100a..0b22a44335f3 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -236,58 +236,11 @@ dect-reset-hog {
+ 	};
+ };
+ 
+-&pcie_phy0 {
+-	status = "okay";
+-	intel,ssc-enable = <1>;
+-};
+-
+-&pcie_phy1 {
+-	status = "okay";
+-	intel,ssc-enable = <1>;
+-};
+-
+-&pcie_phy2 {
+-	status = "okay";
+-	intel,ssc-enable = <1>;
+-};
+-
+ /*
+- * Inbound byte swapping is enabled on the two radio ports and disabled
+- * on RC2. This SoC is big endian and the DWC core is not, so inbound
+- * DMA is byte-swapped on the way through -- except for the VRX318,
+- * whose driver already presents its shared memory in the endianness the
+- * host expects, and swapping again would undo it. The vendor tree
+- * arrives at the same split: grx_common.dtsi sets inbound-swap on all
+- * three, and vrx318.dtsi, included only by boards carrying that chip,
+- * clears it on RC2.
+- *
+- * Outbound is never swapped, on any port.
++ * The 2.4 GHz radio, behind RC1. qca,no-eeprom is required: there is no
++ * calibration EEPROM on the card and the driver must take it from userspace.
+  */
+-&pcie0 {
+-	status = "okay";
+-	intel,inbound-swap = <1>;
+-	intel,outbound-swap = <0>;
+-	reset-gpios = <&gpio0 9 GPIO_ACTIVE_LOW>;
+-};
+-
+ &pcie1 {
+-	status = "okay";
+-	intel,inbound-swap = <1>;
+-	intel,outbound-swap = <0>;
+-	reset-gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
+-
+-	/*
+-	 * The 2.4 GHz radio is an AR93xx whose EEPROM is blank, so it
+-	 * enumerates as 168c:abcd (AR9300_DEVID_INVALID). ath9k_of_init()
+-	 * only looks for calibration data in a file when the device has an
+-	 * OF node carrying qca,no-eeprom, so without this node the driver
+-	 * keeps AH_USE_EEPROM and the radio cannot come up at all -- there
+-	 * is nothing on the part to fall back to.
+-	 *
+-	 * The outer node is the root port at devfn 0 on bus 0, the inner
+-	 * one the endpoint at devfn 0 on bus 1; matching is by devfn, so
+-	 * the compatible is documentation.
+-	 */
+ 	pcie@0 {
+ 		reg = <0 0 0 0 0>;
+ 		#size-cells = <2>;
+@@ -304,7 +257,10 @@ wifi@0,0 {
+ 	};
+ };
+ 
+-/* VRX318 DSL companion -- see the inbound-swap note above. */
++/*
++ * VRX318 DSL companion, behind RC2. Inbound byte swapping is off: the
++ * endpoint's driver already presents host-endian shared memory.
++ */
+ &pcie2 {
+ 	status = "okay";
+ 	intel,inbound-swap = <0>;

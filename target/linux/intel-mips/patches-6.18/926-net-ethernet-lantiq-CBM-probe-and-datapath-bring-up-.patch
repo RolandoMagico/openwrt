@@ -1,0 +1,971 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:27:32 +0000
+Subject: net: ethernet: lantiq: CBM probe and datapath bring-up orchestration
+
+Add cbm.c, the platform driver for the buffer manager node, and the
+bring-up sequence tying together everything added so far. The marked
+constraints in the order below are load-bearing: each one was
+established by breaking TX or RX on this hardware.
+
+Probe sequence:
+
+ 1. Map the eleven register windows, each by name, and take the gate
+    clock by name.
+ 2. Map the reserved-memory buffer pools.
+ 3. TOE/DMA3 controller reset parity (matching the vendor hdma
+    probe environment) BEFORE the CBM hardware init.
+ 4. cbm_hw_init() writes the NGI endian mask and the interface mux
+    first, because both are sampled at block reset, then runs FSQM init
+    for both segment sizes, init_cbm_basic (pool base registers incl.
+    the IOCU aliases, JSEL, counter zero-fill, interrupt mapping and the
+    CBM interrupt, live from this point), EQM CPU ports 0-3 (must
+    precede the first FSQM buffer pop), EQM DMA ingress ports 5-8
+    standard+jumbo with descriptor seeds, and the TOE (IGP9) and LDMA
+    (IGP15) ports.
+ 5. tmu_init().
+ 6. QIDT baseline: fill the whole queue-selection cube with the
+    drop value, then run the CPU DQM row walk (queues 35/34/36)
+    and the endpoint-7 route to queue 35 - routes are carved out
+    of an all-drop baseline, never the reverse.
+ 7. Bring up one CPU dequeue port per online CPU, so each CPU
+    returns segments through its own ptr_rtn register.
+ 8. Preconfigure the dequeue port and flat TMU egress path of every
+    datapath port the switch macros' port children name, skipping
+    the CPU port. Egress must be configured BEFORE the controllers
+    are enabled.
+ 9. cbm_enable_controllers() enables the DQM, then the EQM, then the
+    enqueue-delay setting that lets the TMU bind body lengths. The
+    four load-spreader interrupt enables are written to zero, because
+    those lines are level-sourced and no handler is registered for
+    them, and the per-port EQM and DQM interrupts are masked.
+10. hdma_port_enable() opens each preconfigured port's egress
+    channel once, at the end of probe, after the TMU egress port
+    exists - the channel is never toggled afterwards (toggling it
+    desynchronizes the dequeue handshake).
+11. The eight EQM RX-admit movers open, DMA2RX ch14/15 (standard)
+    and ch30/31 (jumbo) into IGP5/6, DMA1RX ch0/6 into IGP7 and
+    ch5/11 into IGP8.
+12. Give the conduit children of the node their devices.
+
+RCU_IAP_WDT_RST_EN, which gates the watchdog's reset request, is left to
+the watchdog driver that owns it.
+
+The platform driver is registered under a name of its own rather than
+the device's, because two platform drivers cannot share a name.
+
+Nothing builds this driver yet. The next change wires the buffer manager
+into the build.
+
+Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+cqm/grx500/cbm.c probe/config-walk code, which carries no copyright
+notice of its own; the file header names it as the origin and
+per-function provenance is recorded in comments. One deviation from
+the vendor order is deliberate and safe: the EQM is armed earlier
+than the vendor arms it.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+new file mode 100644
+index 000000000000..d9b07f1bfcc9
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -0,0 +1,896 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c.
++ *
++ * Central Buffer Manager (CBM) core: probe, register-window mapping and the
++ * hardware bring-up sequence for the enqueue (EQM) and dequeue (DQM)
++ * managers, the free-segment queue manager and the load spreader.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/io.h>
++#include <linux/err.h>
++#include <linux/atomic.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/of_platform.h>
++#include <linux/mod_devicetable.h>
++#include <linux/clk.h>
++#include <linux/printk.h>
++#include <linux/device.h>
++#include <linux/interrupt.h>
++#include <linux/bits.h>
++#include <linux/cpumask.h>
++#include <asm/io.h>
++#include <asm/page.h>
++
++#include "cbm.h"
++#include "../../tmu/drv_tmu_ll.h"
++#include "../../dma/lantiq_dmax.h"
++
++#define CBM_SBA_0  0x200  /* Std Buf Addr 0 (physical) */
++#define CBM_SBA_1  0x204  /* Std Buf Addr 1 (IOCU alias) */
++#define CBM_JBA_0  0x208  /* Jumbo Buf Addr 0 (physical) */
++#define CBM_JBA_1  0x20C  /* Jumbo Buf Addr 1 (IOCU alias) */
++
++#define CBM_PORT_F_STANDARD_BUF  0x1U
++#define CBM_PORT_F_JUMBO_BUF     0x2U
++#define CBM_DMADESC_PHYS_BASE    0x1e500000U /* DT cbm dma_desc window (reg idx 11) */
++
++extern void cbm_set_val(void __iomem *addr, u32 val, u32 mask, u32 shift);
++extern int cbm_buf_init_pools(struct device *dev);
++extern phys_addr_t cbm_buf_pool_phys_base(int which);
++
++/* Pool index constants — mirror cbm_buf.c's CBM_POOL_STD / CBM_POOL_JBO. */
++#define CBM_POOL_STD  0
++#define CBM_POOL_JBO  1
++
++irqreturn_t cbm_isr_0(int irq, void *dev_id);
++
++/*
++ * MMIO base pointers, populated by cbm_xrx500_probe from the named reg
++ * tuples of the DT node.
++ */
++void __iomem *g_cbm_tmu_base;
++void __iomem *g_cbm_base;
++void __iomem *g_cbm_qidt_base;
++void __iomem *g_cbm_qeqcnt_base;
++void __iomem *g_cbm_qdqcnt_base;
++void __iomem *g_cbm_eqm_base;
++void __iomem *g_cbm_dqm_base;
++void __iomem *g_cbm_fsqm_base[2];
++void __iomem *g_cbm_dma_desc_base;
++
++EXPORT_SYMBOL_GPL(g_cbm_tmu_base);
++EXPORT_SYMBOL_GPL(g_cbm_base);
++EXPORT_SYMBOL_GPL(g_cbm_qidt_base);
++EXPORT_SYMBOL_GPL(g_cbm_qeqcnt_base);
++EXPORT_SYMBOL_GPL(g_cbm_qdqcnt_base);
++EXPORT_SYMBOL_GPL(g_cbm_eqm_base);
++EXPORT_SYMBOL_GPL(g_cbm_dqm_base);
++EXPORT_SYMBOL_GPL(g_cbm_fsqm_base);
++EXPORT_SYMBOL_GPL(g_cbm_dma_desc_base);
++
++/*
++ * Probe re-entry guard.
++ *
++ * The kernel driver-model contract should never double-probe a single
++ * platform_device, but AVM's source pattern uses a global g_cbm_ctrl which
++ * would silently corrupt if a second probe landed (e.g. due to a DT-overlay
++ * race). atomic_inc_return + dev_warn makes the failure mode loud and
++ * observable.
++ */
++static atomic_t cbm_probe_count = ATOMIC_INIT(0);
++
++static struct platform_device *cbm_pdev_cache;
++static int cbm_irqs[1];
++static struct clk *cbm_clk;
++
++/*
++ * The windows are looked up by the name the device tree gives them rather
++ * than by position, so that adding or removing one cannot silently route
++ * every subsequent write to the wrong window.
++ */
++struct cbm_ioremap_slot {
++	const char *name;
++	void __iomem **store;
++};
++
++static const struct cbm_ioremap_slot cbm_ioremap_table[] = {
++	{ "tmu",      &g_cbm_tmu_base },
++	{ "cbm",      &g_cbm_base },
++	{ "qidt",     &g_cbm_qidt_base },
++	{ "qeqcnt",   &g_cbm_qeqcnt_base },
++	{ "qdqcnt",   &g_cbm_qdqcnt_base },
++	{ "eqm",      &g_cbm_eqm_base },
++	{ "dqm",      &g_cbm_dqm_base },
++	{ "fsqm0",    &g_cbm_fsqm_base[0] },
++	{ "fsqm1",    &g_cbm_fsqm_base[1] },
++	{ "dma-desc", &g_cbm_dma_desc_base },
++};
++
++static int cbm_eqm_rx_chan_open(int chan, int cbm_port, u32 buf_type)
++{
++	dma_addr_t desc;
++	int ret;
++
++	ret = ltq_request_dma((u32)chan, "dma2 rx eqm");
++	if (ret < 0) {
++		pr_err("cbm: EQM RX ltq_request_dma(chan=%d) = %d\n",
++		       chan, ret);
++		return ret;
++	}
++
++	desc = (dma_addr_t)(CBM_DMADESC_PHYS_BASE +
++			    CBM_EQM_DMA_DESC(cbm_port, 0, (buf_type >> 1)));
++	ret = ltq_dma_chan_desc_cfg((u32)chan, desc, 2);
++	if (ret < 0) {
++		pr_err("cbm: EQM RX desc_cfg(chan=%d) = %d\n", chan, ret);
++		return ret;
++	}
++
++	ltq_dma_chan_irq_disable((u32)chan);
++
++	ret = ltq_dma_chan_on((u32)chan);
++	if (ret < 0) {
++		pr_err("cbm: EQM RX chan_on(chan=%d) = %d\n", chan, ret);
++		return ret;
++	}
++
++	pr_info("cbm: EQM RX chan %d opened (cbm_port %d, %s)\n",
++		chan, cbm_port,
++		(buf_type & CBM_PORT_F_STANDARD_BUF) ? "std" : "jumbo");
++	return 0;
++}
++
++int cbm_hw_init(struct platform_device *pdev)
++{
++	int ret;
++
++	/*
++	 * The datapath initiators must be strapped big-endian before any CBM
++	 * or GSW reset: the straps are sampled at block reset, so the value
++	 * has to be held across bring-up. SPI_DEBUG_EN (IFMUX_CFG bit 18) is
++	 * cleared as the vendor's own chiptop setup does.
++	 */
++	{
++		void __iomem *ct = ioremap(0x16080000, 0x200);
++
++		if (ct) {
++			u32 pre;
++
++			__raw_writel(0x0000c221, ct + 0x4C);
++			pre = __raw_readl(ct + 0x120);
++			__raw_writel(pre & ~(BIT(22) | BIT(18)), ct + 0x120);
++			iounmap(ct);
++		}
++		pr_info("cbm: chiptop parity applied (ipt_endian, ifmux)\n");
++	}
++
++	(void)pdev;
++
++	init_fsqm(0);
++	init_fsqm(1);
++
++	ret = init_cbm_basic();
++	if (ret) {
++		pr_err("cbm: init_cbm_basic failed: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * (d) post-init markers. The "cbm: " prefix is required so the
++	 * hardware tester's `dmesg | grep '^cbm:'` finds these lines.
++	 */
++	pr_info("cbm: post-init FSQM0 OFSC=0x%08x OFSQ=0x%08x\n",
++		fsqm_r32(0, OFSC),
++		fsqm_r32(0, OFSQ));
++	pr_info("cbm: post-init FSQM1 OFSC=0x%08x OFSQ=0x%08x\n",
++		fsqm_r32(1, OFSC),
++		fsqm_r32(1, OFSQ));
++	pr_info("cbm: post-init SBA_0=0x%08x JBA_0=0x%08x CBM_CTRL=0x%08x\n",
++		(u32)cbm_buf_pool_phys_base(CBM_POOL_STD),
++		(u32)cbm_buf_pool_phys_base(CBM_POOL_JBO),
++		xrx500_cbm_r32(CBM_CTRL));
++
++	{
++		int p;
++
++		for (p = 0; p < 4; p++)
++			init_cbm_eqm_cpu_port(p);
++	}
++
++	{
++		int p;
++
++		for (p = 0; p < 4; p++)
++			init_cbm_eqm_dma_port(p, CBM_PORT_F_STANDARD_BUF);
++		for (p = 0; p < 4; p++)
++			init_cbm_eqm_dma_port(p, CBM_PORT_F_JUMBO_BUF);
++		pr_info("cbm: EQM DMA ports 5-8 seeded (std + jumbo)\n");
++	}
++
++	{
++		int sret = init_cbm_eqm_dma_port(4, CBM_PORT_F_STANDARD_BUF);
++
++		if (sret)
++			pr_err("cbm: init IGP9/TOE port failed: %d\n", sret);
++		sret = init_cbm_eqm_ldma_port();
++		if (sret)
++			pr_err("cbm: init_cbm_eqm_ldma_port failed: %d\n",
++			       sret);
++	}
++
++	return 0;
++}
++
++bool g_cbm_egress_preconfig[CBM_MAX_DP_PORTS];
++
++/*
++ * cbm_dt_dp_ports - collect the datapath port ids this board describes,
++ * ascending, into @out (capacity @max).
++ *
++ * A switch macro's own port number is its datapath port number, and the port
++ * children of the macro nodes are where the board says which of them it
++ * wires. Both macros have to be read: the second one carries a single
++ * front-panel socket on the die variant that wires one, and that socket's
++ * dequeue port needs its egress state written before the controllers are
++ * enabled, exactly as the first macro's ports do. The CPU port owns no
++ * dequeue port of its own and is skipped.
++ *
++ * If no macro is described, no netdev will exist either; fall back to the
++ * first macro's four ports so such a device tree behaves exactly as it did
++ * before this became DT-driven.
++ */
++static int cbm_dt_dp_ports(u32 *out, int max)
++{
++	static const char * const macros[] = {
++		"lantiq,xrx500-gswip",
++		"lantiq,xrx500-gswip-r",
++	};
++	static const u32 lan_only[] = { 2, 3, 4, 5 };
++	struct device_node *sw, *ports, *port;
++	int n = 0, i, j;
++	size_t k;
++
++	for (k = 0; k < ARRAY_SIZE(macros); k++) {
++		sw = of_find_compatible_node(NULL, NULL, macros[k]);
++		if (!sw)
++			continue;
++		if (!of_device_is_available(sw)) {
++			of_node_put(sw);
++			continue;
++		}
++
++		ports = of_get_child_by_name(sw, "ports");
++		of_node_put(sw);
++		if (!ports)
++			continue;
++
++		for_each_available_child_of_node(ports, port) {
++			u32 dp;
++
++			if (n >= max)
++				continue;
++			if (of_property_read_u32(port, "reg", &dp))
++				continue;
++			if (!dp || dp >= CBM_MAX_DP_PORTS)
++				continue;	/* the CPU port, or not one */
++			/* insertion sort; the lists are 4-5 entries long */
++			for (i = 0; i < n && out[i] < dp; i++)
++				;
++			if (i < n && out[i] == dp)
++				continue;	/* duplicate DT entry */
++			for (j = n; j > i; j--)
++				out[j] = out[j - 1];
++			out[i] = dp;
++			n++;
++		}
++		of_node_put(ports);
++	}
++
++	if (n)
++		return n;
++
++	for (i = 0; i < (int)ARRAY_SIZE(lan_only) && i < max; i++)
++		out[i] = lan_only[i];
++	return i;
++}
++
++extern int hdma_port_enable(int port_id);
++extern int hdma_ig192_toe_dma3_reset(void); /* TOE/DMA3 reset parity */
++
++void cbm_program_cpu_qidt(u8 qid_val)
++{
++	unsigned int fl, cls, mpe1, mpe2, enc, dec;
++
++	if (!g_cbm_qidt_base) {
++		pr_err("cbm: cpu_qidt: g_cbm_qidt_base not mapped\n");
++		return;
++	}
++
++	for (fl = 0; fl < 2; fl++)     /* flowid_low dont-care sweep 0..1 */
++	    for (cls = 0; cls < 16; cls++)
++		for (mpe1 = 0; mpe1 < 2; mpe1++)
++			for (mpe2 = 0; mpe2 < 2; mpe2++)
++				for (enc = 0; enc < 2; enc++)
++					for (dec = 0; dec < 2; dec++) {
++						u32 qidt = ((fl << 12) & 0x1000U) |
++							   ((dec << 11) & 0x800U) |
++							   ((enc << 10) & 0x400U) |
++							   ((mpe2 << 9) & 0x200U) |
++							   ((mpe1 << 8) & 0x100U) |
++							   (cls & 0xFU); /* ep=0, flowidh=0 */
++						u32 idx = qidt >> 2;
++						u32 off = (qidt % 4) << 3;
++						u32 mask = 0xFFU << off;
++						u32 v;
++
++						v = __raw_readl(g_cbm_qidt_base + idx * 4);
++						v = (v & ~mask) |
++						    (((u32)qid_val & 0xFFU) << off);
++						__raw_writel(v, g_cbm_qidt_base + idx * 4);
++					}
++	wmb();
++	pr_info("cbm: CPU ingress QIDT ep0->q%u programmed (512 slots, flowidl 0..1)\n",
++		qid_val);
++}
++
++static void cbm_program_ep_qidt(u8 ep, u8 qid_val)
++{
++	unsigned int fh, fl, cls, mpe1, mpe2, enc, dec;
++
++	if (!g_cbm_qidt_base) {
++		pr_err("cbm: ep_qidt: g_cbm_qidt_base not mapped\n");
++		return;
++	}
++
++	for (fh = 0; fh < 2; fh++)
++	 for (fl = 0; fl < 2; fl++)
++	  for (cls = 0; cls < 16; cls++)
++	   for (mpe1 = 0; mpe1 < 2; mpe1++)
++	    for (mpe2 = 0; mpe2 < 2; mpe2++)
++	     for (enc = 0; enc < 2; enc++)
++	      for (dec = 0; dec < 2; dec++) {
++			u32 qidt = ((fh << 13) & 0x2000U) |
++				   ((fl << 12) & 0x1000U) |
++				   ((dec << 11) & 0x800U) |
++				   ((enc << 10) & 0x400U) |
++				   ((mpe2 << 9) & 0x200U) |
++				   ((mpe1 << 8) & 0x100U) |
++				   (((u32)ep << 4) & 0xF0U) |
++				   (cls & 0xFU);
++			u32 idx = qidt >> 2;
++			u32 off = (qidt % 4) << 3;
++			u32 mask = 0xFFU << off;
++			u32 v;
++
++			v = __raw_readl(g_cbm_qidt_base + idx * 4);
++			v = (v & ~mask) | (((u32)qid_val & 0xFFU) << off);
++			__raw_writel(v, g_cbm_qidt_base + idx * 4);
++	      }
++	wmb();
++	pr_info("cbm: QIDT ep%u->q%u programmed (1024 slots, all dims dontcare)\n",
++		ep, qid_val);
++}
++
++/*
++ * Split out of cbm_hw_init so probe can interpose the CPU-TX egress-port +
++ * TMU-egress-path config in between (AVM's configure_ports-before-CTRL=0x11
++ * ordering, cbm.c:5605/5614/5621/5657). 0x11 = EN(bit0) | QEN(bit4), MSEL=0;
++ * direct write (not RMW), matching AVM.
++ */
++static void cbm_enable_controllers(void)
++{
++	cbm_dqm_w32(CBM_DQM_CTRL, 0x11);  /* DQM_EN | DQM_QEN */
++	cbm_eqm_w32(CBM_EQM_CTRL, 0x11);  /* EQM_EN | EQM_QEN */
++	wmb();
++	pr_info("cbm: controllers enabled (EQM_CTRL=0x%08x DQM_CTRL=0x%08x)\n",
++		cbm_eqm_r32(CBM_EQM_CTRL), cbm_dqm_r32(CBM_DQM_CTRL));
++
++	{
++		u32 v = cbm_eqm_r32(CBM_EQM_CTRL);
++		int i;
++
++		v |= BIT(8) | BIT(6) | (3u << 9);
++		cbm_eqm_w32(CBM_EQM_CTRL, v);
++		for (i = 0; i <= 15; i++)
++			cbm_eqm_w32(CBM_EQM_CPU_PORT(i, dcntr), 0x10u & 0x3fu);
++		wmb();
++		pr_info("cbm: EQM enqueue-delay enabled (EQM_CTRL=0x%08x want 0x751; DCNTR[0]=0x%08x want 0x10)\n",
++			cbm_eqm_r32(CBM_EQM_CTRL),
++			cbm_eqm_r32(CBM_EQM_CPU_PORT(0, dcntr)));
++	}
++}
++
++/* cbm_xrx500_probe - DT-bind entry point. */
++static int cbm_xrx500_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	void __iomem *base;
++	int irqs[1];
++	int i;
++	int irq;
++	int ret;
++
++	/*
++	 * (a) Re-entry guard. atomic_inc_return returns the new value so the
++	 * first probe sees 1 (passes), the second sees 2 (rejected).
++	 */
++	if (atomic_inc_return(&cbm_probe_count) > 1) {
++		dev_warn(dev, "cbm: duplicate probe rejected\n");
++		return -EBUSY;
++	}
++
++	/* (b) Map every named MMIO window. */
++	for (i = 0; i < (int)ARRAY_SIZE(cbm_ioremap_table); i++) {
++		res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
++						   cbm_ioremap_table[i].name);
++		if (!res) {
++			dev_err(dev, "cbm: no window named %s\n",
++				cbm_ioremap_table[i].name);
++			ret = -ENOENT;
++			goto err;
++		}
++		base = devm_ioremap_resource(dev, res);
++		if (IS_ERR(base)) {
++			dev_err(dev, "cbm: ioremap %s failed: %ld\n",
++				cbm_ioremap_table[i].name, PTR_ERR(base));
++			ret = PTR_ERR(base);
++			goto err;
++		}
++		*cbm_ioremap_table[i].store = base;
++	}
++
++	/* (c) Collect the interrupt line the manager raises on. */
++	irq = platform_get_irq(pdev, 0);
++	if (irq < 0) {
++		dev_err(dev, "cbm: platform_get_irq 0 failed: %d\n", irq);
++		ret = -EINVAL;
++		goto err;
++	}
++	irqs[0] = irq;
++	cbm_irqs[0] = irq;
++
++	/*
++	 * (d) The gate. Without it the common clock framework switches the
++	 * datapath off again as an unused clock during late boot.
++	 */
++	cbm_clk = devm_clk_get_optional(dev, "cbm");
++	if (IS_ERR(cbm_clk)) {
++		ret = PTR_ERR(cbm_clk);
++		dev_err(dev, "cbm: clk_get failed: %d\n", ret);
++		cbm_clk = NULL;
++		goto err;
++	}
++	if (cbm_clk) {
++		ret = clk_prepare_enable(cbm_clk);
++		if (ret) {
++			dev_err(dev,
++				"cbm: clk_prepare_enable failed: %d\n",
++				ret);
++			cbm_clk = NULL;
++			goto err;
++		}
++	}
++
++	ret = cbm_buf_init_pools(dev);
++	if (ret) {
++		dev_err(dev, "cbm: cbm_buf_init_pools failed: %d\n", ret);
++		goto err_clk;
++	}
++
++	cbm_pdev_cache = pdev;
++
++	hdma_ig192_toe_dma3_reset();
++
++	/* (g) Bring up FSQM + CBM basic. */
++	ret = cbm_hw_init(pdev);
++	if (ret) {
++		dev_err(dev, "cbm: cbm_hw_init failed: %d\n", ret);
++		goto err_clk;
++	}
++
++	dev_dbg(dev, "cbm: interrupt line %d collected\n", irqs[0]);
++
++	/*
++	 * Failure here unwinds through err_clk because the carve allocator's
++	 * pool storage is devm-managed and releases automatically when the
++	 * device unbinds.
++	 */
++	ret = tmu_init();
++	if (ret) {
++		dev_err(dev, "cbm: tmu_init failed: %d\n", ret);
++		goto err_clk;
++	}
++
++	if (g_cbm_qidt_base) {
++		u32 qi;
++
++		for (qi = 0; qi < 0x1000; qi++)
++			__raw_writel(0xFFFFFFFFU, g_cbm_qidt_base + qi * 4);
++		wmb();
++		pr_info("cbm: QIDT whole-table drop-fill done (0x1000 words = qid 255)\n");
++	} else {
++		pr_err("cbm: QIDT drop-fill skipped: g_cbm_qidt_base not mapped\n");
++	}
++
++	if (cbm_configure_dqm_cpu_ports() != CBM_SUCCESS)
++		pr_err("cbm: DQM-CPU configure_ports walk FAILED\n");
++
++	/*
++	 * AVM cbm.c:5753-5759, whose comment states the reason verbatim:
++	 *
++	 *   "Initialise the DQ port 0 as the cbm buffer free API uses DQ port 0
++	 *    for freeing, but do not initialise the TMU queue or look up table
++	 *    for this. The CPU traffic id redirected to DQ2 via device tree
++	 *    entry"
++	 *
++	 * The config table walked above covers ports 2/1/3 only, so port 0 was
++	 * never configured at all — yet it is a buffer-return port: the RX
++	 * tasklet (cbm_intr.c) returns every consumed segment on the running
++	 * CPU's port. A ptr_rtn write into an unconfigured port does not fault and
++	 * does not log — it silently drops the segment, so the FSQM free-list
++	 * count (fsqm0 OFSC) walks down one per event until the std pool runs
++	 * dry and RX starves. That misfires even under nosmp, where every
++	 * rollback targets port 0.
++	 *
++	 * Idempotent for ports 1/2/3: they already carry the same cfg from
++	 * conf_dqm_cpu_port, and init_cbm_dqm_cpu_port re-reads num_desc from
++	 * the registry, so their dptr is rewritten with the value it already
++	 * has while port 0 (num_desc 0, no config row) keeps its reset dptr.
++	 * Placed exactly where AVM places it: after configure_ports, before the
++	 * controllers are enabled.
++	 *
++	 * Bound to the CPUs online at probe, as AVM binds it. A CPU brought up
++	 * later would get no port here and would then return segments through
++	 * an unconfigured one — but nothing in this driver follows CPU hotplug,
++	 * and the platform releases all four VPEs long before the CBM binds.
++	 */
++	for_each_online_cpu(i)
++		init_cbm_dqm_cpu_port(i);
++
++	cbm_program_ep_qidt(7, 35);
++
++	/*
++	 * AVM's configure_ports() walks all 17 compiled-in rows at probe
++	 * (cbm_config.c), so every DMA egress port is preconfigured before
++	 * the controllers come up. The per-port numbers come from
++	 * cbm_dp_egress_res_get() (the ported epg_lookup_table + cbm_config.c
++	 * rows) rather than the dp+5 / dp+15 arithmetic they used to be
++	 * computed with — that arithmetic is a LAN coincidence and does not
++	 * extend.
++	 *
++	 * Which ports to walk is a board fact, taken from the switch macro
++	 * nodes' port children rather than a literal 2..5. A board with a WAN
++	 * port needs dp 15 preconfigured on the same before-enable side of this
++	 * boundary as its LAN ports, and a board without one must not have
++	 * egress state written for a port it does not have.
++	 */
++	{
++		u32 dp_ports[CBM_MAX_DP_PORTS];
++		int n = cbm_dt_dp_ports(dp_ports, ARRAY_SIZE(dp_ports));
++		int i;
++
++		for (i = 0; i < n; i++) {
++			struct cbm_dp_egress_res res;
++			u32 dp = dp_ports[i];
++			u16 deq, qid, sbid;
++
++			if (cbm_dp_egress_res_get(dp, &res)) {
++				pr_err("cbm: dp%u has no egress resources; skipping preconfig\n",
++				       dp);
++				continue;
++			}
++			deq  = (u16)res.deq_port;
++			qid  = (u16)res.tmu_queue;
++			sbid = (u16)(res.tmu_queue - SBID_START);
++
++			init_cbm_dqm_dma_port((int)deq);
++			tmu_create_flat_egress_path(1, deq, sbid, qid, 1);
++			g_cbm_egress_preconfig[dp] = true;
++			pr_info("cbm: dp%u egress preconfigured at probe (deq%u/q%u/sbid%u) before controller enable\n",
++				dp, deq, qid, sbid);
++		}
++	}
++
++	cbm_enable_controllers();
++
++	eqm_intr_ctrl(0);
++	dqm_intr_ctrl(0);
++
++	{
++		u32 dp_ports[CBM_MAX_DP_PORTS];
++		int n = cbm_dt_dp_ports(dp_ports, ARRAY_SIZE(dp_ports));
++		int i;
++
++		for (i = 0; i < n; i++) {
++			struct cbm_dp_egress_res res;
++			int hret;
++
++			if (cbm_dp_egress_res_get(dp_ports[i], &res))
++				continue;
++
++			hret = hdma_port_enable((int)res.deq_port);
++			if (hret)
++				dev_warn(dev, "cbm: probe-time hdma_port_enable(%u) = %d\n",
++					 res.deq_port, hret);
++			else
++				pr_info("cbm: DMA%uTX ch%u opened at probe-end for deq %u (AVM order)\n",
++					res.dma_ctrl, res.dma_chan, res.deq_port);
++		}
++	}
++
++	cbm_eqm_rx_chan_open(DMA2RX_CBMP5_CLASS14, 5, CBM_PORT_F_STANDARD_BUF);
++	cbm_eqm_rx_chan_open(DMA2RX_CBMP6_CLASS15, 6, CBM_PORT_F_STANDARD_BUF);
++	cbm_eqm_rx_chan_open(DMA2RX_CBMP5_CLASS30_JUMBO, 5, CBM_PORT_F_JUMBO_BUF);
++	cbm_eqm_rx_chan_open(DMA2RX_CBMP6_CLASS31_JUMBO, 6, CBM_PORT_F_JUMBO_BUF);
++
++	cbm_eqm_rx_chan_open(DMA1RX_TMU_CLASS0, 7, CBM_PORT_F_STANDARD_BUF);
++	cbm_eqm_rx_chan_open(DMA1RX_CBM_P8_CLASS5, 8, CBM_PORT_F_STANDARD_BUF);
++
++	cbm_eqm_rx_chan_open(DMA1RX_CBM_P7_CLASS6_JUMBO, 7, CBM_PORT_F_JUMBO_BUF);
++	cbm_eqm_rx_chan_open(DMA1RX_CBM_P8_CLASS11_JUMBO, 8, CBM_PORT_F_JUMBO_BUF);
++
++	/*
++	 * A processor's end of a switch macro's datapath owns no window of its
++	 * own and is described as a child of this node, so the children get
++	 * their devices once the manager is up.
++	 */
++	ret = devm_of_platform_populate(dev);
++	if (ret) {
++		dev_err(dev, "cbm: cannot populate the conduits: %d\n", ret);
++		goto err_clk;
++	}
++
++	dev_info(dev,
++		 "%s: CBM XRX500 ready (reserved-memory pools 18MiB std / 8MiB jbo)\n",
++		 dev_name(dev));
++	return 0;
++
++err_clk:
++	if (cbm_clk) {
++		clk_disable_unprepare(cbm_clk);
++		cbm_clk = NULL;
++	}
++err:
++	cbm_pdev_cache = NULL;
++	atomic_dec(&cbm_probe_count);
++	return ret;
++}
++
++/*
++ * cbm_xrx500_remove - tear down in reverse.
++ *
++ * This function only needs to undo what is NOT devm-tracked: -
++ * clk_disable_unprepare (devm undoes _get, not _enable) - atomic_dec the
++ * probe guard - clear the g_cbm_buff buffer pointers so a re-bind sees them
++ * empty
++ */
++static void cbm_xrx500_remove(struct platform_device *pdev)
++{
++	(void)pdev;
++
++	g_cbm_buff.jbo_buf_base = NULL;
++	g_cbm_buff.jbo_buf_addr = NULL;
++	g_cbm_buff.std_buf_base = NULL;
++	g_cbm_buff.std_buf_addr = NULL;
++
++	if (cbm_clk) {
++		clk_disable_unprepare(cbm_clk);
++		cbm_clk = NULL;
++	}
++	cbm_pdev_cache = NULL;
++	atomic_dec(&cbm_probe_count);
++}
++
++/* of_match_table — AVM cqm/grx500/cbm.c:5480-5483. */
++static const struct of_device_id cbm_xrx500_match[] = {
++	{ .compatible = "lantiq,xrx500-cbm" },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(of, cbm_xrx500_match);
++
++static struct platform_driver cbm_xrx500_driver = {
++	.probe  = cbm_xrx500_probe,
++	.remove = cbm_xrx500_remove,
++	/*
++	 * The name is the driver's, not the device's: the conduit driver
++	 * binds this node's children and already answers to the device's own
++	 * name, and two platform drivers cannot share one.
++	 */
++	.driver = {
++		.name           = "xrx500-buffer-manager",
++		.of_match_table = cbm_xrx500_match,
++	},
++};
++module_platform_driver(cbm_xrx500_driver);
++
++/*
++ * Port of the vendor's cbm_intr_mapping_init (cbm.c:1208-1225). The
++ * ENABLE_LL_DEBUG and CONFIG_CBM_LS_ENABLE variants are not built by default
++ * and are not ported.
++ */
++int cbm_intr_mapping_init(void)
++{
++	/* Lines 4 to 7 carried the load spreader; nothing raises on them now. */
++	static const u8 masked_lines[] = { 4, 5, 6, 7 };
++	/* egp_irnen-zero target lines per 0, 4, 5, 6. */
++	static const u8 egp_zero_lines[] = { 0, 4, 5, 6 };
++	size_t i;
++	u32 actual;
++
++	if (!g_cbm_base) {
++		pr_err("cbm: cbm_intr_mapping_init: g_cbm_base NULL\n");
++		return -ENODEV;
++	}
++
++	/*
++	 * These lines are level-sourced. Masking them at the source is what
++	 * makes it safe for no handler to be registered for them.
++	 */
++	for (i = 0; i < ARRAY_SIZE(masked_lines); i++)
++		__raw_writel(0U, g_cbm_base + CBM_INT_LINE(masked_lines[i],
++							   cbm_irnen));
++
++	for (i = 0; i < ARRAY_SIZE(egp_zero_lines); i++)
++		__raw_writel(0U, g_cbm_base + CBM_INT_LINE(egp_zero_lines[i],
++							    egp_irnen));
++
++	for (i = 0; i < ARRAY_SIZE(masked_lines); i++) {
++		actual = __raw_readl(g_cbm_base +
++				     CBM_INT_LINE(masked_lines[i], cbm_irnen));
++		WARN_ONCE(actual != 0U,
++			  "cbm: CBM_INT_LINE(%u, cbm_irnen) readback 0x%08x != expected 0x00000000\n",
++			  (unsigned int)masked_lines[i], actual);
++	}
++	for (i = 0; i < ARRAY_SIZE(egp_zero_lines); i++) {
++		actual = __raw_readl(g_cbm_base +
++				     CBM_INT_LINE(egp_zero_lines[i], egp_irnen));
++		WARN_ONCE(actual != 0U,
++			  "cbm: CBM_INT_LINE(%u, egp_irnen) readback 0x%08x != expected 0x00000000\n",
++			  (unsigned int)egp_zero_lines[i], actual);
++	}
++
++	return 0;
++}
++
++/*
++ * cbm_interrupt_init — claim the manager's interrupt line.
++ *
++ * The device tree lists five. Four of them belonged to the load spreader,
++ * which this datapath does not run and whose enables are masked in
++ * cbm_intr_mapping_init, so only the first is claimed. A failure is
++ * propagated as the errno devm_request_irq returned.
++ */
++int cbm_interrupt_init(struct platform_device *pdev, int *irqs)
++{
++	if (!pdev || !irqs) {
++		pr_err("cbm: cbm_interrupt_init: pdev=%p irqs=%p\n",
++		       pdev, irqs);
++		return -EINVAL;
++	}
++
++	return devm_request_irq(&pdev->dev, irqs[0], cbm_isr_0, IRQF_SHARED,
++				"cbm_isr_0", pdev);
++}
++
++/*
++ * init_cbm_basic — port of AVM cqm/grx500/cbm.c:1231-1256.
++ *
++ *   (1) SBA_0 = __pa(std_buf_addr)                    // physical
++ *   (2) JBA_0 = __pa(jbo_buf_addr)                    // physical
++ *   (3) SBA_1 = CBM_IOCU_ADDR(__pa(std_buf_addr))     // KSEG1 IOCU alias
++ *   (4) JBA_1 = CBM_IOCU_ADDR(__pa(jbo_buf_addr))     // KSEG1 IOCU alias
++ *   (5) jsel = (jbo_frm_size == 0x2000) ? 0 : 1       // AVM cbm.c:1242
++ *   (6) RMW CBM_CTRL[17] = jsel                        // preserve other bits
++ *   (7) QEQCNT 256 u32 = 0                             // cbm_dw_memset 0x400 B
++ *   (8) QDQCNT 256 u32 = 0                             // cbm_dw_memset 0x400 B
++ *   (9) cbm_intr_mapping_init()                        // per-line masks
++ *  (10) cbm_interrupt_init(pdev, irqs)                 // devm_request_irq
++ *
++ * Step (7)/(8) cbm_dw_memset target: QEQCNT and QDQCNT live in their OWN
++ * ioremap'd windows (g_cbm_qeqcnt_base / g_cbm_qdqcnt_base) — NOT within
++ * g_cbm_base. The 'BASE' suffix in this file refers to offset-zero within
++ * those windows.").
++ *
++ * Step (10) chains via the file-static cbm_pdev_cache / cbm_irqs[]
++ * cookies populated by cbm_xrx500_probe. init_cbm_basic keeps the AVM
++ * `void` signature (cbm.h declares it as `int init_cbm_basic(void)`),
++ * matching AVM cbm.c:1231 where init_cbm_basic also reaches the IRQ
++ * array via file-static g_cbm_irq[].
++ *
++ * Returns 0 on success, negative errno on init failure (propagated
++ * from cbm_interrupt_init).
++ */
++int init_cbm_basic(void)
++{
++	phys_addr_t std_pa;
++	phys_addr_t jbo_pa;
++	int jsel;
++	int ret;
++
++	if (!g_cbm_base) {
++		pr_err("cbm: init_cbm_basic: g_cbm_base NULL\n");
++		return -ENODEV;
++	}
++	if (!g_cbm_qeqcnt_base || !g_cbm_qdqcnt_base) {
++		pr_err("cbm: init_cbm_basic: QEQCNT/QDQCNT base NULL\n");
++		return -ENODEV;
++	}
++	if (!g_cbm_buff.std_buf_addr || !g_cbm_buff.jbo_buf_addr) {
++		pr_err("cbm: init_cbm_basic: std/jbo buffer pool not allocated\n");
++		return -ENODEV;
++	}
++	if (!cbm_pdev_cache) {
++		pr_err("cbm: init_cbm_basic: pdev cache empty (probe order bug)\n");
++		return -ENODEV;
++	}
++
++	std_pa = cbm_buf_pool_phys_base(CBM_POOL_STD);
++	jbo_pa = cbm_buf_pool_phys_base(CBM_POOL_JBO);
++
++	if (!std_pa || !jbo_pa) {
++		pr_err("cbm: init_cbm_basic: pool phys base zero (std=%pa jbo=%pa)\n",
++		       &std_pa, &jbo_pa);
++		return -ENODEV;
++	}
++
++	/* (a) AVM cbm.c:1236-1237 pr_info markers (entry trace). */
++	pr_info("cbm: init_cbm_basic: PHY ADDR STD 0x%llx\n",
++		(unsigned long long)std_pa);
++	pr_info("cbm: init_cbm_basic: PHY ADDR JBO 0x%llx\n",
++		(unsigned long long)jbo_pa);
++
++	/* (1)-(4) Buffer pool base addresses. ORDER IS LOAD-BEARING:
++	 * SBA_0 / JBA_0 first (physical), then SBA_1 / JBA_1 (IOCU
++	 * alias). The silicon descriptor engine reads all four during
++	 * DMA setup; any reorder against the jsel write
++	 * below would expose a window where the engine could observe
++	 * inconsistent (SBA_*, JSEL) state.
++	 */
++	__raw_writel((u32)std_pa, g_cbm_base + CBM_SBA_0);
++	__raw_writel((u32)jbo_pa, g_cbm_base + CBM_JBA_0);
++	__raw_writel((u32)CBM_IOCU_ADDR(std_pa),
++		     g_cbm_base + CBM_SBA_1);
++	__raw_writel((u32)CBM_IOCU_ADDR(jbo_pa),
++		     g_cbm_base + CBM_JBA_1);
++
++	/* (5) jsel — AVM cbm.c:1242 verbatim. */
++	jsel = (g_cbm_buff.jbo_frm_size == 0x2000) ? 0 : 1;
++
++	/* (6) RMW CBM_CTRL[17] = jsel — cbm_set_val preserves the other
++	 * 31 bits of the control register (read-modify-write semantics
++	 * verbatim from AVM cqm/cqm_common.h:203-210).
++	 */
++	cbm_set_val(g_cbm_base + CBM_CTRL, (u32)jsel, JSEL_MASK, JSEL_POS);
++
++	/* (7)/(8) Zero the QEQCNT/QDQCNT counter rings (256 u32 = 0x400
++	 * bytes each). The (u32 __force *) cast bridges void __iomem *
++	 * to cbm_dw_memset's u32 * param — cbm_dw_memset uses
++	 * __raw_writel internally so MMIO semantics are preserved.
++	 */
++	cbm_dw_memset((u32 __force *)g_cbm_qeqcnt_base, 0, CBM_QEQCNT_SIZE);
++	cbm_dw_memset((u32 __force *)g_cbm_qdqcnt_base, 0, CBM_QDQCNT_SIZE);
++
++	/* (9) Per-line cbm_irnen / egp_irnen masks (AVM cbm.c:1208-1225). */
++	ret = cbm_intr_mapping_init();
++	if (ret) {
++		pr_err("cbm: cbm_intr_mapping_init failed: %d\n", ret);
++		return ret;
++	}
++
++	ret = cbm_interrupt_init(cbm_pdev_cache, cbm_irqs);
++	if (ret) {
++		pr_err("cbm: cbm_interrupt_init failed: %d\n", ret);
++		return ret;
++	}
++
++	pr_info("cbm: init basic CBM successfully (jsel=%d)\n", jsel);
++	return 0;
++}

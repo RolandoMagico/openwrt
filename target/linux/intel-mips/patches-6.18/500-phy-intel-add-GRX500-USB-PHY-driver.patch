@@ -1,0 +1,425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 22:22:52 +0200
+Subject: phy: intel: add GRX500 USB PHY driver
+
+The xRX500 pairs each of its two Synopsys DWC3 controllers with a PHY
+that has a gate clock, a reset line, an optional VBUS supply and one
+field in the chip-top syscon. Nothing upstream covers it:
+phy-intel-lgm-combo.c is an x86 SerDes with no USB mode at all,
+phy-intel-keembay-usb.c is unrelated arm64 silicon, and
+phy-lantiq-rcu-usb2.c stops at xrx300 and is unreachable from
+INTEL_MIPS anyway, being gated on SOC_TYPE_XWAY.
+
+That last one is still the right template, because the interesting
+part of this hardware is the same on both SoC generations. The DWC3
+core is little endian and this CPU is not, so the byte order of the
+core's AXI master ports is selected outside the core, in a chip-top
+register: bit 10 for the host-mode port, bit 9 for the device-mode
+port. phy-lantiq-rcu-usb2.c calls those same two bit positions
+host_endianness and slave_endianness, sets them from its phy .init,
+and describes it as "Select DMA endianness (Host-endian: big-endian)".
+This driver does the same thing at the same place, which is why the
+port needs no dwc3 glue driver: with the endianness write owned by the
+PHY, nothing SoC-specific is left for a glue layer to do, and the dwc3
+core binds snps,dwc3 straight from DT.
+
+The vendor arranges it differently. AVM 4.9 splits the work between
+drivers/usb/dwc3/dwc3-grx500.c, a 161-line glue whose entire
+SoC-specific content is that one register write followed by
+of_platform_populate(), and drivers/phy/phy-grx500-usb.c, which owns
+the clock, reset, regulator and polarity overrides. Merging the two
+loses nothing: the glue's only other behaviour is an
+of_alias_get_id(node, "usb") that fails probe when the node is not in
+/aliases and then uses the id for nothing but an error string.
+
+The ordering this changes is worth stating plainly, because hardware
+will be the first thing to test it. The vendor's write lands in glue
+probe, before the dwc3 child node is even created. Ours lands in
+phy .init, which dwc3_core_init() calls at drivers/usb/dwc3/core.c
+before dwc3_core_soft_reset() and well before dwc3_event_buffers_setup(),
+so it precedes all DMA -- which is what bit 10 governs. It does not
+precede everything: dwc3_core_probe() reads GSNPSID through
+dwc3_core_is_valid() before dwc3_core_init() runs at all. That read
+goes through the AXI slave port, which neither bit is documented to
+affect, and this board runs dr_mode = "host", so bit 9 governs a data
+path it never uses. If that reasoning is wrong the symptom is precise
+and immediate -- "this is not a DesignWare USB3 DRD Core" -- and the
+fix is to put the write back in a dwc3-of-simple-shaped glue.
+
+The same write is also made once from probe. It is idempotent, so the
+cost is a register access, and it closes a gap that .init alone leaves
+open: the clock, the reset and VBUS all live in .power_on, and
+phy_power_off() followed by phy_power_on() does not pass through .init.
+dwc3 pairs init/exit around power_on/power_off, so nothing exercises
+that today -- but a second consumer, or an .exit added to this driver
+later, would re-assert and re-release the PHY reset with no .init left
+to put the bit back.
+
+Both 100 ms delays in power_on and the one after the endianness write
+are the vendor's, unconditional and unexplained there. There is no
+hardware reference manual for this SoC and no vendor support, so they
+are reproduced rather than tuned; the AVM kernel is the only one known
+to bring this block up.
+
+Two things the vendor driver has are deliberately absent. Over-current
+handling -- an IRQ, a workqueue and a pair of pinctrl states that cut
+and restore port power -- is dead code on this hardware: the pads that
+feed over-current detection are pin 7 for usb0 and pin 2 for usb1,
+which on the FRITZ!Box 7560 are the DECT and WLAN buttons, which is
+why the vendor board files delete all four of their own pinctrl_usb*
+nodes and strip pinctrl-names/-0/-1 off both PHY nodes. And VBUS is a
+proper optional regulator rather than the vendor's mandatory one:
+devm_regulator_get() would answer an absent supply with the dummy
+regulator, and a silently dummied VBUS is indistinguishable from
+working hardware until nothing enumerates.
+
+select RESET_LANTIQ is not redundant. It has no prompt outside
+COMPILE_TEST and defaults to SOC_TYPE_XWAY, which INTEL_MIPS does not
+select, so on this platform nothing reaches it unless a driver selects
+it. A PHY driver that takes a reset control should not depend on an
+unrelated driver being enabled to get a reset driver.
+
+None of the C is the vendor's, but everything that makes it work is:
+the two chip-top bit positions, the polarity override offsets and their
+bit numbers, the three delays and the clock-then-reset-then-VBUS order
+were all read out of the two AVM files named above and reproduced value
+for value, and with no reference manual for this SoC they could not have
+been arrived at any other way. The file header says so, and carries both
+the Intel copyright that comes with those numbers and a line for the
+port.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/phy/intel/Kconfig b/drivers/phy/intel/Kconfig
+index 3dd146bc4ddd..e8ce2311b3ed 100644
+--- a/drivers/phy/intel/Kconfig
++++ b/drivers/phy/intel/Kconfig
+@@ -19,6 +19,25 @@ config PHY_INTEL_GRX500_PCIE
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called phy-intel-grx500-pcie.ko.
+ 
++config PHY_INTEL_GRX500_USB
++	tristate "Intel GRX500 USB PHY driver"
++	depends on INTEL_MIPS || COMPILE_TEST
++	depends on OF && HAS_IOMEM
++	select GENERIC_PHY
++	select MFD_SYSCON
++	select RESET_CONTROLLER
++	select RESET_LANTIQ
++	help
++	  Enable this to support the USB PHYs that feed the on-chip DWC3
++	  controllers of the Intel MIPS (xRX500/GRX500) SoC family. Besides
++	  its own gate clock, reset line and optional VBUS supply the driver
++	  owns the AXI endianness field its controller needs in the chip-top
++	  syscon, which on this big-endian SoC has to be set before the
++	  controller does any DMA.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called phy-intel-grx500-usb.ko.
++
+ config PHY_INTEL_KEEMBAY_EMMC
+ 	tristate "Intel Keem Bay EMMC PHY driver"
+ 	depends on ARCH_KEEMBAY || COMPILE_TEST
+diff --git a/drivers/phy/intel/Makefile b/drivers/phy/intel/Makefile
+index 1093ec293610..e1682e9ae3bc 100644
+--- a/drivers/phy/intel/Makefile
++++ b/drivers/phy/intel/Makefile
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_PHY_INTEL_GRX500_PCIE)	+= phy-intel-grx500-pcie.o
++obj-$(CONFIG_PHY_INTEL_GRX500_USB)	+= phy-intel-grx500-usb.o
+ obj-$(CONFIG_PHY_INTEL_KEEMBAY_EMMC)	+= phy-intel-keembay-emmc.o
+ obj-$(CONFIG_PHY_INTEL_KEEMBAY_USB)	+= phy-intel-keembay-usb.o
+ obj-$(CONFIG_PHY_INTEL_LGM_COMBO)	+= phy-intel-lgm-combo.o
+diff --git a/drivers/phy/intel/phy-intel-grx500-usb.c b/drivers/phy/intel/phy-intel-grx500-usb.c
+new file mode 100644
+index 000000000000..2a845f28b7d5
+--- /dev/null
++++ b/drivers/phy/intel/phy-intel-grx500-usb.c
+@@ -0,0 +1,284 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2016-2017 Intel Corporation.
++ * Copyright (C) 2026 Grische <github@grische.xyz>
++ *
++ * USB PHY driver for the Intel GRX500 (xRX500) SoC family: the chip-top AXI
++ * endianness word, the lane polarity overrides and the clock, reset and VBUS
++ * ordering the controller needs.
++ *
++ * The register offsets, bit positions and settling delays are reproduced from
++ * the vendor BSP (drivers/phy/phy-grx500-usb.c and
++ * drivers/usb/dwc3/dwc3-grx500.c); there is no hardware reference manual for
++ * this SoC.
++ */
++
++#include <linux/bitops.h>
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++#include <linux/regulator/consumer.h>
++#include <linux/reset.h>
++
++/*
++ * Per-controller AXI configuration word in the chip-top syscon. It selects
++ * the byte order the controller presents to the AXI fabric, which is why this
++ * PHY driver exists at all: nothing else owns that register.
++ */
++#define USB_CFG_DEV_ENDIAN		BIT(9)
++#define USB_CFG_HOST_ENDIAN		BIT(10)
++
++/*
++ * PHY PDI registers, relative to the PHY's own window. These two overrides
++ * are the only registers in it this driver ever touches; the vendor driver
++ * has no calibration, trim, impedance or squelch programming either.
++ */
++#define USB_PHY_TX_OVRD			0x4000
++#define  USB_PHY_TX_INVERT		BIT(3)
++#define USB_PHY_RX_OVRD			0x4014
++#define  USB_PHY_RX_INVERT		BIT(1)
++
++/*
++ * Three settling delays, all of them the vendor's, all of them
++ * unconditional and undocumented there: one after the endian write, one
++ * between enabling the gate clock and releasing the PHY from reset, and one
++ * between that and switching VBUS on. Nothing in the AVM 4.9 sources says
++ * what is being waited for, and there is no hardware reference manual for
++ * this SoC to check against, so they are reproduced as-is rather than
++ * guessed at. This is the only kernel that is known to bring the block up.
++ */
++#define USB_PHY_ENDIAN_SETTLE_MS	100
++#define USB_PHY_CLK_SETTLE_MS		100
++#define USB_PHY_RESET_SETTLE_MS		100
++
++struct intel_usbphy {
++	struct device *dev;
++	void __iomem *base;
++	struct regmap *chiptop;
++	unsigned int cfg_offset;
++	struct clk *clk;
++	struct reset_control *rst;
++	struct regulator *vbus;
++	struct phy *phy;
++	bool invert_tx;
++	bool invert_rx;
++};
++
++static void intel_usbphy_set_bit(struct intel_usbphy *priv, unsigned int reg,
++				 u32 bit)
++{
++	u32 val;
++
++	val = readl(priv->base + reg);
++	val |= bit;
++	writel(val, priv->base + reg);
++}
++
++/*
++ * Host port big endian, device port little. Idempotent, and called from
++ * two places on purpose -- see the comment at the probe-side call.
++ */
++static int intel_usbphy_set_endian(struct intel_usbphy *priv)
++{
++	int ret;
++
++	ret = regmap_update_bits(priv->chiptop, priv->cfg_offset,
++				 USB_CFG_HOST_ENDIAN | USB_CFG_DEV_ENDIAN,
++				 USB_CFG_HOST_ENDIAN);
++	if (ret)
++		dev_err(priv->dev, "failed to select the AXI byte order\n");
++
++	return ret;
++}
++
++static int intel_usbphy_init(struct phy *phy)
++{
++	struct intel_usbphy *priv = phy_get_drvdata(phy);
++	int ret;
++
++	ret = intel_usbphy_set_endian(priv);
++	if (ret)
++		return ret;
++
++	msleep(USB_PHY_ENDIAN_SETTLE_MS);
++
++	/*
++	 * Lane polarity overrides, for boards that route the differential
++	 * pair inverted. Absent properties leave the hardware default.
++	 */
++	if (priv->invert_tx)
++		intel_usbphy_set_bit(priv, USB_PHY_TX_OVRD, USB_PHY_TX_INVERT);
++
++	if (priv->invert_rx)
++		intel_usbphy_set_bit(priv, USB_PHY_RX_OVRD, USB_PHY_RX_INVERT);
++
++	return 0;
++}
++
++static int intel_usbphy_power_on(struct phy *phy)
++{
++	struct intel_usbphy *priv = phy_get_drvdata(phy);
++	int ret;
++
++	ret = clk_prepare_enable(priv->clk);
++	if (ret) {
++		dev_err(priv->dev, "failed to enable the PHY gate clock\n");
++		return ret;
++	}
++
++	msleep(USB_PHY_CLK_SETTLE_MS);
++
++	ret = reset_control_deassert(priv->rst);
++	if (ret) {
++		dev_err(priv->dev, "failed to release the PHY reset\n");
++		goto err_disable_clk;
++	}
++
++	msleep(USB_PHY_RESET_SETTLE_MS);
++
++	if (priv->vbus) {
++		ret = regulator_enable(priv->vbus);
++		if (ret) {
++			dev_err(priv->dev, "failed to switch VBUS on\n");
++			goto err_assert_reset;
++		}
++	}
++
++	return 0;
++
++err_assert_reset:
++	reset_control_assert(priv->rst);
++err_disable_clk:
++	clk_disable_unprepare(priv->clk);
++
++	return ret;
++}
++
++static int intel_usbphy_power_off(struct phy *phy)
++{
++	struct intel_usbphy *priv = phy_get_drvdata(phy);
++
++	if (priv->vbus)
++		regulator_disable(priv->vbus);
++
++	reset_control_assert(priv->rst);
++	clk_disable_unprepare(priv->clk);
++
++	return 0;
++}
++
++static const struct phy_ops intel_usbphy_ops = {
++	.init = intel_usbphy_init,
++	.power_on = intel_usbphy_power_on,
++	.power_off = intel_usbphy_power_off,
++	.owner = THIS_MODULE,
++};
++
++static int intel_usbphy_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct phy_provider *phy_provider;
++	struct intel_usbphy *priv;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = dev;
++
++	priv->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(priv->base))
++		return dev_err_probe(dev, PTR_ERR(priv->base),
++				     "failed to map the PHY registers\n");
++
++	priv->chiptop = syscon_regmap_lookup_by_phandle(np, "intel,syscon");
++	if (IS_ERR(priv->chiptop))
++		return dev_err_probe(dev, PTR_ERR(priv->chiptop),
++				     "failed to get the CHIPTOP syscon\n");
++
++	ret = device_property_read_u32(dev, "intel,syscon-offset",
++				       &priv->cfg_offset);
++	if (ret)
++		return dev_err_probe(dev, ret, "missing intel,syscon-offset\n");
++
++	priv->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(priv->clk))
++		return dev_err_probe(dev, PTR_ERR(priv->clk),
++				     "failed to get the PHY gate clock\n");
++
++	priv->rst = devm_reset_control_get_exclusive(dev, "phy");
++	if (IS_ERR(priv->rst))
++		return dev_err_probe(dev, PTR_ERR(priv->rst),
++				     "failed to get the PHY reset\n");
++
++	/*
++	 * VBUS is optional: port power is not software-controlled on every
++	 * board.
++	 */
++	priv->vbus = devm_regulator_get_optional(dev, "vbus");
++	if (IS_ERR(priv->vbus)) {
++		if (PTR_ERR(priv->vbus) != -ENODEV)
++			return dev_err_probe(dev, PTR_ERR(priv->vbus),
++					     "failed to get the VBUS supply\n");
++
++		dev_dbg(dev, "no VBUS supply, assuming port power is fixed\n");
++		priv->vbus = NULL;
++	}
++
++	priv->invert_tx = device_property_present(dev, "intel,invert-tx-polarity");
++	priv->invert_rx = device_property_present(dev, "intel,invert-rx-polarity");
++
++
++	priv->phy = devm_phy_create(dev, np, &intel_usbphy_ops);
++	if (IS_ERR(priv->phy))
++		return dev_err_probe(dev, PTR_ERR(priv->phy),
++				     "failed to create the PHY\n");
++
++	phy_set_drvdata(priv->phy, priv);
++
++	/*
++	 * The byte order must be set before the controller issues its first
++	 * AXI transfer, which is earlier than .init runs, so it is programmed
++	 * here too.
++	 */
++	ret = intel_usbphy_set_endian(priv);
++	if (ret)
++		return ret;
++
++	phy_provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	if (IS_ERR(phy_provider))
++		return dev_err_probe(dev, PTR_ERR(phy_provider),
++				     "failed to register the PHY provider\n");
++
++	dev_dbg(dev, "USB PHY probed, AXI config at CHIPTOP + 0x%x\n",
++		priv->cfg_offset);
++
++	return 0;
++}
++
++static const struct of_device_id intel_usbphy_match[] = {
++	{ .compatible = "intel,grx500-usb-phy" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, intel_usbphy_match);
++
++static struct platform_driver intel_usbphy_driver = {
++	.probe = intel_usbphy_probe,
++	.driver = {
++		.name = "intel-grx500-usb-phy",
++		.of_match_table = intel_usbphy_match,
++	},
++};
++module_platform_driver(intel_usbphy_driver);
++
++MODULE_DESCRIPTION("Intel GRX500 USB PHY driver");
++MODULE_LICENSE("GPL");

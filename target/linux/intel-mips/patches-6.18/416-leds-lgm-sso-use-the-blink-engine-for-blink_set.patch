@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 2 Sep 2026 12:18:15 +0200
+Subject: leds: lgm-sso: use the blink engine for blink_set
+
+sso_led_blink_set() programs the hardware blink engine for the pin and
+then returns 1. led_blink_setup() reads any non-zero return as a
+refusal, so it goes on to led_set_software_blink() and the LED core's
+timer drives the lamp instead -- while the engine stays enabled
+underneath it. The two then fight over the pin: the timer alternates
+brightness between full and LED_OFF, one of those two is always a duty
+of 0, and a duty of 0 parks the pin rather than handing it to the duty
+engine. So the hardware engine is unreachable through the trigger
+interface, and the rate a blinking lamp shows is the core timer's,
+jitter and all.
+
+Return 0 once the engine has been programmed, which is what tells the
+core to leave the LED alone. Two requests the engine cannot serve keep
+falling through to the software timer:
+
+  - Any rank but 0 on a pin below 24. Those pins share a single rate
+    field that sso_led_freq_set() does not write, so the rank their
+    blink registers already hold is the only rate they can blink at.
+
+  - A duty of 0, which is an LED that is off, or one at full brightness
+    on an active-low pin. sso_led_brightness_set() hands the pin to the
+    engine only for a non-zero duty, so there is no phase left for the
+    engine to drive. The software timer picks a brightness of its own
+    and can blink it.
+
+Neither path changes, including the delays being reported back rounded
+to the rank the driver settled on, which is what the LED core asks a
+blink_set to do when it cannot match a request exactly.
+
+No device tree in tree sets intel,sso-hw-blink, without which the core
+is never given a blink_set to call.
+
+Fixes: c3987cd2bca3 ("leds: lgm: Add LED controller driver for LGM SoC")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index dda4e4fa7980..9644a8433226 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -351,6 +351,26 @@ sso_led_blink_set(struct led_classdev *led_cdev, unsigned long *delay_on,
+ 	priv = led->priv;
+ 	freq_idx = delay_to_freq_idx(led, delay_on, delay_off);
+ 
++	/*
++	 * Only a pin in one of the upper two groups has a rate field of its
++	 * own. Pins 0..23 share one that sso_led_freq_set() does not write, so
++	 * the rank their blink registers already hold is the only rate the
++	 * engine can give them.
++	 */
++	if (freq_idx && sso_led_pin_to_group(led->desc.pin) == LED_GRP0_0_23)
++		return 1;
++
++	/*
++	 * The engine drives the pin from DUTY_CYCLE(pin), and the pairing in
++	 * sso_led_brightness_set() hands the pin over only for a non-zero
++	 * duty: a zero one parks it and there is no phase left to blink. That
++	 * is an LED that is off, or one at full brightness on an active-low
++	 * pin. The software timer picks a brightness of its own and can blink
++	 * such an LED.
++	 */
++	if (!sso_led_duty(led, led->desc.brightness))
++		return 1;
++
+ 	sso_led_freq_set(priv, led->desc.pin, freq_idx);
+ 	regmap_update_bits(priv->mmap, SSO_CON2, BIT(led->desc.pin),
+ 			   1 << led->desc.pin);
+@@ -358,7 +378,7 @@ sso_led_blink_set(struct led_classdev *led_cdev, unsigned long *delay_on,
+ 	led->desc.blink_rate = priv->freq[freq_idx];
+ 	led->desc.blinking = 1;
+ 
+-	return 1;
++	return 0;
+ }
+ 
+ static void sso_led_hw_cfg(struct sso_led_priv *priv, struct sso_led *led)

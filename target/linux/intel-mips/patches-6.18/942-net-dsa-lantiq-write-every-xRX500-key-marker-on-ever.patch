@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 6 Sep 2026 04:03:06 +0200
+Subject: net: dsa: lantiq: write every xRX500 key marker on every macro
+
+A field of a flow rule's key is told not to compare by writing all ones
+into it, truncated to the width it is implemented at, so a field left at
+zero is a live compare against the value zero rather than an unused one.
+
+The word that carries the ingress port has a second field above it that
+indexes the active-VLAN table, and the rule writer leaves it at zero. That
+switches on a compare against entry zero of a table this driver neither
+writes nor owns, which the last implemented key word then has to invert to
+keep the rule matching. Whether the rule classifies a frame therefore
+depends on whether some other user of the switch has validated that entry,
+and the rule that stops classifying part of the traffic still reads back
+word for word as intended - a port that quietly falls back to the domain
+nothing is learned in, with no register to say so.
+
+Give both fields their don't-care value instead, so the rule keys on the
+ingress port and nothing else. That drops the invert flag with them, since
+there is no longer an enabled compare for it to apply to.
+
+The ingress-port field is four bits where the macro has seven ports and
+five where it has sixteen, so in both cases it is one value wider than the
+port numbers it has to carry and the field's all-ones value is never a real
+port. A rule therefore always names exactly one port, on either macro.
+Give the field the width it has where it is widest, and say so.
+
+The word above the payload indexes is the other field whose width differs:
+the seven-port macro does not implement it and reads it back as zero
+whatever is written, and the sixteen-port macro does implement it. Leaving
+it at zero is therefore free on one macro and a live compare against entry
+zero of a sub-table the driver never writes on the other - the same
+coupling the ingress port's word was just freed from. Write its marker
+too: it costs nothing where the field is absent, and it is the difference
+between a rule that matches and one that does not where the field is
+there.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index 6b9893221e97..bf5ae005e0cf 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -116,6 +116,32 @@
+  */
+ #define GSWIP_XRX500_PCE_FLOW_VAL2_FID		GENMASK(15, 8)
+ 
++/* A field of a rule's key is told not to compare by writing all ones into it,
++ * truncated to the width the field is implemented at, so a field left at zero
++ * is not an unused field but a live compare against the value zero. A field's
++ * own mask is therefore the value that switches it off.
++ *
++ * The key word that carries the ingress port holds two fields. The port field
++ * is five bits wide on this generation, where the earlier one gives it four,
++ * so it is one value wider than any port number either macro uses and a rule
++ * always names one port rather than all of them. Above the port sits an index
++ * into the active-VLAN table, and that one has to be switched off rather than
++ * left at zero: this rule may not depend on that table, whose entry zero the
++ * driver neither writes nor owns, because a compare against an entry somebody
++ * else validates would stop the rule matching part of the traffic while every
++ * register still read back as intended.
++ */
++#define GSWIP_XRX500_PCE_FLOW_KEY0_PORT		GENMASK(4, 0)
++#define GSWIP_XRX500_PCE_FLOW_KEY0_VLAN_ANY	GENMASK(14, 8)
++
++/* The key word above the payload words carries a sub-interface id below the
++ * flags that invert a compare field by field. Switching the id off the same
++ * way leaves no enabled compare for an invert flag to apply to, so all of
++ * them stay clear and the marker stops at the top of the id rather than
++ * filling the word.
++ */
++#define GSWIP_XRX500_PCE_FLOW_KEY14_SUBIF_ANY	GENMASK(4, 0)
++
+ /* Key words above the ingress port, for a rule that selects on the ingress
+  * port alone: every field they can express, switched off, and the
+  * sub-interface word above as the last of them.
+@@ -138,7 +164,8 @@
+  */
+ static const u16 gswip_xrx500_pce_flow_key[GSWIP_XRX500_PCE_FLOW_KEYS - 1] = {
+ 	0x3f3f, 0x7f7f, 0x7f7f, 0x7f7f, 0x7f7f, 0x7f0f, 0x1f1f, 0x7f1f,
+-	0x7f3f, 0x7f7f, 0x7f7f, 0x3f3f, 0x0000, 0x0100, 0x0000,
++	0x7f3f, 0x7f7f, 0x7f7f, 0x3f3f, 0x7f7f,
++	GSWIP_XRX500_PCE_FLOW_KEY14_SUBIF_ANY, 0x0000,
+ };
+ 
+ /* Action words, likewise, for a rule that assigns a forwarding domain. Only
+@@ -957,7 +984,10 @@ static void gswip_xrx500_r_phylink_get_caps(struct dsa_switch *ds, int port,
+ static int gswip_xrx500_flow_rule_write(struct gswip_priv *priv,
+ 					unsigned int slot, u16 port, u16 fid)
+ {
+-	u16 key[GSWIP_XRX500_PCE_FLOW_KEYS] = { port };
++	u16 key[GSWIP_XRX500_PCE_FLOW_KEYS] = {
++		FIELD_PREP(GSWIP_XRX500_PCE_FLOW_KEY0_PORT, port) |
++		GSWIP_XRX500_PCE_FLOW_KEY0_VLAN_ANY,
++	};
+ 	u16 val[GSWIP_XRX500_PCE_FLOW_VALS] = { };
+ 	unsigned int i;
+ 	u32 ctrl;

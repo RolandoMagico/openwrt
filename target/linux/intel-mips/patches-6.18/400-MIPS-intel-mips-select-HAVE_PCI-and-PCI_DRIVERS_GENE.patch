@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 16:25:32 +0200
+Subject: MIPS: intel-mips: select HAVE_PCI and PCI_DRIVERS_GENERIC
+
+The GRX350 carries three PCIe root complexes, and nothing in this
+platform has ever been able to drive them, because INTEL_MIPS does not
+select HAVE_PCI. CONFIG_PCI depends on it, so PCI cannot be turned on at
+all here and every host controller driver is unreachable regardless of
+what else the defconfig says.
+
+Selecting HAVE_PCI alone is not enough, and the way it is not enough is
+quiet. PCI_DRIVERS_LEGACY is "def_bool !PCI_DRIVERS_GENERIC", so a
+platform that stays silent about which model it wants is handed the
+legacy one: the arch keeps its own struct pci_controller, its own
+pcibios_init(), and expects a driver to register a controller with it.
+No modern host bridge driver does that. They all build a struct
+pci_host_bridge and hand it to pci_host_probe(), which is what
+PCI_DRIVERS_GENERIC arranges for. Picking the wrong half of that pair
+does not produce a build error; it produces a bus that never gets
+scanned.
+
+PCI_DRIVERS_GENERIC also brings in PCI_DOMAINS_GENERIC ("select
+PCI_DOMAINS_GENERIC if PCI"), which is what makes the "linux,pci-domain"
+property in the root complex nodes mean anything. With three independent
+root complexes on one SoC, each needing its own domain number, that is
+not optional either.
+
+Both go in the existing select list in its established order. This is
+the same pair every other MIPS platform with a modern host bridge picks,
+MACH_INGENIC and MIPS_GENERIC among them.
+
+Deliberately not included is SWAP_IO_SPACE. Several MIPS platforms
+select it alongside PCI, and it would look like it belongs here, but it
+is not a PCI-scoped switch: it changes the byte order of readl() and
+friends for the whole kernel image. This SoC's working GSWIP, CBM and
+DMA ethernet datapath is written against the current, unswapped
+accessors. The PCIe side pays for that decision instead, in the host
+bridge driver, where the cost is contained.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index c1757c30a2aa..eddfc62918d9 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -488,11 +488,13 @@ config INTEL_MIPS
+ 	select CSRC_R4K
+ 	select DMA_NONCOHERENT
+ 	select GENERIC_ISA_DMA
++	select HAVE_PCI
+ 	select IRQ_MIPS_CPU
+ 	select MFD_CORE
+ 	select MFD_SYSCON
+ 	select MIPS_CPU_SCACHE
+ 	select MIPS_GIC
++	select PCI_DRIVERS_GENERIC
+ 	select SYS_HAS_CPU_MIPS32_R2
+ 	select SYS_HAS_CPU_MIPS32_R3_5
+ 	select SYS_SUPPORTS_BIG_ENDIAN

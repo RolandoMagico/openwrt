@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 18:41:17 +0000
+Subject: MIPS: dts: intel-mips: fix the FRITZ!Box 7560 LED polarity and labels
+
+The board's six LEDs were transcribed from AVM's 4.9 board description,
+arch/mips/boot/dts/lantiq/avm/grx350_common.dtsi, active levels and node
+names included. A panel test on real hardware says two of those fields
+were wrong at the source, and it is not hard to see why nobody noticed:
+AVM does not drive these lines through gpio-leds. Each one is exported
+individually by the out-of-tree "avm,avm_gpio_generic" shim, which takes
+the bank and pin out of the node and then writes the raw level itself.
+The active-level flag is never consulted and the node name is never
+matched against anything, so both fields were decorative in the vendor
+tree and were free to drift away from the board without anything ever
+complaining.
+
+Polarity. Driving a line high with its pad muxed to GPIO turns the
+corresponding LED off, and driving it low turns it on -- the opposite of
+what the transcribed GPIO_ACTIVE_HIGH says. Four of the six were watched
+going dark by eye as their line was driven high, and the bank's output
+register was read back on each step so that an unlit LED could not be
+confused with a write that never reached the pad. The panel LEDs hang
+off 3V3 with the SoC pin as the sink, so all six become
+GPIO_ACTIVE_LOW.
+
+Labels. Walking the panel one line at a time also shows two of the names
+pointing at the wrong lamp: gpio0 3, which the vendor tree calls
+"festnetz", lights the LED silkscreened DECT, and gpio0 18, which it
+calls "internet", lights the one silkscreened Fon. A 7560 panel has no
+Internet LED at all -- the uplink was DSL and its state shares the Power
+LED -- so "green:internet" was naming a lamp that does not exist on this
+board. Rename the two to green:dect and green:fon, and rename their
+phandle labels to match.
+
+led-boot / led-running / led-failsafe / led-upgrade / led-wifi keep
+pointing at the same four LEDs; none of the aliases referenced either
+renamed node. The power LED's default-state stays "on": gpio-leds
+resolves that through the polarity flag, so "on" still means lit, it
+just now drives the pad low to get there.
+
+The buttons and the DECT reset hog are deliberately untouched. The two
+buttons really are active low -- they read as released with the line
+high and pressed with it pulled down -- and the hog is not a panel line,
+so neither is affected by any of the above.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+index fc303f1393ed..6199a76a1fdf 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -83,6 +83,11 @@ reserved-memory {
+ };
+ 
+ / {
++	/*
++	 * Every line here is active low: the panel LEDs hang off 3V3 and
++	 * the SoC pin sinks them, so driving the pin high extinguishes
++	 * the LED. Confirmed on hardware, one GPIO at a time.
++	 */
+ 	leds {
+ 		compatible = "gpio-leds";
+ 
+@@ -95,38 +100,40 @@ leds {
+ 		 */
+ 		led_power: led-0 {
+ 			label = "green:power";
+-			gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
++			gpios = <&gpio1 4 GPIO_ACTIVE_LOW>;
+ 			default-state = "on";
+ 		};
+ 
+-		led_internet: led-1 {
+-			label = "green:internet";
+-			gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
++		/* Vendor name: gpio_avm_led_internet. Drives "Fon". */
++		led_fon: led-1 {
++			label = "green:fon";
++			gpios = <&gpio0 18 GPIO_ACTIVE_LOW>;
+ 			default-state = "off";
+ 		};
+ 
+-		led_festnetz: led-2 {
+-			label = "green:festnetz";
+-			gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;
++		/* Vendor name: gpio_avm_led_festnetz. Drives "DECT". */
++		led_dect: led-2 {
++			label = "green:dect";
++			gpios = <&gpio0 3 GPIO_ACTIVE_LOW>;
+ 			default-state = "off";
+ 		};
+ 
+ 		led_wlan: led-3 {
+ 			label = "green:wlan";
+-			gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
++			gpios = <&gpio0 14 GPIO_ACTIVE_LOW>;
+ 			default-state = "off";
+ 		};
+ 
+ 		led_info: led-4 {
+ 			label = "green:info";
+-			gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
++			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+ 			default-state = "off";
+ 		};
+ 
+ 		/* Bank 1, pin 2 == SoC pin 34. */
+ 		led_info_red: led-5 {
+ 			label = "red:info";
+-			gpios = <&gpio1 2 GPIO_ACTIVE_HIGH>;
++			gpios = <&gpio1 2 GPIO_ACTIVE_LOW>;
+ 			default-state = "off";
+ 		};
+ 	};

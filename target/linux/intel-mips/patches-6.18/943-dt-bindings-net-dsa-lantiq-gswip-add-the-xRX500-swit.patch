@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 6 Sep 2026 11:25:48 +0200
+Subject: dt-bindings: net: dsa: lantiq,gswip: add the xRX500 switch clocks
+
+Each GSWIP-3.0 macro is fed by a divider off one of the SoC's PLLs and by a
+gate of its own, and neither is shared with any other block on the die.
+Describe the pair and require it of this model; the earlier models keep the
+shape they had.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml b/Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml
+index 2eb97d1d6368..a4bc851a74a4 100644
+--- a/Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml
++++ b/Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml
+@@ -38,6 +38,16 @@ properties:
+ 
+   dma-noncoherent: true
+ 
++  clocks:
++    items:
++      - description: switch core clock
++      - description: switch core gate
++
++  clock-names:
++    items:
++      - const: freq
++      - const: gate
++
+   mdio:
+     $ref: /schemas/net/mdio.yaml#
+     unevaluatedProperties: false
+@@ -178,6 +188,8 @@ allOf:
+ 
+       required:
+         - dma-noncoherent
++        - clocks
++        - clock-names
+ 
+   - if:
+       not:
+@@ -308,6 +320,8 @@ examples:
+     switch@1c000000 {
+             compatible = "lantiq,xrx500-gswip";
+             reg = <0x1c000000 0x4000>;
++            clocks = <&cgu 22>, <&cgu 125>;
++            clock-names = "freq", "gate";
+             dsa,member = <0 0>;
+             dma-noncoherent;
+ 

@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 17:17:09 +0200
+Subject: MIPS: dts: intel-mips: drop the PCIe controllers' clock-names
+
+Each root complex has exactly one clock and pcie-intel-gw.c looks it up
+unnamed, so the name says nothing the node does not already say. It is
+also not a name the DesignWare common schema recognises: "ctl" is neither
+one of the generic clock names nor one of the vendor names that schema
+grandfathers, so a binding for this node cannot describe the property
+without asking for an exception for a string nothing reads.
+
+intel,lgm-pcie, the other user of this driver, names no clock either.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index ca9ee9de2c6b..5654e6b771a6 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -317,7 +317,6 @@ pcie0: pcie@18900000 {
+ 				<0 0 0 4 &gic GIC_SHARED 139 IRQ_TYPE_LEVEL_HIGH>;
+ 
+ 		clocks = <&cgu GCLK_PCIE0>;
+-		clock-names = "ctl";
+ 		phys = <&pcie_phy0>;
+ 		phy-names = "pcie";
+ 
+@@ -352,7 +351,6 @@ pcie1: pcie@18400000 {
+ 				<0 0 0 4 &gic GIC_SHARED 12 IRQ_TYPE_LEVEL_HIGH>;
+ 
+ 		clocks = <&cgu GCLK_PCIE1>;
+-		clock-names = "ctl";
+ 		phys = <&pcie_phy1>;
+ 		phy-names = "pcie";
+ 
+@@ -387,7 +385,6 @@ pcie2: pcie@18e00000 {
+ 				<0 0 0 4 &gic GIC_SHARED 158 IRQ_TYPE_LEVEL_HIGH>;
+ 
+ 		clocks = <&cgu GCLK_PCIE2>;
+-		clock-names = "ctl";
+ 		phys = <&pcie_phy2>;
+ 		phy-names = "pcie";
+ 

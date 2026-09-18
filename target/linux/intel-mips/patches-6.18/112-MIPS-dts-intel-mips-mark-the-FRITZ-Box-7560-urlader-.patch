@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 19:19:35 +0000
+Subject: MIPS: dts: intel-mips: mark the FRITZ!Box 7560 urlader and TFFS
+ read-only
+
+Two of the five NAND partitions on this board hold data that exists
+nowhere else and that nothing in Linux is ever supposed to write.
+
+nand-tffs is AVM's TFFS environment. It is where this particular unit's
+identity lives -- the MAC addresses handed to the four LAN ports, the
+serial number, the bootloader's own settings. There is a single copy:
+unlike the NOR-flash FRITZ!Box boards, which keep a "tffs (1)"/"tffs
+(2)" mirror pair, the NAND scheme has exactly one 4 MiB partition, whose
+32 erase blocks all belong to that one instance. Linux only ever reads
+it, through the fritz_tffs_nand userspace tool, so nothing is lost by
+refusing writes -- while an accidental write leaves the board with no
+way to recover its own MACs.
+
+urlader already carried read-only for the obvious reason that
+overwriting the first-stage bootloader is unrecoverable without JTAG.
+Worth recording alongside it is that the same partition also stores the
+WiFi calibration data, which is per-unit and equally unrecoverable, so
+there is a second independent reason not to write it.
+
+Both partitions are addressed by mtd index by anything that goes
+looking, and the numbering shifts the moment the partition table does;
+the flag turns a mistyped index from a destroyed board into an EROFS.
+
+This mirrors what the two other AVM NAND boards already describe in
+their device trees, vr9_avm_fritz7412 and vr9_avm_fritz7430, which mark
+both their urlader and their nand-tffs read-only.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+index 6199a76a1fdf..66a861434fc9 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -33,7 +33,8 @@ partitions {
+ 			#size-cells = <1>;
+ 
+ 			/*
+-			 * AVM urlader (first-stage bootloader). Read-only:
++			 * AVM urlader (first-stage bootloader). It also holds
++			 * the only copy of the WiFi calibration data. Read-only:
+ 			 * overwriting it bricks the device past the point of
+ 			 * recovery without JTAG/SPI-flashing the chip.
+ 			 */
+@@ -44,13 +45,15 @@ partition@0 {
+ 			};
+ 
+ 			/*
+-			 * AVM TFFS environment (serial, MAC, calibration). Kept
+-			 * writable so the fritz-tffs userspace package can fix
+-			 * up serial/MAC entries in some recovery flows.
++			 * AVM TFFS environment. Holds the only copy of this
++			 * device's identity (MAC addresses, serial number).
++			 * Read-only: it is never written from Linux, and
++			 * erasing it cannot be undone.
+ 			 */
+ 			partition@100000 {
+ 				label = "nand-tffs";
+ 				reg = <0x100000 0x400000>;
++				read-only;
+ 			};
+ 
+ 			/* Primary kernel slot. Written by sysupgrade. */

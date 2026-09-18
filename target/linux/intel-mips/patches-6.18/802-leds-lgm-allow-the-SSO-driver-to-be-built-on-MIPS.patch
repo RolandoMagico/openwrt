@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 13:02:50 +0200
+Subject: leds: lgm: allow the SSO driver to be built on MIPS
+
+The Serial Shift Output controller is not a Lightning Mountain
+peculiarity. Intel's GRX500 family carries the same block, at the same
+register offsets, with the same two clock rates and the same 24/5/3
+pin grouping -- close enough that the vendor's own GRX500 driver and
+this one are two forks of one source file rather than two
+implementations that happen to agree.
+
+LGM is an x86 part, so depends on X86 was right when it was written and
+simply never contemplated a second user. GRX500 is MIPS, and the symbol
+is not selectable there at all: nothing else in the entry stands in the
+way, since GPIOLIB, LEDS_CLASS, MFD_SYSCON and OF are all available and
+already listed.
+
+Nothing in the driver is architecture specific. It reaches the block
+through a syscon regmap and a pair of clocks and touches no x86
+facility. Widening the list rather than deleting it keeps the entry in
+the shape its neighbour LEDS_BCM63138 uses, where the arch list names
+the platforms the hardware is known to exist on.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/Kconfig b/drivers/leds/blink/Kconfig
+index bdcb7377cd4e..28b5f512b7ce 100644
+--- a/drivers/leds/blink/Kconfig
++++ b/drivers/leds/blink/Kconfig
+@@ -14,7 +14,7 @@ config LEDS_BCM63138
+ 
+ config LEDS_LGM
+        tristate "LED support for LGM SoC series"
+-       depends on X86 || COMPILE_TEST
++       depends on X86 || MIPS || COMPILE_TEST
+        depends on GPIOLIB && LEDS_CLASS && MFD_SYSCON && OF
+        help
+          This option enables support for LEDs connected to GPIO lines on

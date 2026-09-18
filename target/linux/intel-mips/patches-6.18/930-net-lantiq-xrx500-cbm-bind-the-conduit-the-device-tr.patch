@@ -1,0 +1,788 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 20:26:47 +0200
+Subject: net: lantiq: xrx500-cbm: bind the conduit the device tree describes
+
+The device tree now describes a conduit as a child of the buffer
+manager, carrying only the register value that names the switch macro it
+serves and a phandle to each of its two DMA controllers. The manager's
+windows and segment pools are on the parent.
+
+Take all of it from the shape that ships:
+
+  - the windows and the pools come off the parent node, so the phandle
+    back to the manager goes away with the node that carried it;
+  - the switch macro index selects the egress resources, which retires
+    the module parameter that used to name a datapath port by hand;
+  - the receive controller comes from its own phandle rather than from a
+    constant naming one controller, so the channel handle is composed at
+    probe from the controller the device tree names.
+
+With one conduit per switch macro the driver stops being a singleton.
+The two locks that serialise the enqueue windows and the traffic
+manager's staging window become the driver's, because each of those is
+one piece of hardware shared by every conduit, and the parameter
+callbacks walk a list of bound conduits instead of following a pointer
+to the only one. Receive ownership defaults on: nothing else consumes a
+macro's receive ring in this shape.
+
+The second macro's row is carried from the vendor's dequeue table rather
+than derived: its dequeue port is drained by a different DMA controller
+from every front-panel port of the first macro, not merely a different
+channel, and the arithmetic that fits the first macro's six consecutive
+rows gives the wrong answer for it.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500-cbm.c b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+index a9d63d9325f1..37748c457d52 100644
+--- a/drivers/net/ethernet/lantiq/xrx500-cbm.c
++++ b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+@@ -33,6 +33,7 @@
+ #include <linux/io.h>
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
++#include <linux/list.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+@@ -338,13 +339,40 @@ struct xrx500_cbm_egress {
+ 	u32 dma_chan;
+ };
+ 
+-static const struct xrx500_cbm_egress xrx500_cbm_egress_tbl[] = {
++static const struct xrx500_cbm_egress xrx500_cbm_egress_lan[] = {
+ 	{ .dp_port = 2, .deq_port =  7, .tmu_qid = 17, .dma_chan = 2 },
+ 	{ .dp_port = 3, .deq_port =  8, .tmu_qid = 18, .dma_chan = 3 },
+ 	{ .dp_port = 4, .deq_port =  9, .tmu_qid = 19, .dma_chan = 4 },
+ 	{ .dp_port = 5, .deq_port = 10, .tmu_qid = 20, .dma_chan = 5 },
+ };
+ 
++/*
++ * The second macro's single front-panel port. Its dequeue port is drained by
++ * the first pair of DMA controllers rather than the second, so the row
++ * carries a channel number that is only meaningful against the controller the
++ * conduit's own transmit phandle names.
++ */
++static const struct xrx500_cbm_egress xrx500_cbm_egress_wan[] = {
++	{ .dp_port = 15, .deq_port = 19, .tmu_qid = 28, .dma_chan = 15 },
++};
++
++/**
++ * struct xrx500_cbm_macro - what one switch macro's conduit serves.
++ * @eg:  egress rows, one per front-panel port of the macro.
++ * @num: rows in @eg.
++ *
++ * Indexed by the conduit's own register value, which names the macro.
++ */
++struct xrx500_cbm_macro {
++	const struct xrx500_cbm_egress *eg;
++	unsigned int num;
++};
++
++static const struct xrx500_cbm_macro xrx500_cbm_macros[] = {
++	{ xrx500_cbm_egress_lan, ARRAY_SIZE(xrx500_cbm_egress_lan) },
++	{ xrx500_cbm_egress_wan, ARRAY_SIZE(xrx500_cbm_egress_wan) },
++};
++
+ /* Wire format */
+ 
+ /*
+@@ -432,13 +460,19 @@ static_assert(sizeof(struct xrx500_cbm_rxd) == 16);
+ #define CBM_RXD_CTL_OWN			BIT(31)
+ 
+ /*
+- * The switch's own receive channel, and the peripheral-to-peripheral consumer
+- * that walks its ring in the topology this driver replaces. Only channel zero
+- * of the receive controller is wired as a switch target, so there is one
+- * hardware receive queue; spreading receive work over the other processors is
+- * a software concern.
++ * Only channel zero of a receive controller is wired as a switch target, so
++ * there is one hardware receive queue per macro; spreading receive work over
++ * the other processors is a software concern. Which controller it is comes
++ * from the device tree, so the handle is composed at probe rather than named
++ * by a constant.
++ */
++#define CBM_RX_CHAN_NR			DMA_CHANNEL_0
++#define CBM_RX_CHAN_PORT		0
++
++/*
++ * The peripheral-to-peripheral consumer that walks the first macro's receive
++ * ring in the topology this driver replaces.
+  */
+-#define CBM_RX_CHAN			DMA2RX_GSWIP_R_CLASS0
+ #define CBM_RX_RELAY_CHAN		DMA1TX_LAN_SWITCH_CLASS0
+ 
+ /*
+@@ -569,11 +603,11 @@ struct xrx500_cbm_rx {
+  * @fsqm:        the two free-segment manager instances.
+  * @dma:         transmit DMA controller window.
+  * @dma_desc_pa: physical base of @desc, needed as a DMA descriptor base.
++ * @rx_chan:     receive channel handle on the controller the device tree
++ *               names for this conduit.
+  * @std:         standard segment pool.
+  * @jbo:         jumbo segment pool.
+  * @eg:          egress resources of the datapath port this conduit serves.
+- * @tx_lock:     serialises the enqueue window against itself.
+- * @tmu_lock:    serialises the traffic-management indirect table.
+  * @restart:     back-pressure release poll.
+  * @stats:       transmit accounting.
+  * @force_empty: remaining synthetic pool-empty answers, for exercising the
+@@ -581,6 +615,7 @@ struct xrx500_cbm_rx {
+  *               Guarded by the transmit lock, which both spenders hold.
+  * @closing:     the device is going down; the release poll must not rearm.
+  * @rx:          receive ring state.
++ * @node:        entry on the list of bound conduits.
+  */
+ struct xrx500_cbm {
+ 	struct device *dev;
+@@ -595,16 +630,13 @@ struct xrx500_cbm {
+ 	void __iomem *fsqm[2];
+ 	void __iomem *dma;
+ 	phys_addr_t dma_desc_pa;
++	u32 rx_chan;
+ 
+ 	struct xrx500_cbm_pool std;
+ 	struct xrx500_cbm_pool jbo;
+ 
+ 	struct xrx500_cbm_egress eg;
+ 
+-	/* serialises the enqueue window against itself */
+-	spinlock_t tx_lock;
+-	/* serialises the traffic manager's indirect-table staging window */
+-	spinlock_t tmu_lock;
+ 	struct timer_list restart;
+ 
+ 	struct xrx500_cbm_stats stats;
+@@ -612,15 +644,17 @@ struct xrx500_cbm {
+ 	bool closing;
+ 
+ 	struct xrx500_cbm_rx rx;
++	struct list_head node;
+ };
+ 
+ /*
+- * Datapath port this conduit transmits on. The value indexes the egress table
+- * above and is also the switch port number the frame egresses from.
++ * The enqueue manager's descriptor windows and the traffic manager's
++ * indirect-table staging window are one piece of hardware each, shared by
++ * every conduit the buffer manager serves, so the locks that serialise them
++ * belong to the driver rather than to a conduit.
+  */
+-static unsigned int dp_port = 3;
+-module_param(dp_port, uint, 0444);
+-MODULE_PARM_DESC(dp_port, "datapath port the conduit transmits on");
++static DEFINE_SPINLOCK(xrx500_cbm_tx_lock);
++static DEFINE_SPINLOCK(xrx500_cbm_tmu_lock);
+ 
+ /*
+  * Take ownership of the buffer manager: seed both segment pools, program the
+@@ -642,12 +676,9 @@ module_param(own_dma_chan, bool, 0444);
+ MODULE_PARM_DESC(own_dma_chan, "program the transmit DMA channel");
+ 
+ /*
+- * Terminate the switch's receive ring on the processor. Off by default,
+- * because the existing datapath consumes the same ring through a
+- * peripheral-to-peripheral copy into the second switch instance and only one
+- * consumer of a ring can be right.
++ * Terminate the switch's receive ring on the processor.
+  */
+-static bool own_rx;
++static bool own_rx = true;
+ module_param(own_rx, bool, 0444);
+ MODULE_PARM_DESC(own_rx, "terminate the switch receive ring on the CPU");
+ 
+@@ -715,11 +746,11 @@ MODULE_PARM_DESC(tx_force_empty,
+ 		 "synthesise N exhausted-pool segment requests");
+ 
+ /*
+- * The parameter callbacks below reach the driver through this pointer, so it
+- * has to stay valid for as long as one of them is running.
++ * The parameter callbacks below reach every bound conduit through this list,
++ * which the same mutex guards against a bind or unbind running beside them.
+  */
+ static DEFINE_MUTEX(xrx500_cbm_lock);
+-static struct xrx500_cbm *xrx500_cbm_singleton;
++static LIST_HEAD(xrx500_cbm_conduits);
+ 
+ /* Register access */
+ 
+@@ -788,10 +819,10 @@ static int tmu_queue_map_port(struct xrx500_cbm *priv, u32 qid, u32 epn)
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	spin_lock_irqsave(&priv->tmu_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tmu_lock, flags);
+ 	cbm_w32(priv->tmu, TMU_QEMT, epn & TMU_QEMT_EPN_MASK);
+ 	ret = tmu_write_cmd(priv, TMU_QMTC, TMU_QMTC_QEW | qid, TMU_QMTC_QEV);
+-	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tmu_lock, flags);
+ 	return ret;
+ }
+ 
+@@ -801,10 +832,10 @@ static int tmu_queue_map_sched(struct xrx500_cbm *priv, u32 qid, u32 sbin)
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	spin_lock_irqsave(&priv->tmu_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tmu_lock, flags);
+ 	cbm_w32(priv->tmu, TMU_QSMT, sbin & TMU_QSMT_SBIN_MASK);
+ 	ret = tmu_write_cmd(priv, TMU_QMTC, TMU_QMTC_QSW | qid, TMU_QMTC_QSV);
+-	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tmu_lock, flags);
+ 	return ret;
+ }
+ 
+@@ -814,7 +845,7 @@ static int tmu_queue_enable(struct xrx500_cbm *priv, u32 qid)
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	spin_lock_irqsave(&priv->tmu_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tmu_lock, flags);
+ 	cbm_w32(priv->tmu, TMU_QTHT0, TMU_QTHT0_DEFAULT | TMU_QTHT0_QE);
+ 	cbm_w32(priv->tmu, TMU_QTHT1,
+ 		(TMU_QTHT1_DEFAULT << 16) | TMU_QTHT1_DEFAULT);
+@@ -825,7 +856,7 @@ static int tmu_queue_enable(struct xrx500_cbm *priv, u32 qid)
+ 	cbm_w32(priv->tmu, TMU_QTHT4,
+ 		(TMU_QTHT4_1_DEFAULT << 16) | TMU_QTHT4_0_DEFAULT);
+ 	ret = tmu_write_cmd(priv, TMU_QMTC, TMU_QMTC_QTW | qid, TMU_QMTC_QTV);
+-	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tmu_lock, flags);
+ 	return ret;
+ }
+ 
+@@ -837,12 +868,12 @@ static int tmu_port_map_read(struct xrx500_cbm *priv, u32 epn, bool *enabled,
+ 	int ret;
+ 	u32 tmp;
+ 
+-	spin_lock_irqsave(&priv->tmu_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tmu_lock, flags);
+ 	ret = tmu_write_cmd(priv, TMU_EPMTC,
+ 			    TMU_EPMTC_EMR | (epn & TMU_EPMTC_EPN_MASK),
+ 			    TMU_EPMTC_VAL);
+ 	tmp = cbm_r32(priv->tmu, TMU_EPMT);
+-	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tmu_lock, flags);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -862,12 +893,12 @@ static int tmu_port_map_write(struct xrx500_cbm *priv, u32 epn, bool enable,
+ 	if (enable)
+ 		tmp |= TMU_EPMT_EPE;
+ 
+-	spin_lock_irqsave(&priv->tmu_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tmu_lock, flags);
+ 	cbm_w32(priv->tmu, TMU_EPMT, tmp);
+ 	ret = tmu_write_cmd(priv, TMU_EPMTC,
+ 			    TMU_EPMTC_EMW | (epn & TMU_EPMTC_EPN_MASK),
+ 			    TMU_EPMTC_VAL);
+-	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tmu_lock, flags);
+ 	return ret;
+ }
+ 
+@@ -887,11 +918,11 @@ static int tmu_sched_link_port(struct xrx500_cbm *priv, u32 sbid, u32 epn)
+ 	sbot0 |= (0U << TMU_SBOTR0_LVL_SHIFT) & TMU_SBOTR0_LVL_MASK;
+ 	sbot0 |= epn & TMU_SBOTR0_OMID_MASK;
+ 
+-	spin_lock_irqsave(&priv->tmu_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tmu_lock, flags);
+ 	cbm_w32(priv->tmu, TMU_SBOTR0, sbot0);
+ 	ret = tmu_write_cmd(priv, TMU_SBOTC, TMU_SBOTC_WRITE | sbid,
+ 			    TMU_SBOTC_VAL);
+-	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tmu_lock, flags);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -909,7 +940,7 @@ static int tmu_sched_link_queue(struct xrx500_cbm *priv, u32 sbin, u32 qid)
+ 	u32 sbit0 = TMU_SBITR0_SIE | (qid & TMU_SBITR0_QSID_MASK);
+ 	int ret;
+ 
+-	spin_lock_irqsave(&priv->tmu_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tmu_lock, flags);
+ 	cbm_w32(priv->tmu, TMU_SBITR0, sbit0);
+ 	cbm_w32(priv->tmu, TMU_SBITR1, TMU_SBIT_NO_SHAPER);
+ 	cbm_w32(priv->tmu, TMU_SBITR2, 0);
+@@ -917,7 +948,7 @@ static int tmu_sched_link_queue(struct xrx500_cbm *priv, u32 sbin, u32 qid)
+ 	ret = tmu_write_cmd(priv, TMU_SBITC,
+ 			    TMU_SBITC_WRITE | TMU_SBITC_SEL | sbin,
+ 			    TMU_SBITC_VAL);
+-	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tmu_lock, flags);
+ 	return ret;
+ }
+ 
+@@ -927,9 +958,9 @@ static int tmu_config_cmd(struct xrx500_cbm *priv, u32 cmd)
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	spin_lock_irqsave(&priv->tmu_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tmu_lock, flags);
+ 	ret = tmu_write_cmd(priv, TMU_CFGCMD, cmd, TMU_CFGCMD_VAL);
+-	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tmu_lock, flags);
+ 	return ret;
+ }
+ 
+@@ -1530,7 +1561,7 @@ static void xrx500_cbm_restart(struct timer_list *t)
+ 	 * so a count only that path spent would hold the queue closed for
+ 	 * every answer past the first until it was cleared by hand.
+ 	 */
+-	scoped_guard(spinlock_irqsave, &priv->tx_lock) {
++	scoped_guard(spinlock_irqsave, &xrx500_cbm_tx_lock) {
+ 		forced = priv->force_empty != 0;
+ 		if (forced)
+ 			priv->force_empty--;
+@@ -1596,7 +1627,7 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 	if (XRX500_CBM_TX_OFFSET + total > XRX500_CBM_STD_SEG_SIZE)
+ 		goto drop;
+ 
+-	spin_lock_irqsave(&priv->tx_lock, flags);
++	spin_lock_irqsave(&xrx500_cbm_tx_lock, flags);
+ 
+ 	/*
+ 	 * The segment request and the enqueue both address a per-port window,
+@@ -1621,10 +1652,10 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 			netif_stop_queue(ndev);
+ 			mod_timer(&priv->restart,
+ 				  jiffies + XRX500_CBM_RESTART_DELAY);
+-			spin_unlock_irqrestore(&priv->tx_lock, flags);
++			spin_unlock_irqrestore(&xrx500_cbm_tx_lock, flags);
+ 			return NETDEV_TX_BUSY;
+ 		}
+-		spin_unlock_irqrestore(&priv->tx_lock, flags);
++		spin_unlock_irqrestore(&xrx500_cbm_tx_lock, flags);
+ 		goto drop;
+ 	}
+ 
+@@ -1668,7 +1699,7 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 	wmb();  /* make the commit globally visible */
+ 
+ 	dev_sw_netstats_tx_add(ndev, 1, skb->len);
+-	spin_unlock_irqrestore(&priv->tx_lock, flags);
++	spin_unlock_irqrestore(&xrx500_cbm_tx_lock, flags);
+ 
+ 	dev_consume_skb_any(skb);
+ 	return NETDEV_TX_OK;
+@@ -1910,7 +1941,7 @@ static int xrx500_cbm_rx_poll(struct napi_struct *napi, int budget)
+ 	 */
+ 	if (done < budget && napi_complete_done(napi, done) &&
+ 	    !rx->aborted && READ_ONCE(rx->active) &&
+-	    ltq_dma_chan_irq_enable(CBM_RX_CHAN))
++	    ltq_dma_chan_irq_enable(priv->rx_chan))
+ 		xrx500_cbm_rx_abort(priv, "channel interrupt not rearmed");
+ 
+ 	return done;
+@@ -2078,7 +2109,7 @@ static int xrx500_cbm_rx_take(struct xrx500_cbm *priv)
+ 	dma_addr_t cur;
+ 	int ret;
+ 
+-	ret = ltq_dma_chan_reset(CBM_RX_CHAN);
++	ret = ltq_dma_chan_reset(priv->rx_chan);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -2090,22 +2121,22 @@ static int xrx500_cbm_rx_take(struct xrx500_cbm *priv)
+ 	 * the other driver keeps for it stops describing a ring this one now
+ 	 * owns the base of.
+ 	 */
+-	ltq_dma_chan_desc_free(CBM_RX_CHAN);
++	ltq_dma_chan_desc_free(priv->rx_chan);
+ 
+-	ret = ltq_dma_chan_desc_cfg(CBM_RX_CHAN, priv->rx.ring_pa,
++	ret = ltq_dma_chan_desc_cfg(priv->rx_chan, priv->rx.ring_pa,
+ 				    priv->rx.ring_len);
+ 	if (ret)
+ 		goto err;
+ 
+-	ret = ltq_dma_chan_on(CBM_RX_CHAN);
++	ret = ltq_dma_chan_on(priv->rx_chan);
+ 	if (ret)
+ 		goto err;
+ 
+-	ret = ltq_dma_chan_irq_enable(CBM_RX_CHAN);
++	ret = ltq_dma_chan_irq_enable(priv->rx_chan);
+ 	if (ret)
+ 		goto err;
+ 
+-	cur = ltq_dma_chan_get_curr_desc_addr(CBM_RX_CHAN);
++	cur = ltq_dma_chan_get_curr_desc_addr(priv->rx_chan);
+ 	netdev_info(priv->ndev, "receive channel taken, engine at %pad\n", &cur);
+ 	return 0;
+ 
+@@ -2118,8 +2149,8 @@ static int xrx500_cbm_rx_take(struct xrx500_cbm *priv)
+ 
+ static void xrx500_cbm_rx_release(struct xrx500_cbm *priv)
+ {
+-	ltq_dma_chan_irq_disable(CBM_RX_CHAN);
+-	ltq_dma_chan_off(CBM_RX_CHAN);
++	ltq_dma_chan_irq_disable(priv->rx_chan);
++	ltq_dma_chan_off(priv->rx_chan);
+ }
+ 
+ /* Network device */
+@@ -2192,7 +2223,7 @@ static int xrx500_cbm_stop(struct net_device *ndev)
+ 		WRITE_ONCE(priv->rx.active, false);
+ 		xrx500_cbm_rx_release(priv);
+ 		napi_disable(&priv->rx.napi);
+-		ltq_dma_chan_irq_disable(CBM_RX_CHAN);
++		ltq_dma_chan_irq_disable(priv->rx_chan);
+ 		scoped_guard(mutex, &xrx500_cbm_lock)
+ 			xrx500_cbm_rx_ring_free(priv);
+ 	}
+@@ -2220,42 +2251,28 @@ static int xrx500_cbm_set_report(const char *val,
+ 		return ret;
+ 
+ 	guard(mutex)(&xrx500_cbm_lock);
+-	priv = xrx500_cbm_singleton;
+-	if (!priv)
+-		return 0;
+-
+-	pr_info("%s: free=%u pops=%llu rollbacks=%llu outstanding=%llu empty=%llu stops=%llu wakes=%llu polls=%llu\n",
+-		XRX500_CBM_DRV_NAME, xrx500_cbm_free_segs(priv),
+-		priv->stats.pops, priv->stats.rollbacks,
+-		priv->stats.pops - priv->stats.rollbacks,
+-		priv->stats.pool_empty, priv->stats.stops,
+-		priv->stats.wakes, priv->stats.polls);
++	list_for_each_entry(priv, &xrx500_cbm_conduits, node)
++		netdev_info(priv->ndev,
++			    "free=%u pops=%llu rollbacks=%llu outstanding=%llu empty=%llu stops=%llu wakes=%llu polls=%llu\n",
++			    xrx500_cbm_free_segs(priv),
++			    priv->stats.pops, priv->stats.rollbacks,
++			    priv->stats.pops - priv->stats.rollbacks,
++			    priv->stats.pool_empty, priv->stats.stops,
++			    priv->stats.wakes, priv->stats.polls);
+ 	return 0;
+ }
+ 
+-static int xrx500_cbm_set_rx_report(const char *val,
+-				    const struct kernel_param *kp)
++static void xrx500_cbm_rx_report_one(struct xrx500_cbm *priv)
+ {
+-	struct xrx500_cbm_rx *rx;
+-	struct xrx500_cbm *priv;
++	struct xrx500_cbm_rx *rx = &priv->rx;
+ 	unsigned int armed = 0;
+ 	unsigned int done = 0;
+ 	unsigned int i;
+-	int ret = param_set_int(val, kp);
+ 
+-	if (ret)
+-		return ret;
+-
+-	guard(mutex)(&xrx500_cbm_lock);
+-	priv = xrx500_cbm_singleton;
+-	if (!priv)
+-		return 0;
+-
+-	rx = &priv->rx;
+ 	if (!rx->ring) {
+-		pr_info("%s: receive ring not built (own_rx=%u)\n",
+-			XRX500_CBM_DRV_NAME, own_rx);
+-		return 0;
++		netdev_info(priv->ndev, "receive ring not built (own_rx=%u)\n",
++			    own_rx);
++		return;
+ 	}
+ 
+ 	for (i = 0; i < rx->ring_len; i++) {
+@@ -2267,21 +2284,35 @@ static int xrx500_cbm_set_rx_report(const char *val,
+ 			done++;
+ 	}
+ 
+-	pr_info("%s: ring=%u buf=%u boff=%u next=%u armed=%u completed=%u%s\n",
+-		XRX500_CBM_DRV_NAME, rx->ring_len, rx->buf_len, rx->boff,
+-		rx->next, armed, done, rx->aborted ? " ABORTED" : "");
+-	pr_info("%s: polls=%llu completions=%llu bytes=%llu delivered=%llu wraps=%llu\n",
+-		XRX500_CBM_DRV_NAME, rx->stats.polls, rx->stats.completions,
+-		rx->stats.bytes, rx->stats.delivered, rx->stats.wraps);
+-	pr_info("%s: malformed=%llu drop_noskb=%llu\n",
+-		XRX500_CBM_DRV_NAME, rx->stats.malformed,
+-		rx->stats.drop_noskb);
++	netdev_info(priv->ndev,
++		    "ring=%u buf=%u boff=%u next=%u armed=%u completed=%u%s\n",
++		    rx->ring_len, rx->buf_len, rx->boff, rx->next, armed, done,
++		    rx->aborted ? " ABORTED" : "");
++	netdev_info(priv->ndev,
++		    "polls=%llu completions=%llu bytes=%llu delivered=%llu wraps=%llu\n",
++		    rx->stats.polls, rx->stats.completions, rx->stats.bytes,
++		    rx->stats.delivered, rx->stats.wraps);
++	netdev_info(priv->ndev, "malformed=%llu drop_noskb=%llu\n",
++		    rx->stats.malformed, rx->stats.drop_noskb);
+ 
+ 	for (i = 0; i < PMAC_RX_SPPID_NUM; i++)
+ 		if (rx->sppid[i])
+-			pr_info("%s: source port %u: %llu frames\n",
+-				XRX500_CBM_DRV_NAME, i, rx->sppid[i]);
++			netdev_info(priv->ndev, "source port %u: %llu frames\n",
++				    i, rx->sppid[i]);
++}
++
++static int xrx500_cbm_set_rx_report(const char *val,
++				    const struct kernel_param *kp)
++{
++	struct xrx500_cbm *priv;
++	int ret = param_set_int(val, kp);
+ 
++	if (ret)
++		return ret;
++
++	guard(mutex)(&xrx500_cbm_lock);
++	list_for_each_entry(priv, &xrx500_cbm_conduits, node)
++		xrx500_cbm_rx_report_one(priv);
+ 	return 0;
+ }
+ 
+@@ -2295,12 +2326,9 @@ static int xrx500_cbm_set_force_empty(const char *val,
+ 		return ret;
+ 
+ 	guard(mutex)(&xrx500_cbm_lock);
+-	priv = xrx500_cbm_singleton;
+-	if (!priv)
+-		return 0;
+-
+-	scoped_guard(spinlock_irqsave, &priv->tx_lock)
+-		priv->force_empty = tx_force_empty;
++	list_for_each_entry(priv, &xrx500_cbm_conduits, node)
++		scoped_guard(spinlock_irqsave, &xrx500_cbm_tx_lock)
++			priv->force_empty = tx_force_empty;
+ 	return 0;
+ }
+ 
+@@ -2427,36 +2455,80 @@ static int xrx500_cbm_pool_get(struct xrx500_cbm *priv, struct device_node *np,
+ 	return 0;
+ }
+ 
+-static int xrx500_cbm_egress_lookup(struct xrx500_cbm *priv, u32 dp)
++/**
++ * xrx500_cbm_dma_win() - map the register window of a referenced controller.
++ * @priv: driver state.
++ * @name: phandle property naming the controller.
++ * @cid:  optional out, the controller's identity.
++ */
++static void __iomem *xrx500_cbm_dma_win(struct xrx500_cbm *priv,
++					const char *name, int *cid)
+ {
+-	int i;
++	struct device_node *np;
++	struct resource res;
++	void __iomem *base;
++	int ret;
+ 
+-	for (i = 0; i < ARRAY_SIZE(xrx500_cbm_egress_tbl); i++) {
+-		if (xrx500_cbm_egress_tbl[i].dp_port != dp)
+-			continue;
+-		priv->eg = xrx500_cbm_egress_tbl[i];
+-		return 0;
++	np = of_parse_phandle(priv->dev->of_node, name, 0);
++	if (!np) {
++		dev_err(priv->dev, "no %s phandle\n", name);
++		return IOMEM_ERR_PTR(-ENODEV);
++	}
++
++	ret = of_address_to_resource(np, 0, &res);
++	of_node_put(np);
++	if (ret) {
++		dev_err(priv->dev, "%s window unresolvable: %d\n", name, ret);
++		return IOMEM_ERR_PTR(ret);
++	}
++
++	if (cid) {
++		*cid = ltq_dma_ctrl_id_by_phys(res.start);
++		if (*cid < 0) {
++			dev_err(priv->dev, "%s is not a packet DMA controller\n",
++				name);
++			return IOMEM_ERR_PTR(*cid);
++		}
++	}
++
++	base = devm_ioremap(priv->dev, res.start, resource_size(&res));
++	if (!base) {
++		dev_err(priv->dev, "%s window not mappable\n", name);
++		return IOMEM_ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	dev_err(priv->dev, "datapath port %u has no egress resources\n", dp);
+-	return -EINVAL;
++	return base;
+ }
+ 
+ static int xrx500_cbm_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct device_node *np = dev->of_node;
+-	struct device_node *cbm_np;
+-	struct device_node *dma_np;
++	struct device_node *mgr = np->parent;
++	const struct xrx500_cbm_macro *macro;
+ 	struct net_device *ndev;
+ 	struct xrx500_cbm *priv;
+-	struct resource res;
++	void __iomem *rx_win;
++	int rx_cid;
++	u32 index;
+ 	int ret;
+ 	u32 i;
+ 
+-	scoped_guard(mutex, &xrx500_cbm_lock)
+-		if (xrx500_cbm_singleton)
+-			return -EBUSY;
++	/*
++	 * The conduit's own register value names the switch macro it serves,
++	 * which is what decides the set of egress resources it has.
++	 */
++	ret = of_property_read_u32(np, "reg", &index);
++	if (ret) {
++		dev_err(dev, "no switch macro index\n");
++		return ret;
++	}
++	if (index >= ARRAY_SIZE(xrx500_cbm_macros)) {
++		dev_err(dev, "switch macro %u has no conduit resources\n",
++			index);
++		return -EINVAL;
++	}
++	macro = &xrx500_cbm_macros[index];
+ 
+ 	ndev = alloc_etherdev(sizeof(*priv));
+ 	if (!ndev)
+@@ -2466,64 +2538,42 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	priv = netdev_priv(ndev);
+ 	priv->dev = dev;
+ 	priv->ndev = ndev;
+-	spin_lock_init(&priv->tx_lock);
+-	spin_lock_init(&priv->tmu_lock);
++	INIT_LIST_HEAD(&priv->node);
+ 	timer_setup(&priv->restart, xrx500_cbm_restart, 0);
++	priv->eg = macro->eg[0];
+ 
+-	ret = xrx500_cbm_egress_lookup(priv, dp_port);
+-	if (ret)
+-		goto err_free;
+-
+-	cbm_np = of_parse_phandle(np, "lantiq,buffer-manager", 0);
+-	if (!cbm_np) {
+-		dev_err(dev, "no lantiq,buffer-manager phandle\n");
+-		ret = -ENODEV;
+-		goto err_free;
+-	}
+-
+-	priv->cbm = xrx500_cbm_map(priv, cbm_np, "cbm", NULL);
+-	priv->eqm = xrx500_cbm_map(priv, cbm_np, "eqm", NULL);
+-	priv->dqm = xrx500_cbm_map(priv, cbm_np, "dqm", NULL);
+-	priv->desc = xrx500_cbm_map(priv, cbm_np, "dma-desc",
+-				    &priv->dma_desc_pa);
+-	priv->qidt = xrx500_cbm_map(priv, cbm_np, "qidt", NULL);
+-	priv->tmu = xrx500_cbm_map(priv, cbm_np, "tmu", NULL);
+-	priv->fsqm[0] = xrx500_cbm_map(priv, cbm_np, "fsqm0", NULL);
+-	priv->fsqm[1] = xrx500_cbm_map(priv, cbm_np, "fsqm1", NULL);
++	/*
++	 * The windows and the segment pools belong to the buffer manager, and
++	 * this device is a child of the node that describes them, so they are
++	 * read off the parent rather than followed through a phandle.
++	 */
++	priv->cbm = xrx500_cbm_map(priv, mgr, "cbm", NULL);
++	priv->eqm = xrx500_cbm_map(priv, mgr, "eqm", NULL);
++	priv->dqm = xrx500_cbm_map(priv, mgr, "dqm", NULL);
++	priv->desc = xrx500_cbm_map(priv, mgr, "dma-desc", &priv->dma_desc_pa);
++	priv->qidt = xrx500_cbm_map(priv, mgr, "qidt", NULL);
++	priv->tmu = xrx500_cbm_map(priv, mgr, "tmu", NULL);
++	priv->fsqm[0] = xrx500_cbm_map(priv, mgr, "fsqm0", NULL);
++	priv->fsqm[1] = xrx500_cbm_map(priv, mgr, "fsqm1", NULL);
+ 
+ 	if (IS_ERR(priv->cbm) || IS_ERR(priv->eqm) || IS_ERR(priv->dqm) ||
+ 	    IS_ERR(priv->desc) || IS_ERR(priv->qidt) || IS_ERR(priv->tmu) ||
+ 	    IS_ERR(priv->fsqm[0]) || IS_ERR(priv->fsqm[1])) {
+-		of_node_put(cbm_np);
+ 		ret = -ENODEV;
+ 		goto err_free;
+ 	}
+ 
+-	ret = xrx500_cbm_pool_get(priv, cbm_np, "std-pool",
++	ret = xrx500_cbm_pool_get(priv, mgr, "std-pool",
+ 				  XRX500_CBM_STD_SEG_SIZE, &priv->std);
+ 	if (!ret)
+-		ret = xrx500_cbm_pool_get(priv, cbm_np, "jumbo-pool",
++		ret = xrx500_cbm_pool_get(priv, mgr, "jumbo-pool",
+ 					  XRX500_CBM_JBO_SEG_SIZE, &priv->jbo);
+-	of_node_put(cbm_np);
+ 	if (ret)
+ 		goto err_free;
+ 
+-	dma_np = of_parse_phandle(np, "lantiq,transmit-dma", 0);
+-	if (!dma_np) {
+-		dev_err(dev, "no lantiq,transmit-dma phandle\n");
+-		ret = -ENODEV;
+-		goto err_free;
+-	}
+-	ret = of_address_to_resource(dma_np, 0, &res);
+-	of_node_put(dma_np);
+-	if (ret) {
+-		dev_err(dev, "transmit DMA window unresolvable: %d\n", ret);
+-		goto err_free;
+-	}
+-	priv->dma = devm_ioremap(dev, res.start, resource_size(&res));
+-	if (!priv->dma) {
+-		dev_err(dev, "transmit DMA window not mappable\n");
+-		ret = -ENOMEM;
++	priv->dma = xrx500_cbm_dma_win(priv, "lantiq,transmit-dma", NULL);
++	if (IS_ERR(priv->dma)) {
++		ret = PTR_ERR(priv->dma);
+ 		goto err_free;
+ 	}
+ 	if (!cbm_r32(priv->dma, DMA_ID) ||
+@@ -2533,6 +2583,17 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 		goto err_free;
+ 	}
+ 
++	/*
++	 * Only the receive controller's identity is wanted here: the ring is
++	 * driven through the channel interface, which addresses it by handle.
++	 */
++	rx_win = xrx500_cbm_dma_win(priv, "lantiq,receive-dma", &rx_cid);
++	if (IS_ERR(rx_win)) {
++		ret = PTR_ERR(rx_win);
++		goto err_free;
++	}
++	priv->rx_chan = _DMA_C(rx_cid, CBM_RX_CHAN_PORT, CBM_RX_CHAN_NR);
++
+ 	/*
+ 	 * Without ownership the segment pools have to be live already, or the
+ 	 * first transmit would find an empty free list.
+@@ -2598,7 +2659,7 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	 * is live, which is what the ownership flag it reads is for.
+ 	 */
+ 	if (own_rx) {
+-		ret = ltq_dma_chan_pseudo_irq_handler_callback_cfg(CBM_RX_CHAN,
++		ret = ltq_dma_chan_pseudo_irq_handler_callback_cfg(priv->rx_chan,
+ 								   xrx500_cbm_rx_intr,
+ 								   priv);
+ 		if (ret) {
+@@ -2625,7 +2686,7 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 
+ 	platform_set_drvdata(pdev, priv);
+ 	scoped_guard(mutex, &xrx500_cbm_lock)
+-		xrx500_cbm_singleton = priv;
++		list_add_tail(&priv->node, &xrx500_cbm_conduits);
+ 
+ 	dev_info(dev,
+ 		 "%s serves datapath port %u: dequeue %u queue %u channel %u, %u free segments\n",
+@@ -2647,7 +2708,7 @@ static void xrx500_cbm_remove(struct platform_device *pdev)
+ 	struct xrx500_cbm *priv = platform_get_drvdata(pdev);
+ 
+ 	mutex_lock(&xrx500_cbm_lock);
+-	xrx500_cbm_singleton = NULL;
++	list_del(&priv->node);
+ 	mutex_unlock(&xrx500_cbm_lock);
+ 
+ 	unregister_netdev(priv->ndev);
+@@ -2662,7 +2723,7 @@ static void xrx500_cbm_remove(struct platform_device *pdev)
+ 	 * built in.
+ 	 */
+ 	if (own_rx)
+-		ltq_dma_chan_pseudo_irq_handler_callback_cfg(CBM_RX_CHAN,
++		ltq_dma_chan_pseudo_irq_handler_callback_cfg(priv->rx_chan,
+ 							     xrx500_cbm_rx_intr,
+ 							     NULL);
+ 

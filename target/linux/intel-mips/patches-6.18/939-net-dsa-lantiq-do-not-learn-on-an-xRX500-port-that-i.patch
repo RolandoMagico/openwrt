@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 07:09:16 +0200
+Subject: net: dsa: lantiq: do not learn on an xRX500 port that is standalone
+
+The core clears the learning flag on every port that leaves a bridge and
+inherits the bridge port's own flag on every port that joins one, but it
+sets neither on a port that has never been in a bridge. So a port left
+standalone since reset learned addresses while an identical port that
+had been bridged and then left did not, and which of the two a port was
+depended on its history rather than on its configuration.
+
+That distinction is not cosmetic on this switch. An address table entry
+is the only thing that makes the fabric deliver a frame to a port, and it
+does so whether or not the ingress port shares a forwarding domain with
+it, so a standalone port that learns is a standalone port that can be
+reached from one that should not reach it.
+
+Take the standalone posture at bring-up, which is where the port starts.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index aefd916f9c38..ce778408d754 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -710,7 +710,7 @@ static int gswip_xrx500_setup(struct dsa_switch *ds)
+ {
+ 	struct gswip_priv *priv = ds->priv;
+ 	const struct gswip_xrx500_model *model = gswip_xrx500_model(priv);
+-	struct dsa_port *cpu_dp;
++	struct dsa_port *cpu_dp, *dp;
+ 	int err;
+ 
+ 	/* The queue manager's drop-policy selector is two bits wide here, and
+@@ -744,6 +744,25 @@ static int gswip_xrx500_setup(struct dsa_switch *ds)
+ 				GSWIP_PCE_PCTRL_3p(cpu_dp->index),
+ 				GSWIP_PCE_PCTRL_3_LNDIS);
+ 
++	/* A user port starts standalone, and a standalone port does not learn:
++	 * the core clears the learning flag on every port that leaves a
++	 * bridge, and inherits the bridge port's own flag on every port that
++	 * joins one. What it does not do is set either on a port that has
++	 * never been in a bridge, so without this a port standalone since
++	 * reset would learn while an identical port that had been bridged and
++	 * left would not, and which of the two a port is would depend on its
++	 * history rather than on its configuration.
++	 *
++	 * The distinction is not cosmetic on this switch. An address table
++	 * entry is the only thing that makes the fabric deliver a frame to a
++	 * port, and it does so whether or not the ingress port shares a
++	 * forwarding domain with it, so a standalone port that learns is a
++	 * standalone port that can be reached.
++	 */
++	dsa_switch_for_each_user_port(dp, ds)
++		regmap_set_bits(priv->gswip, GSWIP_PCE_PCTRL_3p(dp->index),
++				GSWIP_PCE_PCTRL_3_LNDIS);
++
+ 	/* Address the egress table by traffic class rather than by the
+ 	 * processing flags of the accelerator paths, which this design does
+ 	 * not build. This has to be settled before the table is written,

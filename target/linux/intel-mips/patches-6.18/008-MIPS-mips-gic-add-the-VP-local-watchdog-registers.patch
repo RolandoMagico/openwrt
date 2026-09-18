@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 15 Aug 2026 08:38:55 +0200
+Subject: MIPS: mips-gic: add the VP-local watchdog registers
+
+The GIC provides every Virtual Processor with a watchdog timer, but the
+header only exposes GIC_Vx_WD_MAP -- the register that routes the
+expiry interrupt. The three registers that make up the timer itself,
+GIC_Vx_WD_CONFIG0 (0x090), GIC_Vx_WD_COUNT0 (0x094) and
+GIC_Vx_WD_INITIAL0 (0x098), have no accessors, so a driver cannot arm,
+feed or read the thing it maps. The offsets are the ones the
+pre-rewrite MIPS GIC header carried before commit 1fad12cd5ef4
+("irqchip: mips-gic: Remove linux/irqchip/mips-gic.h").
+
+Add them along with the GIC_Vx_WD_CONFIG0 field definitions. The TYPE
+field selects what an expiry does:
+
+  0  interrupt only -- the countdown stops at zero and stays there,
+  1  SCD (Second CountDown) -- the first expiry sets WDINTR and reloads,
+     a second expiry while WDINTR is still set requests a reset,
+  2  PIT -- reload and interrupt forever, no reset.
+
+So SCD is the only setting under which the block behaves as a watchdog.
+WDINTR and WDRESET are the corresponding status bits, cleared by
+writing them back.
+
+The field positions are not documented in any header this architecture
+has ever carried; they were established by exercising the timer on a
+MIPS interAptiv part, one field at a time, against the observable
+behaviour above.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/include/asm/mips-gic.h b/arch/mips/include/asm/mips-gic.h
+index fd9da5e3beaa..74cb2ef35d8a 100644
+--- a/arch/mips/include/asm/mips-gic.h
++++ b/arch/mips/include/asm/mips-gic.h
+@@ -285,6 +285,23 @@ GIC_VX_ACCESSOR_RW(32, 0x080, other)
+ GIC_VX_ACCESSOR_RO(32, 0x088, ident)
+ #define GIC_VX_IDENT_VPNUM		GENMASK(5, 0)
+ 
++/* GIC_Vx_WD_CONFIG0 - Configure the local Virtual Processor's watchdog */
++GIC_VX_ACCESSOR_RW(32, 0x090, wd_config0)
++#define GIC_VX_WD_CONFIG0_WDRESET	BIT(7)
++#define GIC_VX_WD_CONFIG0_WDINTR	BIT(6)
++#define GIC_VX_WD_CONFIG0_NWAIT		BIT(5)
++#define GIC_VX_WD_CONFIG0_DEBUG		BIT(4)
++#define GIC_VX_WD_CONFIG0_TYPE		GENMASK(2, 1)
++#define GIC_VX_WD_CONFIG0_TYPE_SCD	0x1
++#define GIC_VX_WD_CONFIG0_TYPE_PIT	0x2
++#define GIC_VX_WD_CONFIG0_START		BIT(0)
++
++/* GIC_Vx_WD_COUNT0 - Current value of the local watchdog's countdown */
++GIC_VX_ACCESSOR_RW(32, 0x094, wd_count0)
++
++/* GIC_Vx_WD_INITIAL0 - Value the local watchdog's countdown reloads from */
++GIC_VX_ACCESSOR_RW(32, 0x098, wd_initial0)
++
+ /* GIC_Vx_COMPARE - Value to compare with GIC_SH_COUNTER */
+ GIC_VX_ACCESSOR_RW(64, 0x0a0, compare)
+ 

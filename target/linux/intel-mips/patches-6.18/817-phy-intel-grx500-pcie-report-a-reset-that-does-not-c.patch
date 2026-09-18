@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 10 Sep 2026 18:33:03 +0200
+Subject: phy: intel: grx500-pcie: report a reset that does not complete
+
+The PHY reset is asserted and released once at probe and again on every
+init, and both return values were dropped on the floor. The reset
+controller polls a status bit for each transition and gives up after a
+timeout, so a discarded error here means the line's state is unknown and
+the driver carries on as though it had reset the PHY.
+
+Neither caller can do anything useful about it. The PHY has kept working
+even when the poll timed out, and failing probe over it would take the
+root complex with it. Warn instead, so the condition is visible in the
+log rather than silent.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/phy/intel/phy-intel-grx500-pcie.c b/drivers/phy/intel/phy-intel-grx500-pcie.c
+index 79ccdedd083f..5e31415fcb71 100644
+--- a/drivers/phy/intel/phy-intel-grx500-pcie.c
++++ b/drivers/phy/intel/phy-intel-grx500-pcie.c
+@@ -210,8 +210,25 @@ static void intel_pciephy_ssc_disable(struct intel_pciephy *priv)
+ 
+ static void intel_pciephy_reset(struct intel_pciephy *priv)
+ {
+-	reset_control_assert(priv->rst);
+-	reset_control_deassert(priv->rst);
++	int ret;
++
++	/*
++	 * Neither caller can do anything about a reset that will not complete,
++	 * and the PHY has kept working in practice even when the poll timed
++	 * out. But the reset controller polls a status bit the device tree
++	 * names, so a timeout here means that bit is the wrong one and the
++	 * line's real state is unknown. Say so instead of discarding it.
++	 */
++	ret = reset_control_assert(priv->rst);
++	if (ret)
++		dev_warn(priv->dev, "failed to assert the PHY reset: %d\n",
++			 ret);
++
++	ret = reset_control_deassert(priv->rst);
++	if (ret)
++		dev_warn(priv->dev, "failed to release the PHY reset: %d\n",
++			 ret);
++
+ 	udelay(1);
+ }
+ 

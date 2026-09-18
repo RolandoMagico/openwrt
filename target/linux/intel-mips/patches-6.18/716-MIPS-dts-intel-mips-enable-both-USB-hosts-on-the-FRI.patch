@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 19:38:13 +0200
+Subject: MIPS: dts: intel-mips: enable both USB hosts on the FRITZ!Box 7590
+
+The 7590 populates both of the SoC's USB host controllers where the 7560
+populates one, so enable usb0 and usb1 and both of their PHYs. AVM's
+HW226 board chain carries no status override on any of the four nodes,
+against the 7560's grx350_common.dtsi, which disables usb0.
+
+Port power is the part that is genuinely this board's own. There is one
+enable line for both controllers, not one per controller: AVM declares a
+single gpio_avm_usb_power_enable on gpio1 2, active high, in
+grx550_common.dtsi, with no per-instance variant anywhere in the HW226
+chain. gpio1 line 2 is pad 34, and the 7590 board file has no other GPIO
+consumer of any kind, so nothing contends for it.
+
+The regulator node is the 7560's, copied unchanged apart from the GPIO,
+which is the point: that node form has raised port power on real
+hardware, and the boards differ only in which line does it. Both PHYs
+name it as their vbus-supply. That is legal and refcounted -- the PHY
+driver asks with devm_regulator_get_optional(), which is an
+OPTIONAL_GET, and the regulator core only enforces single-consumer
+exclusivity for EXCLUSIVE_GET -- so the line rises when the first PHY
+powers on and falls when the last one powers off.
+
+As on the 7560, the vendor drives this pad from patched xhci code rather
+than as a regulator, and raises it 100 ms after the controller starts
+where a vbus-supply raises it before. The 7560's comment records why the
+regulator is the better model and that the vendor's delay is the first
+thing to try if a device does not enumerate; both apply here unchanged.
+
+This also puts the second instance of the USB PHY through its own
+parameters for the first time. usb0 uses a different chip-top word
+(+0x18 against +0x34), a different reset bit and a different gate clock
+from usb1, and none of those are shared state in the driver -- a wrong
+chip-top offset would leave the AXI byte order unset and xHCI would read
+its capability registers byte-reversed, and a wrong reset bit would
+leave the PHY held in reset. So this board is what shows the
+per-instance parameterisation is real rather than incidentally correct
+for the one instance the 7560 uses.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 9ff2a40bb044..7a4e3a009602 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -7,6 +7,8 @@
+  */
+ /dts-v1/;
+ 
++#include <dt-bindings/gpio/gpio.h>
++
+ #include "seale_avm.dtsi"
+ 
+ / {
+@@ -127,6 +129,36 @@ shm-rng-seed@3dfb0000 {
+ 			no-map;
+ 		};
+ 	};
++
++	/*
++	 * Port power, for both USB host controllers at once. The FRITZ!Box 7560 has
++	 * one port and one enable line; this board has two ports and still
++	 * one enable line. AVM declares a single gpio_avm_usb_power_enable
++	 * on gpio1 2, active high, with no per-controller variant (AVM 4.9
++	 * arch/mips/boot/dts/lantiq/avm/grx550_common.dtsi). That is gpio
++	 * bank 1 line 2, i.e. pad 34, and nothing else on this board claims
++	 * it.
++	 *
++	 * Both PHYs take it as their vbus-supply, which is legal and
++	 * refcounted: the PHY driver asks with regulator_get_optional(), and
++	 * only an exclusive get would turn a second consumer away. Whichever
++	 * PHY powers on first raises the line and it drops again when the
++	 * last one powers off.
++	 *
++	 * The vendor mechanism, and the reason for not reproducing it, are
++	 * the FRITZ!Box 7560's: see the comment on that board's usb_vbus.
++	 *
++	 * No pinmux, for the same reason as there: the pad comes up as a
++	 * GPIO, which is what the regulator needs.
++	 */
++	usb_vbus: regulator-usb-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb_vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&gpio1 2 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
+ };
+ 
+ /*
+@@ -183,3 +215,27 @@ partition@1500000 {
+ 		};
+ 	};
+ };
++
++/*
++ * Both USB host controllers. The vendor's HW226 chain carries no status
++ * override on either of them, where the FRITZ!Box 7560's grx350_common.dtsi disables
++ * usb0. How many jacks that reaches, and which controller sits behind each
++ * one, is a board-layout fact the vendor sources do not state.
++ */
++&usb0_phy {
++	status = "okay";
++	vbus-supply = <&usb_vbus>;
++};
++
++&usb0 {
++	status = "okay";
++};
++
++&usb1_phy {
++	status = "okay";
++	vbus-supply = <&usb_vbus>;
++};
++
++&usb1 {
++	status = "okay";
++};

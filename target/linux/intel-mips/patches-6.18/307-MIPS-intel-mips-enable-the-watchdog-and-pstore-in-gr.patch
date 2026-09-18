@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 15 Aug 2026 09:06:28 +0200
+Subject: MIPS: intel-mips: enable the watchdog and pstore in grx500_defconfig
+
+Turn on the watchdog menu and the new GRX500 driver, the pretimeout
+governors, and the pstore ram backend that the FRITZ!Box 7560's reserved
+ramoops region feeds.
+
+Both governors are named explicitly rather than left to resolve from
+WATCHDOG_CORE, because each is its own object file and an =m governor
+would build a module nobody loads -- watchdog_notify_pretimeout() would
+then find nothing registered and silently do nothing. The default is
+noop: the driver's expiry interrupt has never run on this silicon, and a
+spurious first countdown should not panic every boot. Switching to panic
+at runtime is the point of building both, which is also why
+WATCHDOG_SYSFS is on -- the whole attribute group, pretimeout_governor
+included, lives inside that symbol's ifdef.
+
+WATCHDOG_SYSFS also gives timeleft, which turns the hardware gate from
+"wait and see whether it resets" into an observable countdown without
+opening /dev/watchdog and thereby arming anything.
+
+PSTORE_CONSOLE, not just the oops/panic records: a watchdog bite is not
+an oops and never calls kmsg_dump, so the console zone is the only part
+of pstore that captures a silent wedge -- which is exactly the case we
+have no other post-mortem for. PSTORE_PMSG and PSTORE_FTRACE stay off;
+userspace logging has other places to go and FTRACE is off here.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index 6f35d44c323b..c619a89c4a0b 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -96,6 +96,13 @@ CONFIG_PINCTRL_EQUILIBRIUM=y
+ CONFIG_POWER_RESET=y
+ CONFIG_POWER_RESET_SYSCON=y
+ # CONFIG_HWMON is not set
++CONFIG_WATCHDOG=y
++CONFIG_WATCHDOG_SYSFS=y
++CONFIG_WATCHDOG_PRETIMEOUT_GOV=y
++CONFIG_WATCHDOG_PRETIMEOUT_GOV_NOOP=y
++CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y
++CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_NOOP=y
++CONFIG_INTEL_GRX500_WDT=y
+ CONFIG_REGULATOR=y
+ CONFIG_REGULATOR_FIXED_VOLTAGE=y
+ # CONFIG_VGA_CONSOLE is not set
+@@ -137,6 +144,9 @@ CONFIG_SQUASHFS_XATTR=y
+ CONFIG_SQUASHFS_LZ4=y
+ CONFIG_SQUASHFS_LZO=y
+ CONFIG_SQUASHFS_XZ=y
++CONFIG_PSTORE=y
++CONFIG_PSTORE_CONSOLE=y
++CONFIG_PSTORE_RAM=y
+ CONFIG_NLS=y
+ CONFIG_PRINTK_TIME=y
+ CONFIG_BOOT_PRINTK_DELAY=y

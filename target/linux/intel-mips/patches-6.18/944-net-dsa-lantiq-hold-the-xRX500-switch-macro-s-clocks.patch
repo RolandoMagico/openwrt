@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 6 Sep 2026 11:26:04 +0200
+Subject: net: dsa: lantiq: hold the xRX500 switch macro's clocks
+
+Neither switch node named its clocks and the driver claimed none, so the
+only thing keeping the switch running was that no consumer existed to
+account for the gate.
+
+Name both clocks on both nodes and take them at probe with the managed bulk
+helper, which also lets them go when the device is unbound. Both are
+already running when the driver binds, so nothing changes at run time; what
+the tree gains is a statement of what the block needs, and the framework
+gains a consumer to count.
+
+The two macros take different pairs because they sit on different branches
+of the same PLL: the switch divider and gate for one, the packet
+accelerator's for the other.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 34262d6ac90f..7a86b6047528 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -274,10 +274,17 @@ ebu_nand: nand-controller@16f00000 {
+ 	 * dma-noncoherent is not decoration. The PHY cores fetch their
+ 	 * firmware without taking part in the platform's cache coherence, so
+ 	 * the staged image has to be written back before they are released.
++	 *
++	 * Each macro is fed by a divider off the second PLL and a gate of its
++	 * own, and neither is shared with anything else on the die. The two
++	 * macros sit on different branches of that PLL, which is why the pair
++	 * differs between them.
+ 	 */
+ 	gswl: switch@1c000000 {
+ 		compatible = "lantiq,xrx500-gswip";
+ 		reg = <0x1c000000 0x4000>;
++		clocks = <&cgu CLK_GSWIP>, <&cgu GCLK_GSWIP>;
++		clock-names = "freq", "gate";
+ 		dsa,member = <0 0>;
+ 		dma-noncoherent;
+ 		status = "disabled";
+@@ -307,6 +314,8 @@ fixed-link {
+ 	gswr: switch@1a000000 {
+ 		compatible = "lantiq,xrx500-gswip-r";
+ 		reg = <0x1a000000 0x4000>;
++		clocks = <&cgu CLK_PAE>, <&cgu GCLK_PAE>;
++		clock-names = "freq", "gate";
+ 		dsa,member = <1 0>;
+ 		dma-noncoherent;
+ 		status = "disabled";
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index bf5ae005e0cf..db94567a0862 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -19,6 +19,7 @@
+ #include "lantiq_gswip.h"
+ #include "lantiq_pce_xrx500.h"
+ 
++#include <linux/clk.h>
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/firmware.h>
+@@ -1081,6 +1082,7 @@ static const struct regmap_config gswip_xrx500_regmap_config = {
+ static int gswip_xrx500_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
++	struct clk_bulk_data *clks;
+ 	struct gswip_xrx500 *chip;
+ 	struct gswip_priv *priv;
+ 	void __iomem *base;
+@@ -1109,6 +1111,15 @@ static int gswip_xrx500_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, -EINVAL,
+ 				     "the switch node needs dma-noncoherent\n");
+ 
++	/* The macro's divider and its gate. Both are already running when
++	 * the driver binds, so claiming them changes nothing at run time;
++	 * what it adds is that the block needing them is the one holding
++	 * them, and that they are let go again when it is not.
++	 */
++	err = devm_clk_bulk_get_all_enabled(dev, &clks);
++	if (err < 0)
++		return dev_err_probe(dev, err, "cannot enable the clocks\n");
++
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(base))
+ 		return PTR_ERR(base);

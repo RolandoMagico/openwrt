@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 12:17:03 +0200
+Subject: net: dsa: lantiq: look the per-port MAC block up rather than deriving
+ it
+
+MAC_CTRL_0p(), _2p() and _4p() assume the MAC blocks are laid out 1:1 over
+the port numbers. The blocks themselves are always 0xc apart starting at
+0x903, but which block serves which port is a model property: a model can
+bias the index, and it can have ports with no MAC block at all, for
+instance a CPU port whose MAC sits in a different block.
+
+Split the three macros into a base and three in-block offsets, and put the
+per-port bases in hw_info->mac_ctrl, with the same s16 -1 sentinel that
+mii_cfg[] and mii_pcdu[] use. gswip_mac_ctrl_reg() resolves a port and an
+in-block offset into a register address, or a negative value for a port
+without a block, which the seven call sites now check. A model that leaves
+mac_ctrl NULL gets the 1:1 table, so xRX200, xRX300 and GSW1xx address
+exactly the registers they address today.
+
+No functional change for those models: the default table evaluates to
+0x903 + 0xc * port for every port, and no call site can take its new early
+exit while every port has a MAC block.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.h b/drivers/net/dsa/lantiq/lantiq_gswip.h
+index 8c9e16b38656..6991be8a4a7f 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.h
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.h
+@@ -178,7 +178,9 @@
+ #define GSWIP_PCE_DEFPVID(p)		(0x486 + ((p) * 0xA))
+ 
+ #define GSWIP_MAC_FLEN			0x8C5
+-#define GSWIP_MAC_CTRL_0p(p)		(0x903 + ((p) * 0xC))
++/* Base of a port's MAC block, and the offsets of the registers inside it */
++#define GSWIP_MAC_CTRL_BASEp(p)		(0x903 + ((p) * 0xC))
++#define GSWIP_MAC_CTRL_0		0x0
+ #define  GSWIP_MAC_CTRL_0_PADEN		BIT(8)
+ #define  GSWIP_MAC_CTRL_0_FCS_EN	BIT(7)
+ #define  GSWIP_MAC_CTRL_0_FCON_MASK	0x0070
+@@ -195,10 +197,10 @@
+ #define  GSWIP_MAC_CTRL_0_GMII_AUTO	0x0000
+ #define  GSWIP_MAC_CTRL_0_GMII_MII	0x0001
+ #define  GSWIP_MAC_CTRL_0_GMII_RGMII	0x0002
+-#define GSWIP_MAC_CTRL_2p(p)		(0x905 + ((p) * 0xC))
++#define GSWIP_MAC_CTRL_2		0x2
+ #define GSWIP_MAC_CTRL_2_LCHKL		BIT(2) /* Frame Length Check Long Enable */
+ #define GSWIP_MAC_CTRL_2_MLEN		BIT(3) /* Maximum Untagged Frame Lnegth */
+-#define GSWIP_MAC_CTRL_4p(p)		(0x907 + ((p) * 0xC))
++#define GSWIP_MAC_CTRL_4		0x4
+ #define  GSWIP_MAC_CTRL_4_LPIEN		BIT(7) /* LPI Mode Enable */
+ #define  GSWIP_MAC_CTRL_4_GWAIT_MASK	GENMASK(14, 8) /* LPI Wait Time 1G */
+ #define  GSWIP_MAC_CTRL_4_GWAIT(t)	u16_encode_bits((t), GSWIP_MAC_CTRL_4_GWAIT_MASK)
+@@ -284,6 +286,10 @@ struct gswip_hw_info {
+ 	s16 mii_pcdu[GSWIP_MAX_PORTS];
+ 	/* NULL selects the GSWIP-2.x layout */
+ 	const struct gswip_mdio_layout *mdio_layout;
++	/* Per-port MAC block base, -1 if the port has no MAC block.
++	 * NULL maps the blocks 1:1 onto the port numbers.
++	 */
++	const s16 *mac_ctrl;
+ 	bool supports_2500m;
+ 	const struct gswip_pce_microcode (*pce_microcode)[];
+ 	size_t pce_microcode_size;
+@@ -314,6 +320,7 @@ struct gswip_priv {
+ 	struct regmap *mii;
+ 	const struct gswip_hw_info *hw_info;
+ 	const struct gswip_mdio_layout *mdio_layout;
++	const s16 *mac_ctrl;
+ 	const struct xway_gphy_match_data *gphy_fw_name_cfg;
+ 	struct dsa_switch *ds;
+ 	struct device *dev;
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index a8883285c72e..109664bb2878 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -150,6 +150,24 @@ static void gswip_mdio_mask_phy(struct gswip_priv *priv, int port, u32 mask,
+ 	regmap_write_bits(priv->mdio, priv->mdio_layout->phy[port], mask, set);
+ }
+ 
++static const s16 gswip_mac_ctrl_2x[GSWIP_MAX_PORTS] = {
++	GSWIP_MAC_CTRL_BASEp(0), GSWIP_MAC_CTRL_BASEp(1),
++	GSWIP_MAC_CTRL_BASEp(2), GSWIP_MAC_CTRL_BASEp(3),
++	GSWIP_MAC_CTRL_BASEp(4), GSWIP_MAC_CTRL_BASEp(5),
++	GSWIP_MAC_CTRL_BASEp(6),
++};
++
++/* Returns the address of one register of a port's MAC block, or a negative
++ * value if the port has no MAC block.
++ */
++static int gswip_mac_ctrl_reg(struct gswip_priv *priv, int port, u16 reg)
++{
++	if (priv->mac_ctrl[port] == -1)
++		return -1;
++
++	return priv->mac_ctrl[port] + reg;
++}
++
+ static int gswip_mdio_poll(struct gswip_priv *priv)
+ {
+ 	u32 ctrl;
+@@ -1292,6 +1310,7 @@ static int gswip_port_max_mtu(struct dsa_switch *ds, int port)
+ static int gswip_port_change_mtu(struct dsa_switch *ds, int port, int new_mtu)
+ {
+ 	struct gswip_priv *priv = ds->priv;
++	int reg;
+ 
+ 	/* CPU port always has maximum mtu of user ports, so use it to set
+ 	 * switch frame size, including 8 byte special header.
+@@ -1302,15 +1321,17 @@ static int gswip_port_change_mtu(struct dsa_switch *ds, int port, int new_mtu)
+ 			     VLAN_ETH_HLEN + new_mtu + ETH_FCS_LEN);
+ 	}
+ 
++	reg = gswip_mac_ctrl_reg(priv, port, GSWIP_MAC_CTRL_2);
++	if (reg < 0)
++		return 0;
++
+ 	/* Enable MLEN for ports with non-standard MTUs, including the special
+ 	 * header on the CPU port added above.
+ 	 */
+ 	if (new_mtu != ETH_DATA_LEN)
+-		regmap_set_bits(priv->gswip, GSWIP_MAC_CTRL_2p(port),
+-				GSWIP_MAC_CTRL_2_MLEN);
++		regmap_set_bits(priv->gswip, reg, GSWIP_MAC_CTRL_2_MLEN);
+ 	else
+-		regmap_clear_bits(priv->gswip, GSWIP_MAC_CTRL_2p(port),
+-				  GSWIP_MAC_CTRL_2_MLEN);
++		regmap_clear_bits(priv->gswip, reg, GSWIP_MAC_CTRL_2_MLEN);
+ 
+ 	return 0;
+ }
+@@ -1339,6 +1360,7 @@ static void gswip_port_set_speed(struct gswip_priv *priv, int port, int speed,
+ 				 phy_interface_t interface)
+ {
+ 	u32 mdio_phy = 0, mii_cfg = 0, mac_ctrl_0 = 0;
++	int reg;
+ 
+ 	switch (speed) {
+ 	case SPEED_10:
+@@ -1374,13 +1396,17 @@ static void gswip_port_set_speed(struct gswip_priv *priv, int port, int speed,
+ 
+ 	gswip_mdio_mask_phy(priv, port, GSWIP_MDIO_PHY_SPEED_MASK, mdio_phy);
+ 	gswip_mii_mask_cfg(priv, GSWIP_MII_CFG_RATE_MASK, mii_cfg, port);
+-	regmap_write_bits(priv->gswip, GSWIP_MAC_CTRL_0p(port),
+-			  GSWIP_MAC_CTRL_0_GMII_MASK, mac_ctrl_0);
++
++	reg = gswip_mac_ctrl_reg(priv, port, GSWIP_MAC_CTRL_0);
++	if (reg >= 0)
++		regmap_write_bits(priv->gswip, reg, GSWIP_MAC_CTRL_0_GMII_MASK,
++				  mac_ctrl_0);
+ }
+ 
+ static void gswip_port_set_duplex(struct gswip_priv *priv, int port, int duplex)
+ {
+ 	u32 mac_ctrl_0, mdio_phy;
++	int reg;
+ 
+ 	if (duplex == DUPLEX_FULL) {
+ 		mac_ctrl_0 = GSWIP_MAC_CTRL_0_FDUP_EN;
+@@ -1390,8 +1416,10 @@ static void gswip_port_set_duplex(struct gswip_priv *priv, int port, int duplex)
+ 		mdio_phy = GSWIP_MDIO_PHY_FDUP_DIS;
+ 	}
+ 
+-	regmap_write_bits(priv->gswip, GSWIP_MAC_CTRL_0p(port),
+-			  GSWIP_MAC_CTRL_0_FDUP_MASK, mac_ctrl_0);
++	reg = gswip_mac_ctrl_reg(priv, port, GSWIP_MAC_CTRL_0);
++	if (reg >= 0)
++		regmap_write_bits(priv->gswip, reg, GSWIP_MAC_CTRL_0_FDUP_MASK,
++				  mac_ctrl_0);
+ 	gswip_mdio_mask_phy(priv, port, GSWIP_MDIO_PHY_FDUP_MASK, mdio_phy);
+ }
+ 
+@@ -1399,6 +1427,7 @@ static void gswip_port_set_pause(struct gswip_priv *priv, int port,
+ 				 bool tx_pause, bool rx_pause)
+ {
+ 	u32 mac_ctrl_0, mdio_phy;
++	int reg;
+ 
+ 	if (tx_pause && rx_pause) {
+ 		mac_ctrl_0 = GSWIP_MAC_CTRL_0_FCON_RXTX;
+@@ -1418,8 +1447,10 @@ static void gswip_port_set_pause(struct gswip_priv *priv, int port,
+ 			   GSWIP_MDIO_PHY_FCONRX_DIS;
+ 	}
+ 
+-	regmap_write_bits(priv->gswip, GSWIP_MAC_CTRL_0p(port),
+-			  GSWIP_MAC_CTRL_0_FCON_MASK, mac_ctrl_0);
++	reg = gswip_mac_ctrl_reg(priv, port, GSWIP_MAC_CTRL_0);
++	if (reg >= 0)
++		regmap_write_bits(priv->gswip, reg, GSWIP_MAC_CTRL_0_FCON_MASK,
++				  mac_ctrl_0);
+ 	gswip_mdio_mask_phy(priv, port,
+ 			    GSWIP_MDIO_PHY_FCONTX_MASK |
+ 			    GSWIP_MDIO_PHY_FCONRX_MASK, mdio_phy);
+@@ -1592,9 +1623,13 @@ static void gswip_phylink_mac_disable_tx_lpi(struct phylink_config *config)
+ {
+ 	struct dsa_port *dp = dsa_phylink_to_port(config);
+ 	struct gswip_priv *priv = dp->ds->priv;
++	int reg;
++
++	reg = gswip_mac_ctrl_reg(priv, dp->index, GSWIP_MAC_CTRL_4);
++	if (reg < 0)
++		return;
+ 
+-	regmap_clear_bits(priv->gswip, GSWIP_MAC_CTRL_4p(dp->index),
+-			  GSWIP_MAC_CTRL_4_LPIEN);
++	regmap_clear_bits(priv->gswip, reg, GSWIP_MAC_CTRL_4_LPIEN);
+ }
+ 
+ static int gswip_phylink_mac_enable_tx_lpi(struct phylink_config *config,
+@@ -1602,8 +1637,13 @@ static int gswip_phylink_mac_enable_tx_lpi(struct phylink_config *config,
+ {
+ 	struct dsa_port *dp = dsa_phylink_to_port(config);
+ 	struct gswip_priv *priv = dp->ds->priv;
++	int reg;
+ 
+-	return regmap_update_bits(priv->gswip, GSWIP_MAC_CTRL_4p(dp->index),
++	reg = gswip_mac_ctrl_reg(priv, dp->index, GSWIP_MAC_CTRL_4);
++	if (reg < 0)
++		return -EOPNOTSUPP;
++
++	return regmap_update_bits(priv->gswip, reg,
+ 				  GSWIP_MAC_CTRL_4_LPIEN |
+ 				  GSWIP_MAC_CTRL_4_GWAIT_MASK |
+ 				  GSWIP_MAC_CTRL_4_WAIT_MASK,
+@@ -1709,6 +1749,11 @@ int gswip_probe_common(struct gswip_priv *priv, u32 version)
+ 	else
+ 		priv->mdio_layout = &gswip_mdio_layout_2x;
+ 
++	if (priv->hw_info->mac_ctrl)
++		priv->mac_ctrl = priv->hw_info->mac_ctrl;
++	else
++		priv->mac_ctrl = gswip_mac_ctrl_2x;
++
+ 	priv->ds = devm_kzalloc(priv->dev, sizeof(*priv->ds), GFP_KERNEL);
+ 	if (!priv->ds)
+ 		return -ENOMEM;

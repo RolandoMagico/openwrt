@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 01:31:34 +0200
+Subject: MIPS: dts: intel-mips: base the FRITZ!Box 7590 on the shared AVM dtsi
+
+Include seale_avm.dtsi and drop the NAND controller scaffolding the
+board file was duplicating, leaving only the partition map that actually
+differs.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 3ab98685650d..1c341e2bd329 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -7,7 +7,7 @@
+  */
+ /dts-v1/;
+ 
+-#include "xrx500.dtsi"
++#include "seale_avm.dtsi"
+ 
+ / {
+ 	model = "AVM FRITZ!Box 7590";
+@@ -43,7 +43,9 @@ avm-hw-revision {
+ 	 * Widening past this needs the bootcore question settled first (a
+ 	 * bootcore built for 512 MiB, or a single-kernel image that starts no
+ 	 * bootcore at all) and the KSEG1 aperture bound respected -- see the
+-	 * warning on the reservations below.
++	 * warning on the reservations below. It also cannot move the CBM pools
++	 * that seale_avm.dtsi reserves at 0x23800000..0x25200000, only extend
++	 * past them.
+ 	 */
+ 	memory@20000000 {
+ 		device_type = "memory";
+@@ -65,18 +67,8 @@ chosen {
+ 	};
+ 
+ 	/*
+-	 * WARNING: every region here is below PHYS_OFFSET + 0x12310000
+-	 * (0x32310000), and that is a requirement, not a coincidence. KSEG1 is one
+-	 * 512 MiB window shared between the uncached DRAM alias and the SoC
+-	 * register aperture, whose lowest block sits 0x12310000 past the RAM
+-	 * base. A page above that bound has an uncached alias that *is* a
+-	 * register address, so anything reached through ioremap(),
+-	 * memremap(..., MEMREMAP_WC) or CKSEG1ADDR() has to live below it.
+-	 *
+-	 * The vendor's third reservation, an shm RNG seed at 0x3dfb0000, is
+-	 * above the bound. It is out of range of the memory node today; if the
+-	 * node is ever widened far enough to include it, a plain cached
+-	 * mapping is fine and an uncached one is not.
++	 * Every region below must stay under PHYS_OFFSET + SZ_256M; the
++	 * uncached alias above that address reaches registers, not DRAM.
+ 	 */
+ 	reserved-memory {
+ 		#address-cells = <1>;
+@@ -116,84 +108,56 @@ bootcore@2e000000 {
+ };
+ 
+ /*
+- * NAND. The controller and its wiring are identical to the FRITZ!Box 7560's -- EBU
+- * chip-select 1, on-die ECC -- and the chip self-identifies, so no geometry
+- * appears here. What differs is the chip: 512 MiB with a 4 KiB page and a
+- * 256 KiB erase block, against the FRITZ!Box 7560's 128 MiB / 2 KiB / 128 KiB. That
+- * matters to whoever builds the UBI image, not to this file.
++ * Toshiba BENAND, 512 MiB with a 4 KiB page; the geometry is self-identified.
++ * The partition map is the one the vendor boot loader installs, so a vendor
++ * recovery can hand the kernel back to the original firmware without
++ * remapping flash.
+  */
+-&ebu_nand {
+-	status = "okay";
+-
+-	lantiq,cs = <1>;
+-
+-	nand@0 {
+-		reg = <0>;
+-		label = "nand0";
++&nand0 {
++	partitions {
++		compatible = "fixed-partitions";
++		#address-cells = <1>;
++		#size-cells = <1>;
+ 
+ 		/*
+-		 * Toshiba BENAND, ECC on the chip. Selected through the legacy
+-		 * "nand-ecc-mode" property on purpose: the modern
+-		 * "nand-ecc-engine" spelling is a phandle, and a string there
+-		 * fails phandle resolution silently.
++		 * First-stage boot loader, and the only copy of the Wi-Fi
++		 * calibration data. Read-only: overwriting it bricks the
++		 * device past the point of recovery without an external
++		 * programmer.
+ 		 */
+-		nand-ecc-mode = "on-die";
++		partition@0 {
++			label = "urlader";
++			reg = <0x0 0x100000>;
++			read-only;
++		};
+ 
+ 		/*
+-		 * The two kernel slots are *mirrored* relative to the FRITZ!Box 7560,
+-		 * because this unit has linux_fs_start = 1: the active slot
+-		 * is the one at 0xd00000.
+-		 *
+-		 * So this map pins slot 1.
++		 * AVM TFFS environment: the only copy of this unit's
++		 * identity (MAC addresses, serial number). Never
++		 * written from Linux, and erasing it cannot be undone.
+ 		 */
+-		partitions {
+-			compatible = "fixed-partitions";
+-			#address-cells = <1>;
+-			#size-cells = <1>;
+-
+-			/*
+-			 * First-stage boot loader, and the only copy of the
+-			 * Wi-Fi calibration data. Read-only: overwriting it
+-			 * bricks the device past the point of recovery
+-			 * without an external programmer.
+-			 */
+-			partition@0 {
+-				label = "urlader";
+-				reg = <0x0 0x100000>;
+-				read-only;
+-			};
+-
+-			/*
+-			 * AVM TFFS environment: the only copy of this unit's
+-			 * identity (MAC addresses, serial number). Never
+-			 * written from Linux, and erasing it cannot be undone.
+-			 */
+-			partition@100000 {
+-				label = "nand-tffs";
+-				reg = <0x100000 0x400000>;
+-				read-only;
+-			};
+-
+-			/* Inactive kernel slot 0. Written by sysupgrade. */
+-			partition@500000 {
+-				label = "reserved-kernel";
+-				reg = <0x500000 0x800000>;
+-			};
+-
+-			/*
+-			 * Active kernel slot 1 -- the one EVA boots on this
+-			 * unit.
+-			 */
+-			partition@d00000 {
+-				label = "kernel";
+-				reg = <0xd00000 0x800000>;
+-			};
+-
+-			/* UBI: rootfs and rootfs_data. Ends at the 512 MiB mark. */
+-			partition@1500000 {
+-				label = "ubi";
+-				reg = <0x1500000 0x1eb00000>;
+-			};
++		partition@100000 {
++			label = "nand-tffs";
++			reg = <0x100000 0x400000>;
++			read-only;
++		};
++
++		/* Inactive kernel slot 0. Written by sysupgrade. */
++		partition@500000 {
++			label = "reserved-kernel";
++			reg = <0x500000 0x800000>;
++		};
++
++		/* Active kernel slot 1 -- the one EVA boots on this unit. */
++		partition@d00000 {
++			label = "kernel";
++			reg = <0xd00000 0x800000>;
++		};
++
++		/* UBI: rootfs and rootfs_data. Ends at the 512 MiB mark. */
++		partition@1500000 {
++			label = "ubi";
++			reg = <0x1500000 0x1eb00000>;
+ 		};
+ 	};
+ };

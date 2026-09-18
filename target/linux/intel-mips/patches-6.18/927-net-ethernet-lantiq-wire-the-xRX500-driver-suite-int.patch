@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:15:16 +0000
+Subject: net: ethernet: lantiq: wire the xRX500 driver suite into the build
+
+Hook drivers/net/ethernet/lantiq/ into the ethernet Kconfig and
+Makefile, and give it the INTEL_XRX500_NET menu and the INTEL_XRX500_BM
+symbol with the intel-xrx500-bm composite. The hook comes last so that
+every patch of the series builds. The buffer manager, the traffic
+manager and the DMA driver are one composite with mutual dependencies
+between its objects, so the object list is only link-complete now.
+
+INTEL_XRX500_NET is separate from LANTIQ_XRX200 because INTEL_MIPS and
+LANTIQ are mutually exclusive entries in the system type choice of
+arch/mips/Kconfig, so this port cannot depend on SOC_TYPE_XWAY.
+INTEL_XRX500_BM is not a module. The buffer economy is a set of reserved
+memory regions the driver maintains by hand, and the MIPS cache
+maintenance that takes is not exported to modules.
+
+From this point CONFIG_INTEL_XRX500_NET=y and CONFIG_INTEL_XRX500_BM=y
+build intel-xrx500-bm.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/Kconfig b/drivers/net/ethernet/Kconfig
+index aead145dd91d..0ca6b91f798d 100644
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -118,6 +118,7 @@ config LANTIQ_XRX200
+ 	  Support for the PMAC of the Gigabit switch (GSWIP) inside the
+ 	  Lantiq / Intel VRX200 VDSL SoC
+ 
++source "drivers/net/ethernet/lantiq/Kconfig"
+ source "drivers/net/ethernet/adi/Kconfig"
+ source "drivers/net/ethernet/litex/Kconfig"
+ source "drivers/net/ethernet/marvell/Kconfig"
+diff --git a/drivers/net/ethernet/Makefile b/drivers/net/ethernet/Makefile
+index 998dd628b202..7432200bd12e 100644
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -56,6 +56,7 @@ obj-$(CONFIG_JME) += jme.o
+ obj-$(CONFIG_KORINA) += korina.o
+ obj-$(CONFIG_LANTIQ_ETOP) += lantiq_etop.o
+ obj-$(CONFIG_LANTIQ_XRX200) += lantiq_xrx200.o
++obj-$(CONFIG_INTEL_XRX500_NET) += lantiq/
+ obj-$(CONFIG_NET_VENDOR_LITEX) += litex/
+ obj-$(CONFIG_NET_VENDOR_MARVELL) += marvell/
+ obj-$(CONFIG_NET_VENDOR_MEDIATEK) += mediatek/
+diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/Kconfig
+new file mode 100644
+index 000000000000..0071cfad7b55
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/Kconfig
+@@ -0,0 +1,43 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Intel xRX500 packet datapath.
++#
++# INTEL_XRX500_NET is separate from LANTIQ_XRX200 because INTEL_MIPS and
++# LANTIQ are mutually exclusive entries in arch/mips/Kconfig's "System
++# type" choice, so this port cannot depend on SOC_TYPE_XWAY.
++
++menuconfig INTEL_XRX500_NET
++	bool "Intel xRX500 / GRX350 ethernet drivers"
++	depends on INTEL_MIPS && OF && HAS_IOMEM
++	default n
++	help
++	  Selects the packet datapath of the Intel xRX500 family: the buffer
++	  manager that owns the segment pools and the egress queues, the DMA
++	  controllers that move frames between them and the switch macros, and
++	  the network device that carries the processor's end of it.
++
++	  The switch macros themselves are driven as DSA switches and are
++	  configured under Distributed Switch Architecture instead.
++
++	  Say N here unless you are building for a GRX350-class board such as
++	  the AVM FRITZ!Box 7560.
++
++if INTEL_XRX500_NET
++
++config INTEL_XRX500_BM
++	bool "xRX500 packet buffer manager"
++	default n
++	help
++	  The central buffer manager, the traffic manager it dequeues
++	  through, and the packet DMA controllers. Together they own the
++	  reserved segment pools every frame is carried in, the free-segment
++	  queue those segments are drawn from and returned to, and the
++	  per-port egress resources a frame is enqueued on.
++
++	  Not a module: the buffer economy is a set of reserved memory
++	  regions the driver maintains by hand, and the MIPS cache
++	  maintenance that takes is not exported to modules.
++
++	  Say N unless you are bringing this datapath up.
++
++endif # INTEL_XRX500_NET
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+new file mode 100644
+index 000000000000..f0313921e9df
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Makefile for the Intel xRX500 packet datapath.
++#
++# cqm/grx500/, tmu/ and dma/ all contribute objects to one composite
++# module, so the object list lives here rather than in the subdirectory
++# Makefiles: symbol resolution between them stays intra-module and needs no
++# exports.
++
++obj-$(CONFIG_INTEL_XRX500_BM) += intel-xrx500-bm.o
++
++intel-xrx500-bm-y := cqm/grx500/cbm.o cqm/grx500/cbm_basic.o cqm/grx500/cbm_buf.o
++intel-xrx500-bm-y += cqm/grx500/cbm_intr.o cqm/grx500/fsqm.o cqm/grx500/cbm_dma.o
++intel-xrx500-bm-y += cqm/grx500/cbm_ports.o
++intel-xrx500-bm-y += dma/hdma.o
++intel-xrx500-bm-y += tmu/tmu_init.o tmu/drv_tmu_ll.o

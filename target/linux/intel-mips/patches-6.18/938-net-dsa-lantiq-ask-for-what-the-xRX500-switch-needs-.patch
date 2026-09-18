@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 06:38:23 +0200
+Subject: net: dsa: lantiq: ask for what the xRX500 switch needs to probe
+
+The reset lines of the integrated PHYs come from the SoC's own reset
+controller. Its driver has no prompt outside COMPILE_TEST and defaults to a
+system type this family is not, so it can only arrive by selection -- and a
+configuration line naming it does not survive, because a promptless symbol
+falls back to its default whatever the file says. On this platform it was
+being selected by an unrelated PHY driver; turn that driver off and every
+reset lookup defers forever, the switch never probes and the board has no
+network at all, with nothing in the log naming the cause.
+
+The driver that needs it asks for it now, together with the register window
+the reset controller reads its status through, and both only on the system
+type that has this switch. The firmware loader the integrated PHYs are
+staged through is asked for too, and the memory-mapped regmap both switch
+models build on moves to the core they share.
+
+Also drop a comment's reference to a file this tree does not have; the
+register it describes is unchanged.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/Kconfig b/drivers/net/dsa/lantiq/Kconfig
+index 7c13df0a0dc7..fc9ddad11b9a 100644
+--- a/drivers/net/dsa/lantiq/Kconfig
++++ b/drivers/net/dsa/lantiq/Kconfig
+@@ -1,6 +1,7 @@
+ config NET_DSA_LANTIQ_COMMON
+ 	tristate
+ 	select REGMAP
++	select REGMAP_MMIO
+ 
+ config NET_DSA_LANTIQ_GSWIP
+ 	tristate "Lantiq / Intel GSWIP"
+@@ -13,10 +14,22 @@ config NET_DSA_LANTIQ_GSWIP
+ 
+ config NET_DSA_LANTIQ_GSWIP_XRX500
+ 	tristate "Lantiq / Intel GSWIP 3.0"
++	depends on INTEL_MIPS || COMPILE_TEST
+ 	depends on HAS_IOMEM
+ 	depends on RESET_CONTROLLER
++	select FW_LOADER
+ 	select NET_DSA_TAG_GSWIP3
+ 	select NET_DSA_LANTIQ_COMMON
++	#
++	# The reset lines of the integrated PHYs come from the SoC's own
++	# reset controller, whose driver has no prompt of its own and
++	# defaults to a system type this family is not. Without it every
++	# reset lookup defers forever and the switch never probes, so the
++	# one driver that needs it asks for it, along with the register
++	# window it reads its status through.
++	#
++	select MFD_SYSCON if INTEL_MIPS
++	select RESET_LANTIQ if INTEL_MIPS
+ 	help
+ 	  This enables support for the two Lantiq / Intel GSWIP 3.0 switch
+ 	  macros found in the xRX500 SoC family.
+diff --git a/drivers/watchdog/intel_grx500_wdt.c b/drivers/watchdog/intel_grx500_wdt.c
+index 6ca15fd31dc5..12decd152a1f 100644
+--- a/drivers/watchdog/intel_grx500_wdt.c
++++ b/drivers/watchdog/intel_grx500_wdt.c
+@@ -59,12 +59,11 @@
+  * its deassert status register (it writes only to +0x10). That does not make
+  * the reading ambiguous: the status register is a remap of the request
+  * register rather than a mirror of it, and bit 31 is one of the positions
+- * where the two part company. The bit xrx500_phy_fw.c takes for the GPHYF
+- * reset line is bit 31 of RCU_RST_REQ, which is a different register; that
+- * line reports its status in bit 30, and bit 31 of the status word is a reset
+- * cause with no request counterpart at all. Bit 29 beside it is the other
+- * cause, the status of the global software reset a reboot goes through, and
+- * the two are mutually exclusive.
++ * where the two part company. RCU_RST_REQ bit 31 is the GPHY firmware reset
++ * line, whose status is reported in bit 30; bit 31 of the status word is a
++ * reset cause with no request counterpart at all. Bit 29 beside it is the
++ * other cause, the status of the global software reset a reboot goes through,
++ * and the two are mutually exclusive.
+  *
+  * Whether the bit is write-1-to-clear or plain read/write is unresolved, and
+  * a blind write-back would clobber the reset line statuses that share the

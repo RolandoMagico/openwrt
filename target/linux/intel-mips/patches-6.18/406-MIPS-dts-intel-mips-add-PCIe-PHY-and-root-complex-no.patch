@@ -1,0 +1,240 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 16:24:45 +0200
+Subject: MIPS: dts: intel-mips: add PCIe PHY and root complex nodes
+
+Describe the three Synopsys DesignWare root complexes and their three
+serdes PHYs so the intel-gw-pcie and grx500-pciephy drivers can bind on
+xRX500. Everything is disabled here; which ports are populated, and how
+they are wired, is a board property.
+
+Addresses, interrupt lines and reset bits come from the vendor tree
+(AVM 4.9 arch/mips/boot/dts/lantiq/xrx500.dtsi), which boots this
+silicon. Four things are deliberately not the vendor's:
+
+ - reg-names are the upstream binding's "dbi"/"config"/"app", not the
+   vendor's "csr"/"cfg"/"app". pcie-designware-host.c looks the config
+   window up by the name "config" and fails the probe without it, and
+   taking the other two names from intel-gw-pcie.yaml at the same time
+   costs nothing now and saves renaming them again when that binding
+   grows an xRX500 compatible.
+
+ - bus-range ends at 7, not 8. The config accessor masks the bus number
+   to three bits before shifting it into the config window, so bus 8
+   does not address bus 8; it aliases onto bus 0, which is the DBI.
+   Enumerating it would read the root port's own registers back as a
+   phantom device on a phantom bus. Seven busses is everything this
+   address decoder can express, and no board here comes close to
+   needing more.
+
+ - ranges carries the memory window only. The vendor tree adds a 64 KiB
+   downstream I/O window per port, at cfg + 0x800000. Nothing on this
+   platform implements PCI I/O BARs, and MIPS resolves port numbers as
+   mips_io_port_base + port, which arch/mips/intel-mips/prom.c points at
+   KSEG1 -- so an I/O resource here would not reach the window it names,
+   it would land on low physical memory. Describing one would be a
+   liability, not a fallback.
+
+ - the MSI windows and the eight MSI interrupts per port are left out.
+   This step routes legacy INTx only, through interrupt-map. Adding the
+   MSI controller is a separate change, and describing hardware nothing
+   drives helps nobody.
+
+The PHY nodes need two syscon phandles rather than the vendor's one:
+intel,syscon for the chiptop IFMUX reference-clock gate, whose enable
+bit is 22 + intel,phy-id, and intel,cgu-syscon for the spread-spectrum
+controls in the CGU. intel,phy-id itself is mandatory -- the driver has
+no of_alias_get_id() fallback -- which is why no "pciephy" aliases are
+needed.
+
+Their resets are also shaped differently. The vendor writes <&rcu0 12>
+against a controller with #reset-cells = <1>; this tree binds the
+mainline lantiq,xrx200-reset, whose two cells are a request bit and a
+status bit. As everywhere else on this SoC the two are the same bit
+position in RCU_RST_REQ and RCU_RST_STAT, hence <&rcu_reset0 12 12>.
+
+No intel,ssc-enable at SoC level. Spread spectrum is a board decision
+and the driver defaults it off when the property is absent, so boards
+that want it ask for it themselves. The vendor tree does state a
+SoC-level default, and it is dead: its driver knows only the underscore
+spelling, which is what its board files use, so the hyphenated <0> here
+is read by nothing. A default that never applies is worse than no
+default, because it reads as policy.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 319eb8de4b11..604e523a6cd2 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -172,4 +172,169 @@ ebu_nand: nand-controller@16f00000 {
+ 		#size-cells = <0>;
+ 		status = "disabled";
+ 	};
++
++	/*
++	 * Three independent Synopsys DesignWare root complexes, each with its
++	 * own serdes PHY and its own chip-top byte-swap configuration.
++	 */
++
++	/*
++	 * Serdes PHYs. Both syscon phandles are mandatory: one carries the
++	 * PHY configuration word and the other the reset. intel,phy-id has no
++	 * fallback — the driver cannot derive it — and the reset cell is
++	 * doubled because the set and status bits differ.
++	 */
++	pcie_phy0: phy@18500000 {
++		compatible = "intel,grx500-pciephy";
++		reg = <0x18500000 0x100000>;
++		reg-names = "phy";
++		#phy-cells = <0>;
++		intel,syscon = <&chiptop>;
++		intel,cgu-syscon = <&cgu>;
++		intel,phy-id = <0>;
++		resets = <&rcu_reset0 12 12>;
++		reset-names = "phy";
++		status = "disabled";
++	};
++
++	pcie_phy1: phy@18000000 {
++		compatible = "intel,grx500-pciephy";
++		reg = <0x18000000 0x100000>;
++		reg-names = "phy";
++		#phy-cells = <0>;
++		intel,syscon = <&chiptop>;
++		intel,cgu-syscon = <&cgu>;
++		intel,phy-id = <1>;
++		resets = <&rcu_reset0 13 13>;
++		reset-names = "phy";
++		status = "disabled";
++	};
++
++	pcie_phy2: phy@18a00000 {
++		compatible = "intel,grx500-pciephy";
++		reg = <0x18a00000 0x100000>;
++		reg-names = "phy";
++		#phy-cells = <0>;
++		intel,syscon = <&chiptop>;
++		intel,cgu-syscon = <&cgu>;
++		intel,phy-id = <2>;
++		resets = <&rcu_reset0 10 10>;
++		reset-names = "phy";
++		status = "disabled";
++	};
++
++	/*
++	 * Root complexes. Three requirements the code cannot show:
++	 *
++	 * - The window must be named "config": pcie-designware-host.c looks
++	 *   it up by name.
++	 * - bus-range stops at 7 because the config accessor masks the bus
++	 *   number to three bits.
++	 * - device_type = "pci" is required for the OF PCI bus parser to
++	 *   accept the node.
++	 */
++	pcie0: pcie@18900000 {
++		compatible = "intel,xrx500-pcie";
++		device_type = "pci";
++		reg = <0x18900000 0x100000>,	/* DWC core registers (DBI) */
++		      <0xbb000000 0x800000>,	/* configuration space */
++		      <0x18800000 0x100000>;	/* application logic */
++		reg-names = "dbi", "config", "app";
++		#address-cells = <3>;
++		#size-cells = <2>;
++		bus-range = <0x00 0x07>;
++		ranges = <0x02000000 0 0xb8000000 0xb8000000 0 0x03000000>;
++		linux,pci-domain = <0>;
++		max-link-speed = <2>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 152 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "ir";
++		#interrupt-cells = <1>;
++		interrupt-map-mask = <0 0 0 0x7>;
++		interrupt-map = <0 0 0 1 &gic GIC_SHARED 136 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 2 &gic GIC_SHARED 137 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 3 &gic GIC_SHARED 138 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 4 &gic GIC_SHARED 139 IRQ_TYPE_LEVEL_HIGH>;
++
++		clocks = <&cgu GCLK_PCIE0>;
++		clock-names = "ctl";
++		phys = <&pcie_phy0>;
++		phy-names = "pcie";
++
++		intel,syscon = <&chiptop>;
++		intel,inbound-shift = <5>;
++		intel,outbound-shift = <4>;
++		status = "disabled";
++	};
++
++	pcie1: pcie@18400000 {
++		compatible = "intel,xrx500-pcie";
++		device_type = "pci";
++		reg = <0x18400000 0x100000>,	/* DWC core registers (DBI) */
++		      <0xb7000000 0x800000>,	/* configuration space */
++		      <0x18300000 0x100000>;	/* application logic */
++		reg-names = "dbi", "config", "app";
++		#address-cells = <3>;
++		#size-cells = <2>;
++		bus-range = <0x00 0x07>;
++		ranges = <0x02000000 0 0xb4000000 0xb4000000 0 0x03000000>;
++		linux,pci-domain = <1>;
++		max-link-speed = <2>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 49 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "ir";
++		#interrupt-cells = <1>;
++		interrupt-map-mask = <0 0 0 0x7>;
++		interrupt-map = <0 0 0 1 &gic GIC_SHARED 9 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 2 &gic GIC_SHARED 10 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 3 &gic GIC_SHARED 11 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 4 &gic GIC_SHARED 12 IRQ_TYPE_LEVEL_HIGH>;
++
++		clocks = <&cgu GCLK_PCIE1>;
++		clock-names = "ctl";
++		phys = <&pcie_phy1>;
++		phy-names = "pcie";
++
++		intel,syscon = <&chiptop>;
++		intel,inbound-shift = <9>;
++		intel,outbound-shift = <8>;
++		status = "disabled";
++	};
++
++	pcie2: pcie@18e00000 {
++		compatible = "intel,xrx500-pcie";
++		device_type = "pci";
++		reg = <0x18e00000 0x100000>,	/* DWC core registers (DBI) */
++		      <0xbf000000 0x800000>,	/* configuration space */
++		      <0x18d00000 0x100000>;	/* application logic */
++		reg-names = "dbi", "config", "app";
++		#address-cells = <3>;
++		#size-cells = <2>;
++		bus-range = <0x00 0x07>;
++		ranges = <0x02000000 0 0xbc000000 0xbc000000 0 0x03000000>;
++		linux,pci-domain = <2>;
++		max-link-speed = <2>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 55 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "ir";
++		#interrupt-cells = <1>;
++		interrupt-map-mask = <0 0 0 0x7>;
++		interrupt-map = <0 0 0 1 &gic GIC_SHARED 155 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 2 &gic GIC_SHARED 156 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 3 &gic GIC_SHARED 157 IRQ_TYPE_LEVEL_HIGH>,
++				<0 0 0 4 &gic GIC_SHARED 158 IRQ_TYPE_LEVEL_HIGH>;
++
++		clocks = <&cgu GCLK_PCIE2>;
++		clock-names = "ctl";
++		phys = <&pcie_phy2>;
++		phy-names = "pcie";
++
++		intel,syscon = <&chiptop>;
++		intel,inbound-shift = <13>;
++		intel,outbound-shift = <12>;
++		status = "disabled";
++	};
+ };

@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 12:56:57 +0200
+Subject: net: dsa: lantiq: let a model finish the switch bring-up
+
+setup() covers the blocks the whole family shares, and the reset it issues
+first returns everything else in the switch register window to its defaults.
+A model whose window holds more than those blocks therefore cannot program
+them from probe: whatever it writes there is undone by the time setup()
+returns.
+
+Add a per-model setup callback, run at the end of setup() in the same shape as
+the existing per-port one, so a model can place its own bring-up after the
+reset, the microcode load and the MDIO bus registration.
+
+No functional change: no existing model sets the callback.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.h b/drivers/net/dsa/lantiq/lantiq_gswip.h
+index 343dac7a1625..2d973f348593 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.h
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.h
+@@ -316,6 +316,12 @@ struct gswip_hw_info {
+ 	struct phylink_pcs *(*mac_select_pcs)(struct phylink_config *config,
+ 					      phy_interface_t interface);
+ 	int (*port_setup)(struct dsa_switch *ds, int port);
++	/* Model-specific part of the switch bring-up. Runs at the end of
++	 * setup(), after the microcode load and the MDIO bus registration,
++	 * so a model can program blocks that the reset at the start of
++	 * setup() returns to their defaults.
++	 */
++	int (*setup)(struct dsa_switch *ds);
+ };
+ 
+ struct gswip_gphy_fw {
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index 8cf031279496..b92d15d063c1 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -794,6 +794,12 @@ static int gswip_setup(struct dsa_switch *ds)
+ 
+ 	ds->mtu_enforcement_ingress = true;
+ 
++	if (priv->hw_info->setup) {
++		err = priv->hw_info->setup(ds);
++		if (err)
++			return err;
++	}
++
+ 	return 0;
+ }
+ 

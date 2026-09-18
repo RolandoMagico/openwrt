@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 30 Aug 2026 22:23:09 +0200
+Subject: MIPS: asm-eva: stop kernel_ld/kernel_sd emitting EVA instructions
+
+The kernel_* accessors in asm-eva.h exist so that code touching kernel
+memory on an EVA kernel uses ordinary load/store instructions instead of
+the EVA ones, which perform the access with user access rights whatever
+mode the CPU is in. CONFIG_32BIT has no ld or sd, so the doubleword forms
+are assembled from a pair of word accesses -- but from user_lw() and
+user_sw(), not from kernel_lw() and kernel_sw(). Under CONFIG_EVA that
+makes kernel_ld() expand to lwe and kernel_sd() to swe, so the two members
+of the family whose whole purpose is to avoid EVA instructions are the only
+ones that emit them. EVA is a MIPS32 feature, so an EVA kernel is always a
+CONFIG_32BIT kernel and always gets that pair.
+
+Their users are __get_kernel_nofault() and __put_kernel_nofault(), which
+pick an accessor by access size. copy_from_kernel_nofault() and
+copy_to_kernel_nofault() therefore issue user-rights accesses for as long
+as at least eight bytes are left to transfer. EVA segmentation gives the
+kernel's unmapped windows kernel-only access mode, so a user-rights access
+to one is an address error whatever the address is -- and that is where the
+memory these callers are asked to touch lives. Reading /dev/mem with dd on
+a MIPS interAptiv with CONFIG_CPU_MIPS32_3_5_EVA=y (abridged):
+
+  Unhandled kernel unaligned access[#1]:
+  epc   : 806b4644 copy_from_kernel_nofault+0xec/0x1c0
+  Cause : 00800010 (ExcCode 04)
+  BadVA : 91000000
+  Code: 1460000b 26100008 00c01025 <7e04002f> 7e05022f 2652fff8
+
+7e04002f and 7e05022f are "lwe a0,0(s0)" and "lwe a1,4(s0)", the two halves
+of the doubleword load, and 2652fff8 is the "addiu s2,s2,-8" that closes
+the eight-byte loop. The failure is thus size dependent and address
+independent: the four-, two- and one-byte loops select kernel_lw(),
+kernel_lh() and kernel_lb(), which are correct, so a four-byte read of an
+address returns its contents while an eight-byte read of the same address
+oopses. The reach is every user of the two helpers, among them
+bpf_probe_read_kernel() and read() on /dev/mem.
+
+Build kernel_ld() and kernel_sd() out of kernel_lw() and kernel_sw()
+instead. Without CONFIG_EVA the two spellings are the same instruction, so
+nothing changes there. With it, the only difference in the generated code
+for the eight-byte loops is lwe/swe becoming lw/sw; registers, offsets and
+exception table entries are untouched.
+
+The definitions have been wrong since kernel_ld() and kernel_sd() were
+introduced, but nothing used them: uaccess.h kept private _loadd/_stored
+macros for its kernel-access paths until commit 04324f44cb69 ("MIPS: Remove
+get_fs/set_fs") deleted those and pointed __get_kernel_nofault() and
+__put_kernel_nofault() at the asm-eva.h family.
+
+Fixes: 04324f44cb69 ("MIPS: Remove get_fs/set_fs")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/include/asm/asm-eva.h b/arch/mips/include/asm/asm-eva.h
+index 220431d00ee9..acbc928e551f 100644
+--- a/arch/mips/include/asm/asm-eva.h
++++ b/arch/mips/include/asm/asm-eva.h
+@@ -35,8 +35,8 @@
+  * No 'sd' or 'ld' instructions in 32-bit but the code will
+  * do the correct thing
+  */
+-#define kernel_sd(reg, addr)		user_sw(reg, addr)
+-#define kernel_ld(reg, addr)		user_lw(reg, addr)
++#define kernel_sd(reg, addr)		kernel_sw(reg, addr)
++#define kernel_ld(reg, addr)		kernel_lw(reg, addr)
+ #else
+ #define kernel_sd(reg, addr)		"sd " reg", " addr "\n"
+ #define kernel_ld(reg, addr)		"ld " reg", " addr "\n"
+@@ -122,8 +122,8 @@
+  * No 'sd' or 'ld' instructions in 32-bit but the code will
+  * do the correct thing
+  */
+-#define kernel_sd(reg, addr)		user_sw(reg, addr)
+-#define kernel_ld(reg, addr)		user_lw(reg, addr)
++#define kernel_sd(reg, addr)		kernel_sw(reg, addr)
++#define kernel_ld(reg, addr)		kernel_lw(reg, addr)
+ #else
+ #define kernel_sd(reg, addr)		sd reg, addr
+ #define kernel_ld(reg, addr)		ld reg, addr

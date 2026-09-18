@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 17:09:51 +0200
+Subject: clk: intel: correct the off-by-one in the CGU field write mask
+
+intel_set_clk_val() builds its mask with GENMASK(width + shift, shift),
+which spans width + 1 bits.  Every field write therefore also clears the
+bit immediately above the field it was asked to write.
+
+The vendor tree has already fixed this in the same file.  The GPL source
+releases for the FRITZ!Box 7590 (07.50 and 08.25) carry a later revision
+of drivers/clk/intel/clk-cgu.c -- same filename, same function name,
+same signature -- whose helper reads
+
+	u32 mask = GENMASK(width + shift - 1, shift);
+
+That is the form adopted here, verbatim.  This file is shared framework
+code rather than per-SoC code: in the 08.25 tree it backs clk-prx300.c,
+while the GRX500 support there is a separate legacy CLK_OF_DECLARE
+driver.  We drive it from our own clk-grx500.c branch tables instead, so
+the helper is common ground between the two trees even though nothing
+else in the directory is.  Our copy of it descends from the older 2018
+Intel submission that created drivers/clk/intel/ and had the defect from
+birth; the 7590 releases carry the same helper after the vendor base it
+came from was corrected.
+
+Three further implementations agree.  The reader in this very file is
+right (intel_get_clk_val() masks with BIT(width) - 1).  Mainline's fork
+is right: drivers/clk/x86/clk-cgu.h, lgm_set_clk_val(), uses
+(GENMASK(width - 1, 0) << shift), the same value written the other way
+round.  And the older vendor helper is right too: set_clk_val() in
+drivers/clk/intel/clk_api.c masks with to_mask(width) = BIT(width) - 1,
+byte-identical across every vendor GPL release checked.
+
+One write already goes out with the bad mask on every boot, and hardware
+says it is harmless.  CLK_VOICE carries CLOCK_FLAG_VAL_INIT
+(clk-grx500.c), so intel_clk_register_fixed() writes IF_CLK bits 15:14 at
+every probe with mask 0x1c000 instead of 0xc000, taking CGU IF_CLK
+(0x162000c4) bit 16 down with it.  A FRITZ!Box 7590 running the corrected
+code still reads 0x00008084 there, exactly as it did before, so bit 16 is
+0 out of reset on this silicon and the surplus write was overwriting a
+zero with a zero.  Worth stating plainly rather than leaving as a claim of
+corruption: this was the only place the defect was reachable today, and
+the answer is benign.
+
+The unreachable paths are where it would have mattered.  The eight
+pll_div fields sit at shifts 0/4/8/12 with width 4, so the surplus bit
+of a set_rate() write lands on bit shift + 4 -- which for four of the
+eight is the neighbouring divider's bit 0 (a gswip write would also
+clear ddr's LSB, an ssx4 write cpu0's).  The CPU mux is worse: CLK_CPU
+is shift 29 width 1 in PLL0A_CFG1, so a set_parent() would clear bit 30,
+and bit 30 reads 1 on both boards (PLL0A_CFG1 = 0x60403863 on the
+FRITZ!Box 7590).  None of it is reachable without an OPP table or a
+cpufreq driver, neither of which exists for intel-mips, but the watchdog
+is about to grow a clk rate-change notifier whose whole purpose is to
+cope with a CPU-clock change, so the helper has to be correct first.
+
+The three gate call sites pass a hardcoded width of 1 and so write two
+bits, but only ever into the write-1-to-act GATE_HW_REG_EN/_DIS registers
+with the surplus bit zero, which is inert.  They become exact too.  The
+08.25 revision passes the same hardcoded 1 and relies on the same
+property.
+
+No caller compensates for the wide mask: every width argument in this
+directory comes straight from the intel_clk_branch tables, the macros in
+clk-cgu.h apply no arithmetic to it, and both the 08.25 revision and
+mainline pass identical widths to their corrected helpers.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/clk/intel/clk-cgu.c b/drivers/clk/intel/clk-cgu.c
+index 84dcfa913ee0..f17448377f3f 100644
+--- a/drivers/clk/intel/clk-cgu.c
++++ b/drivers/clk/intel/clk-cgu.c
+@@ -28,7 +28,7 @@
+ void intel_set_clk_val(struct regmap *map, u32 reg, u8 shift,
+ 		       u8 width, u32 set_val)
+ {
+-	u32 mask = GENMASK(width + shift, shift);
++	u32 mask = GENMASK(width + shift - 1, shift);
+ 
+ 	regmap_update_bits(map, reg, mask, set_val << shift);
+ }

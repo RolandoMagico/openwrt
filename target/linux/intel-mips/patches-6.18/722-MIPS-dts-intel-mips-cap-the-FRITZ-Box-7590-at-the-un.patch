@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 07:02:19 +0200
+Subject: MIPS: dts: intel-mips: cap the FRITZ!Box 7590 at the uncached window
+
+Match the memory node to the top of the uncached window, PHYS_OFFSET +
+SZ_256M, the same constant arch/mips/mm/dma-noncoherent.c bounds
+uncached aliases with.
+
+Below that line every page has an uncached alias, so a coherent
+allocation can be handed one wherever the allocator happens to place it
+and the bound holds by construction. Above it there is no alias to give,
+and nothing in the page allocator can be asked to prefer one page over
+another on that basis -- so as long as the node reaches past the window,
+a coherent allocation is a lottery that this board loses once page-cache
+churn has moved the free lists up. That was observed: both radios failed
+to return from a wifi down/up, and a later boot took a fatal data bus
+error on a coherent page at physical 0x31477000, whose alias falls in an
+unpopulated part of the register space.
+
+This is a statement about coherent DMA and not about the memory. The
+upper 256 MiB is good RAM and the fabric reaches all of it -- cached
+access across the full 512 MiB is proven by a 300 MiB cached md5 round
+trip, and by a boot that ran its kernel stack at physical 0x309f8000 for
+nearly nine seconds without complaint. Only the uncached alias stops
+early.
+
+It is the second cap on this node and the first one is instructive. That
+one stopped at 0x32310000, a number taken from the CPC base -- the first
+populated block in the register space rather than the start of it. It
+sat above the true bound, so it cost 221 MiB and still admitted every
+address that faults. It has been dropped.
+
+Recovering the full width is parked rather than abandoned. The shape
+that would do it is to size ZONE_DMA to the uncached window and have
+dma-direct allocate from the zone that has an uncached alias, which
+confines coherent allocations without capping anything. Two things keep
+it out for now. It
+moves ordinary GFP_KERNEL allocations above 0x30000000, which boots into
+a reserved instruction exception -- module text is vmalloc-only on this
+architecture, so a module function pointer reached through the linear
+alias lands on a page that does not hold it; the defect is latent today
+and has nothing to do with DMA, and one CONFIG_DEBUG_VIRTUAL boot will
+name the caller with %pS rather than leaving an EPC to decode. And it
+changes the FRITZ!Box 7560's zone layout as a side effect, turning that
+board's entire memory into ZONE_DMA, which is an unvalidated change to
+the one board this platform is proven on.
+
+Every reservation in this file and in seale_avm.dtsi is below the cap,
+the bootcore window ending exactly at it. The shm RNG seed at 0x3dfb0000
+is outside the memory node again, so its reservation returns to being a
+supported no-op; the comments on both say so.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 69588093bfe1..71c0845cdc71 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -29,52 +29,13 @@ avm-hw-revision {
+ 	};
+ 
+ 	/*
+-	 * The board's full 512 MiB, at PHYS_OFFSET 0x20000000.
+-	 *
+-	 * ## THIS DTB IS SINGLE-KERNEL-ONLY.                      ##
+-	 * ## Booting it from a dual-kernel container corrupts or  ##
+-	 * ## hangs, and it does so silently at first.             ##
+-	 *
+-	 * The coupling is exact and it is not a style preference. The
+-	 * bootcore's protect_unattached() takes the ram-size = <256> its own
+-	 * device tree declares and programs a PM_DDR_GROUP_NONE deny-all
+-	 * fabric region over its 32 MiB window at [0x2e000000, 0x2fffffff]
+-	 * and over everything above that size, [0x30000000, 0x9fffffff].
+-	 *
+-	 * The upper half of this board's populated DRAM -- precisely the half
+-	 * this memory node now declares -- is then denied to every initiator.
+-	 * The failure is a fault or hang on first touch of anything above
+-	 * 0x30000000, and it is not the KSEG1-aperture class and not helped
+-	 * by staying under that bound.
+-	 *
+-	 * A single-kernel image starts no bootcore, so the protection pass
+-	 * never runs and this node is safe.
+-	 *
+-	 * Two bounds that did NOT move and still apply at 512 MiB:
+-	 *
+-	 * The uncached alias of DRAM covers the first 256 MiB only, and stops
+-	 * at PHYS_OFFSET + SZ_256M = 0x30000000. The SegCtl maps kernel VA
+-	 * 0xA0000000-0xBFFFFFFF uncached onto physical 0x20000000-0x3FFFFFFF,
+-	 * and only the lower half of that is DRAM; the upper half is the
+-	 * SoC's register space. Cached RAM is fine across the whole node --
+-	 * KSEG0 maps 0x80000000 to 0x20000000 and covers all 512 MiB -- but
+-	 * anything taking an uncached alias must stay below 0x30000000. hdma,
+-	 * which aliases addresses by hand, carries the same bound itself; for
+-	 * every other consumer it is the width of this memory node that has
+-	 * to keep allocations inside the window, since an ordinary GFP_KERNEL
+-	 * page can otherwise come from anywhere in it.
+-	 *
+-	 * An earlier revision of this comment put the line at PHYS_OFFSET +
+-	 * 0x12310000. That address is the CPC -- the first *populated* block
+-	 * in the register space rather than the start of it -- and bounding
+-	 * at it admitted 35 MiB whose alias faults on the unpopulated holes
+-	 * and lands in live registers elsewhere. The CBM pools at
+-	 * 0x23800000..0x25200000 that seale_avm.dtsi reserves cannot move,
+-	 * only be extended past.
++	 * Capped at the top of the uncached window (PHYS_OFFSET + SZ_256M):
++	 * above it the KSEG1 alias of a page is a register address, so no
++	 * coherent allocation may land there.
+ 	 */
+ 	memory@20000000 {
+ 		device_type = "memory";
+-		reg = <0x20000000 0x20000000>;
++		reg = <0x20000000 0x10000000>;
+ 	};
+ 
+ 	aliases {

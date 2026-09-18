@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 19:42:22 +0200
+Subject: MIPS: mm: fix arch_dma_set_uncached() under EVA
+
+arch_dma_set_uncached() builds the uncached alias of a kernel address by
+taking __pa() of it and adding UNCAC_BASE.  That composes correctly only
+when __pa() returns an address measured from the same point the uncached
+window starts at, namely the beginning of DRAM.
+
+___pa() has three forms (arch/mips/include/asm/page.h).  On 64-bit, and
+on 32-bit without EVA, it masks the segment bits off the virtual address
+and so returns an address measured from physical zero; the sum is right.
+Under EVA the memory map is arbitrary, there are no segment bits that can
+be masked, and __pa() is computed as
+
+	x - PAGE_OFFSET + PHYS_OFFSET
+
+which is anchored on PHYS_OFFSET.  Adding UNCAC_BASE to that overshoots
+by exactly PHYS_OFFSET, since the uncached window is not anchored on
+PHYS_OFFSET -- it maps the start of DRAM, whether directly or through a
+board alias.
+
+Malta with CONFIG_EVA=y is affected in tree.  It sets PAGE_OFFSET = 0 and
+PHYS_OFFSET = 0x80000000 in arch/mips/include/asm/mach-malta/spaces.h and
+exploits the board alias of physical 0x80000000-0xffffffff onto physical
+zero, so a lowmem page at virtual 0x023c4000 has __pa() 0x823c4000.
+Adding UNCAC_BASE gives 0x1223c4000, which truncates to 0x223c4000 -- a
+useg address, which Malta's own segmentation setup makes kernel-unmapped
+and *cached* (segment 5, MUSUK, PA 6).  The caller is handed a cached
+pointer to unrelated DRAM rather than something that faults, so the
+failure mode is silent corruption.  With the anchor taken back out the
+same page yields 0xa23c4000, a kseg1 address onto the alias of the very
+same DRAM.
+
+This reproduces on qemu-system-mipsel -M malta -cpu P5600 -m 2G with
+maltasmvp_eva_defconfig.  Malta leaves dma_default_coherent false there
+("Software DMA cache coherency enabled"), so every dma_alloc_coherent()
+takes this path: the PIIX4 IDE controller's descriptor table lands on the
+bad pointer and the root filesystem fails to mount, and it mounts with
+the anchor removed.  A write through the cached mapping followed by
+dma_cache_wback_inv() is visible through the corrected alias and not
+through the current one.
+
+The other platforms carrying a non-zero PHYS_OFFSET -- IP22, IP28 and
+PIC32MZDA, plus anything selecting MIPS_AUTO_PFN_OFFSET such as EyeQ or
+the generic kernel -- are not EVA, and must keep the existing arithmetic
+because their __pa() really does measure from physical zero.  Gating on
+CONFIG_EVA rather than on a non-zero PHYS_OFFSET is what keeps them
+working; building arch/mips/mm/dma-noncoherent.o for ip22_defconfig,
+ip28_defconfig and eyeq5_defconfig shows that an unconditional
+subtraction would have changed their code generation.
+
+Under EVA, __pa(x) - PHYS_OFFSET is x - PAGE_OFFSET, so this restores
+exactly the arithmetic UNCAC_ADDR() carried before commit 0d0e14770d44
+("MIPS: Make (UN)CAC_ADDR() PHYS_OFFSET-agnostic") folded PHYS_OFFSET
+into it.  That commit also dropped the per-platform UNCAC_BASE overrides
+which had been compensating, which is why nothing has compensated since.
+
+Restoring such an override is not an option here, because the expression
+adds a full physical address: a Malta UNCAC_BASE would have to be
+0xa0000000 - 0x80000000 = 0x20000000, which is not a kseg1 address at all
+and would break every other TO_UNCAC() and CKSEG1ADDR() user.
+
+Fixes: 0d0e14770d44 ("MIPS: Make (UN)CAC_ADDR() PHYS_OFFSET-agnostic")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/mm/dma-noncoherent.c b/arch/mips/mm/dma-noncoherent.c
+index ab4f2a75a7d0..96400a9fd294 100644
+--- a/arch/mips/mm/dma-noncoherent.c
++++ b/arch/mips/mm/dma-noncoherent.c
+@@ -51,6 +51,16 @@ void arch_dma_prep_coherent(struct page *page, size_t size)
+ 
+ void *arch_dma_set_uncached(void *addr, size_t size)
+ {
++	/*
++	 * __pa() yields an address measured from physical zero on the legacy
++	 * memory map, which is also where the uncached window at UNCAC_BASE
++	 * begins, so the two compose directly.  Under EVA __pa() is anchored
++	 * on PHYS_OFFSET instead, while the window still starts at the base
++	 * of DRAM, so the anchor has to be taken back out.
++	 */
++	if (IS_ENABLED(CONFIG_EVA))
++		return (void *)(__pa(addr) - PHYS_OFFSET + UNCAC_BASE);
++
+ 	return (void *)(__pa(addr) + UNCAC_BASE);
+ }
+ 

@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 10 Sep 2026 18:33:53 +0200
+Subject: clk: intel: grx500: register the gates the packet datapath draws on
+
+The gate table carries twelve peripheral gates and none of the three the
+packet datapath runs on, even though the bit position of each is already
+defined beside the others: the buffer manager at bit 9 of the first gate
+status register, the packet accelerator at 26 and the switch at 28.
+
+That has cost nothing so far, because a gate nobody registers is a gate
+the framework cannot turn off either.
+
+Register all three the way the rest of the table is registered, with
+CLK_IGNORE_UNUSED like every gate above them. Nothing holds these three
+yet, so that flag is the whole of what keeps clk_disable_unused away from
+clocks the packet datapath does not survive losing, which is the policy
+the comment over the table already states. The same comment already names
+the buffer manager, the packet accelerator and the switch among them; this
+is what makes that sentence true of the table under it.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/clk/intel/clk-grx500.c b/drivers/clk/intel/clk-grx500.c
+index b3447f43cb13..6e2c2559d94c 100644
+--- a/drivers/clk/intel/clk-grx500.c
++++ b/drivers/clk/intel/clk-grx500.c
+@@ -124,6 +124,12 @@ static struct intel_clk_branch grx500_branch_clks[] __initdata = {
+ 	 * PAE, GSWIP and both USB controllers; the packet datapath does not
+ 	 * survive losing them.
+ 	 */
++	INTEL_GATE(GCLK_CBM, "g_cbm", NULL, CLK_IGNORE_UNUSED, GRX500_CLK_GSR1,
++		   G_CBM_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(GCLK_PAE, "g_pae", NULL, CLK_IGNORE_UNUSED, GRX500_CLK_GSR1,
++		   G_PAE_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(GCLK_GSWIP, "g_gswip", NULL, CLK_IGNORE_UNUSED,
++		   GRX500_CLK_GSR1, G_SWITCH_SHIFT, GATE_CLK_HW, 0),
+ 	INTEL_GATE(GCLK_DMA0, "g_dma0", NULL, CLK_IGNORE_UNUSED, GRX500_CLK_GSR1,
+ 		   G_DMA0_SHIFT, GATE_CLK_HW, 0),
+ 	INTEL_GATE(GCLK_USB0, "g_usb0", NULL, CLK_IGNORE_UNUSED, GRX500_CLK_GSR1,

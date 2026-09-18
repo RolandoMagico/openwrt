@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 19:50:46 +0200
+Subject: dt-bindings: phy: add Intel GRX500 USB PHY
+
+Document the binding the intel,grx500-usb-phy driver has been reading
+since it was added. Nothing here is new: the properties are the ones the
+driver already parses and the two boards already spell, written down.
+
+Both instances appear as examples on purpose. Everything that
+distinguishes them is a property value -- register window, gate clock,
+reset bit, chip-top offset -- so a binding that showed one instance would
+not show that any of it is parameterised. Both are in use: the FRITZ!Box
+7590 enables both controllers, the FRITZ!Box 7560 only the second.
+
+Four notes on things a reader may reasonably question, none of which the
+binding itself is the place for.
+
+The resets property refers to the second RCU reset bank, which is a
+sibling reset-controller node inside the RCU with descending reg entries
+(<0x48 4>, <0x24 4>) and two cells. That is not an invention: it is the
+example in Documentation/devicetree/bindings/mips/lantiq/rcu.txt, which
+shows the same node beside the first bank, and lantiq,reset.yaml
+validates each node on its own with no ordering constraint on reg. The
+same file documents the xRX200's two USB PHYs on bank 1 bits 4 and 5,
+with configuration words at +0x18 and +0x34 -- the pairing this SoC
+keeps, with the word moved into the chip-top syscon.
+
+The polarity properties are the vendor's, with a vendor prefix added.
+AVM's driver reads them unprefixed as invert-tx-polarity and
+invert-rx-polarity, which are not generic properties and should not look
+like ones; nothing outside that tree uses either spelling, so renaming
+them costs no compatibility.
+
+The driver's Kconfig entry uses select RESET_LANTIQ rather than
+depends on. RESET_LANTIQ has no prompt outside COMPILE_TEST, so a
+depends on would make the driver unselectable on the platform that needs
+it, which is the case select exists for.
+
+The three unconditional 100 ms settling delays in the driver -- after
+the endian write, between the gate clock and the reset release, and
+between that and VBUS -- are the vendor's values reproduced as-is. The
+comment above them in drivers/phy/intel/phy-intel-grx500-usb.c says why:
+this SoC has no publicly available hardware reference manual, nothing in
+the vendor sources says what is being waited for, and its kernel is the
+only one known to bring the block up. They are a driver detail and do
+not belong in a binding.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/phy/intel,grx500-usb-phy.yaml b/Documentation/devicetree/bindings/phy/intel,grx500-usb-phy.yaml
+new file mode 100644
+index 000000000000..06e872d8e47d
+--- /dev/null
++++ b/Documentation/devicetree/bindings/phy/intel,grx500-usb-phy.yaml
+@@ -0,0 +1,115 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/phy/intel,grx500-usb-phy.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Intel GRX500 USB PHY
++
++maintainers:
++  - Grische <github@grische.xyz>
++
++description: |
++  The USB PHY feeding one of the two on-chip Synopsys DesignWare USB3
++  controllers of the Intel MIPS xRX500 (GRX500) SoC family.
++
++  Each controller has a PHY of its own, and the two instances differ only in
++  the values of the properties below: a register window, a gate clock, a bit
++  in the second RCU reset bank, and the offset of an AXI configuration word
++  in the chip-top syscon.
++
++  The PHY also has an over-current interrupt, which is not described here
++  because no board wires over-current detection to the pads that feed it.
++
++properties:
++  compatible:
++    const: intel,grx500-usb-phy
++
++  reg:
++    maxItems: 1
++
++  clocks:
++    maxItems: 1
++    description: The PHY's gate clock.
++
++  resets:
++    maxItems: 1
++
++  reset-names:
++    items:
++      - const: phy
++
++  intel,syscon:
++    $ref: /schemas/types.yaml#/definitions/phandle-array
++    items:
++      - items:
++          - description: phandle to the chip-top syscon
++          - description: >
++              byte offset within it of the AXI configuration word belonging
++              to the controller this PHY feeds
++    description:
++      The AXI configuration word selects the byte order of each of the DWC3
++      core's two AXI master ports. It sits in the chip-top syscon rather
++      than in the PHY's own register window, at a different offset per
++      controller.
++
++  vbus-supply:
++    description:
++      Port power for the controller this PHY feeds. Optional, since port
++      power is not always software controlled. Both PHYs may name the same
++      regulator on a board that switches its ports together.
++
++  intel,invert-tx-polarity:
++    type: boolean
++    description:
++      Invert the polarity of the SuperSpeed transmit pair, for a board that
++      routes it crossed.
++
++  intel,invert-rx-polarity:
++    type: boolean
++    description:
++      Invert the polarity of the SuperSpeed receive pair, for a board that
++      routes it crossed.
++
++  "#phy-cells":
++    const: 0
++
++required:
++  - compatible
++  - reg
++  - clocks
++  - resets
++  - reset-names
++  - intel,syscon
++  - "#phy-cells"
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/intel,grx500-clk.h>
++
++    phy@1a400000 {
++        compatible = "intel,grx500-usb-phy";
++        reg = <0x1a400000 0x10000>;
++        clocks = <&cgu GCLK_USB0>;
++        resets = <&rcu_reset1 4 4>;
++        reset-names = "phy";
++        intel,syscon = <&chiptop 0x18>;
++        vbus-supply = <&usb_vbus>;
++        #phy-cells = <0>;
++    };
++
++  - |
++    #include <dt-bindings/clock/intel,grx500-clk.h>
++
++    phy@1a600000 {
++        compatible = "intel,grx500-usb-phy";
++        reg = <0x1a600000 0x10000>;
++        clocks = <&cgu GCLK_USB1>;
++        resets = <&rcu_reset1 5 5>;
++        reset-names = "phy";
++        intel,syscon = <&chiptop 0x34>;
++        vbus-supply = <&usb_vbus>;
++        #phy-cells = <0>;
++    };

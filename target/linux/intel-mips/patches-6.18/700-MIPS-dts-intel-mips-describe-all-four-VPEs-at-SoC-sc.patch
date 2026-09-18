@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 17 Aug 2026 19:16:15 +0200
+Subject: MIPS: dts: intel-mips: describe all four VPEs at SoC scope
+
+cpu2 and cpu3 were declared in the FRITZ!Box 7560 board file while
+xrx500.dtsi stopped at cpu0/cpu1, which reads as though the fourth VPE
+were something the board contributes. It is not: two interAptiv cores
+with two VPEs each is a property of the xRX500 die and holds for the
+GRX550 as well as the GRX350, so a second board on this SoC would have
+had to copy the block verbatim. Move it next to cpu0/cpu1 and record why
+cpu0 alone carries the clocks phandle.
+
+The FRITZ!Box 7560's DTB is unchanged: decompiling it before and after
+the move gives identical output, since dtc merged the board file's cpus
+node into the same path anyway.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+index 5712bba4be3b..7eb39d6d7403 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -27,27 +27,6 @@ avm-hw-revision {
+ 		subrevision = "1";
+ 	};
+ 
+-	/*
+-	 * xrx500.dtsi already declares cpu0/cpu1 (interAptiv). The FRITZ!Box 7560 has
+-	 * a 4-core interAptiv cluster ("VPE topology {2,2} total 4" per line
+-	 * 197), so augment the inherited cpus block with cpu2/cpu3. The cpus
+-	 * node is merged by dtc with the same path declared in xrx500.dtsi;
+-	 * #address-cells / #size-cells are inherited.
+-	 */
+-	cpus {
+-		cpu2: cpu@2 {
+-			device_type = "cpu";
+-			compatible = "mti,interaptiv";
+-			reg = <2>;
+-		};
+-
+-		cpu3: cpu@3 {
+-			device_type = "cpu";
+-			compatible = "mti,interaptiv";
+-			reg = <3>;
+-		};
+-	};
+-
+ 	/*
+ 	 * 128 MiB DDR at PHYS_OFFSET 0x20000000. Match the 5.10 reference
+ 	 * DTS for this board. The chip has 256 MiB physical but the 4Kec
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index df2d085f7358..f1640c4368b3 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -6,6 +6,13 @@ / {
+ 	#size-cells = <1>;
+ 	compatible = "intel,xrx500";
+ 
++	/*
++	 * Two interAptiv cores, two VPEs each. Only cpu0 carries clocks:
++	 * time.c reads the rate from node 0. The vmb-fw-ipi numbers are
++	 * firmware-owned — the same three values appear in the vendor device
++	 * tree — and are repeated in mti,reserved-list so nothing else claims
++	 * them.
++	 */
+ 	cpus {
+ 		#address-cells = <1>;
+ 		#size-cells = <0>;
+@@ -22,6 +29,18 @@ cpu1: cpu@1 {
+ 			compatible = "mti,interaptiv";
+ 			reg = <1>;
+ 		};
++
++		cpu2: cpu@2 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <2>;
++		};
++
++		cpu3: cpu@3 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <3>;
++		};
+ 	};
+ 
+ 	cpu_intc: interrupt-controller {

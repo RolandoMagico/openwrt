@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 02:16:41 +0200
+Subject: net: dsa: lantiq: report the standardised statistics groups
+
+The driver reports its counter bank only through the driver-defined
+statistics string set, so ethtool's standardised MAC, control, pause and
+RMON groups answer nothing at all. The bank supplies most of what those
+groups ask for; wire it up.
+
+A field the bank has no counter for is left at the value the caller
+marked it unset with, so it is reported as absent rather than as a
+misleading zero. That covers the four broadcast fields: the bank counts
+broadcasts only by relabelling the counter this driver already reports
+as the received packet count, so it has none to give.
+
+The receive length histogram has six buckets, the last of which ends at
+the longest frame the switch can be configured to accept.
+
+A 64-bit count occupies two entries of the counter RAM and each entry is
+read by a transaction of its own, so a count that carries between the two
+reads is reported wrongly by four gigabytes, in the direction the read
+order decides. The low half is read first here, which is the order the
+driver-defined statistics already use, so that the two ways of reading the
+same counter cannot be made to disagree about which way they err.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index 8c0ac89caee7..5aea1e0cc2db 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -1687,6 +1687,153 @@ static int gswip_get_sset_count(struct dsa_switch *ds, int port, int sset)
+ 	return ARRAY_SIZE(gswip_rmon_cnt);
+ }
+ 
++static u64 gswip_rmon_read(struct gswip_priv *priv, s16 table,
++			   enum gswip_rmon_counter counter)
++{
++	return gswip_bcm_ram_entry_read(priv, table, counter);
++}
++
++/*
++ * A 64-bit count occupies two entries and each entry is read by a separate
++ * transaction, so a count that carries between the two reads is reported
++ * wrongly by four gigabytes either way. Read the low half first, which is the
++ * order the driver-defined statistics use, so that the two ways of reading the
++ * same counter cannot disagree about which way they err.
++ */
++static u64 gswip_rmon_read64(struct gswip_priv *priv, s16 table,
++			     enum gswip_rmon_counter counter)
++{
++	u64 low = gswip_bcm_ram_entry_read(priv, table, counter);
++
++	return low | (u64)gswip_bcm_ram_entry_read(priv, table, counter + 1) << 32;
++}
++
++/*
++ * The standardised groups below leave a field the counter bank has no counter
++ * for at the value the caller marked it unset with, so that it is reported as
++ * absent rather than as zero. The bank has no broadcast counters of its own:
++ * turning one on means relabelling a counter this driver already reports under
++ * its standard name, so those fields stay absent.
++ */
++static void gswip_get_eth_mac_stats(struct dsa_switch *ds, int port,
++				    struct ethtool_eth_mac_stats *mac_stats)
++{
++	struct gswip_priv *priv = ds->priv;
++	s16 table = priv->rmon_table[port];
++
++	if (table < 0)
++		return;
++
++#define RD(counter)	gswip_rmon_read(priv, table, GSWIP_RMON_##counter)
++#define RD64(counter)	gswip_rmon_read64(priv, table, GSWIP_RMON_##counter)
++	mac_stats->FramesTransmittedOK = RD(TX_GOOD_PKTS);
++	mac_stats->SingleCollisionFrames = RD(TX_SINGLE_COLL);
++	mac_stats->MultipleCollisionFrames = RD(TX_MULT_COLL);
++	mac_stats->FramesReceivedOK = RD(RX_GOOD_PKTS);
++	mac_stats->FrameCheckSequenceErrors = RD(RX_FCS_ERROR_PKTS);
++	mac_stats->AlignmentErrors = RD(RX_ALIGN_ERROR_PKTS);
++	mac_stats->OctetsTransmittedOK = RD64(TX_GOOD_BYTES);
++	mac_stats->LateCollisions = RD(TX_LATE_COLL);
++	mac_stats->FramesAbortedDueToXSColls = RD(TX_EXCESS_COLL);
++	mac_stats->OctetsReceivedOK = RD64(RX_GOOD_BYTES);
++	mac_stats->MulticastFramesXmittedOK = RD(TX_MULTICAST_PKTS);
++	mac_stats->MulticastFramesReceivedOK = RD(RX_MULTICAST_PKTS);
++	/*
++	 * A frame past the maximum length is counted in one of two counters
++	 * depending on whether its check sequence is also wrong, and this
++	 * field covers both.
++	 */
++	mac_stats->FrameTooLongErrors = RD(RX_OVERSIZE_GOOD_PKTS) +
++					RD(RX_OVERSIZE_ERROR_PKTS);
++#undef RD64
++#undef RD
++}
++
++static void gswip_get_eth_ctrl_stats(struct dsa_switch *ds, int port,
++				     struct ethtool_eth_ctrl_stats *ctrl_stats)
++{
++	struct gswip_priv *priv = ds->priv;
++	s16 table = priv->rmon_table[port];
++
++	if (table < 0)
++		return;
++
++	ctrl_stats->MACControlFramesTransmitted =
++		gswip_rmon_read(priv, table, GSWIP_RMON_TX_PAUSE);
++	ctrl_stats->MACControlFramesReceived =
++		gswip_rmon_read(priv, table, GSWIP_RMON_RX_GOOD_PAUSE_PKTS);
++}
++
++static void gswip_get_pause_stats(struct dsa_switch *ds, int port,
++				  struct ethtool_pause_stats *pause_stats)
++{
++	struct gswip_priv *priv = ds->priv;
++	s16 table = priv->rmon_table[port];
++
++	if (table < 0)
++		return;
++
++	pause_stats->tx_pause_frames =
++		gswip_rmon_read(priv, table, GSWIP_RMON_TX_PAUSE);
++	pause_stats->rx_pause_frames =
++		gswip_rmon_read(priv, table, GSWIP_RMON_RX_GOOD_PAUSE_PKTS);
++}
++
++/*
++ * The top bucket ends where the longest frame the switch accepts does. The
++ * counter behind it is documented as counting anything at or above 1024 bytes,
++ * so a frame longer than the bucket says is counted here rather than nowhere.
++ */
++static const struct ethtool_rmon_hist_range gswip_rmon_ranges[] = {
++	{    0,   64 },
++	{   65,  127 },
++	{  128,  255 },
++	{  256,  511 },
++	{  512, 1023 },
++	{ 1024, VLAN_ETH_FRAME_LEN + ETH_FCS_LEN },
++	{}
++};
++
++static void gswip_get_rmon_stats(struct dsa_switch *ds, int port,
++				 struct ethtool_rmon_stats *rmon_stats,
++				 const struct ethtool_rmon_hist_range **ranges)
++{
++	struct gswip_priv *priv = ds->priv;
++	s16 table = priv->rmon_table[port];
++
++	*ranges = gswip_rmon_ranges;
++
++	if (table < 0)
++		return;
++
++#define RD(counter)	gswip_rmon_read(priv, table, GSWIP_RMON_##counter)
++	/*
++	 * A short or long frame is counted in one of two counters depending on
++	 * whether its check sequence is also wrong, which is exactly the split
++	 * this group draws between a runt and a fragment, and between an
++	 * oversized frame and a jabber.
++	 */
++	rmon_stats->undersize_pkts = RD(RX_UNDERSIZE_GOOD_PKTS);
++	rmon_stats->fragments = RD(RX_UNDERSIZE_ERROR_PKTS);
++	rmon_stats->oversize_pkts = RD(RX_OVERSIZE_GOOD_PKTS);
++	rmon_stats->jabbers = RD(RX_OVERSIZE_ERROR_PKTS);
++
++	rmon_stats->hist[0] = RD(RX_64B_PKTS);
++	rmon_stats->hist[1] = RD(RX_127B_PKTS);
++	rmon_stats->hist[2] = RD(RX_255B_PKTS);
++	rmon_stats->hist[3] = RD(RX_511B_PKTS);
++	rmon_stats->hist[4] = RD(RX_1023B_PKTS);
++	rmon_stats->hist[5] = RD(RX_MAXB_PKTS);
++
++	rmon_stats->hist_tx[0] = RD(TX_64B_PKTS);
++	rmon_stats->hist_tx[1] = RD(TX_127B_PKTS);
++	rmon_stats->hist_tx[2] = RD(TX_255B_PKTS);
++	rmon_stats->hist_tx[3] = RD(TX_511B_PKTS);
++	rmon_stats->hist_tx[4] = RD(TX_1023B_PKTS);
++	rmon_stats->hist_tx[5] = RD(TX_MAXB_PKTS);
++#undef RD
++}
++
+ static int gswip_set_mac_eee(struct dsa_switch *ds, int port,
+ 			     struct ethtool_keee *e)
+ {
+@@ -1785,6 +1932,10 @@ static const struct dsa_switch_ops gswip_switch_ops = {
+ 	.get_strings		= gswip_get_strings,
+ 	.get_ethtool_stats	= gswip_get_ethtool_stats,
+ 	.get_sset_count		= gswip_get_sset_count,
++	.get_eth_mac_stats	= gswip_get_eth_mac_stats,
++	.get_eth_ctrl_stats	= gswip_get_eth_ctrl_stats,
++	.get_pause_stats	= gswip_get_pause_stats,
++	.get_rmon_stats		= gswip_get_rmon_stats,
+ 	.set_mac_eee		= gswip_set_mac_eee,
+ 	.support_eee		= gswip_support_eee,
+ 	.port_hsr_join		= dsa_port_simple_hsr_join,

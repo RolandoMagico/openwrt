@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 20 Aug 2026 17:39:03 +0200
+Subject: MIPS: dts: intel-mips: widen the FRITZ!Box 7560 to its full 256 MiB
+
+The memory node declared 128 MiB of a 256 MiB board, and both halves of
+the reason given for it were wrong. The comment conceded that the chip
+holds 256 MiB but claimed AVM's 4Kec bootcore lives in "the upper
+region", so only the bottom half was safe to hand the InterAptiv kernel.
+The bootcore owns the top 32 MiB, not the upper 128, and the 128 MiB
+figure did not come from a measurement of this board at all -- it came
+from matching an earlier work-in-progress device tree of our own. The
+part is 256 MiB, and the vendor kernel for this board runs out of
+0x28000000.
+
+Declare the part, ending at exactly PHYS_OFFSET + SZ_256M = 0x30000000.
+That address is two things at once here: the top of the fitted DRAM and
+the top of the uncached window. On the FRITZ!Box 7590, whose part is
+twice the size, only the second holds and the same number is a cap that
+costs half the board; here the two agree, so the node is full and
+bounded by the same edge. Nothing else has to move to honour the window.
+The generic check in arch/mips/mm/dma-noncoherent.c that enforces it is
+written against PHYS_OFFSET + SZ_256M rather than against a RAM size, so
+at this width the node ends exactly where the check does and satisfies
+it by construction.
+
+Carve out the bootcore's RAM window and its mailbox pool in the shape
+the FRITZ!Box 7590 already uses: no-map, cpunet@2dfc0000 and
+bootcore@2e000000. They stop being free at this width. While the node
+ended at 0x28000000 both ranges sat outside memblock.memory entirely and
+their nomap was a supported no-op; now the 32 MiB window and the 256 KiB
+pool come off usable RAM for real. That is worth paying. This DTB boots
+single-kernel, where no bootcore runs and neither region is touched, but
+the reservations are what make it survivable if one is ever started
+against the blob -- and the bootcore image loads at 0x8dfffffc, which is
+inside the cpunet pool rather than merely next to it. Delete them
+together with the dual-kernel chain, not before it.
+
+The FRITZ!Box 7590's third reservation, the shm RNG seed at 0x3dfb0000, is
+deliberately not copied over: it sits above the uncached ceiling, so it
+is outside this node at any width this board can be given.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+index abbf456943cd..a57763836c1f 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -29,15 +29,14 @@ avm-hw-revision {
+ 	};
+ 
+ 	/*
+-	 * 128 MiB DDR at PHYS_OFFSET 0x20000000. Match the 5.10 reference
+-	 * DTS for this board. The chip has 256 MiB physical but the 4Kec
+-	 * bootcore lives in the upper region;
+-	 * conservative Phase 1 exposes only the bottom 128 MiB to the
+-	 * InterAptiv kernel.
++	 * 256 MiB DDR at PHYS_OFFSET, the full part. It ends at the top of
++	 * the uncached window (PHYS_OFFSET + SZ_256M): above that address the
++	 * KSEG1 alias of a page is a register address, so no coherent
++	 * allocation may land there.
+ 	 */
+ 	memory@20000000 {
+ 		device_type = "memory";
+-		reg = <0x20000000 0x08000000>;
++		reg = <0x20000000 0x10000000>;
+ 	};
+ 
+ 	aliases {
+@@ -69,6 +68,20 @@ ramoops@23700000 {
+ 			console-size = <0x80000>;
+ 			mem-type = <1>;
+ 		};
++
++		/*
++		 * Owned by the second CPU's boot loader; no-map so this
++		 * kernel never maps another CPU's memory.
++		 */
++		cpunet@2dfc0000 {
++			reg = <0x2dfc0000 0x40000>;
++			no-map;
++		};
++
++		bootcore@2e000000 {
++			reg = <0x2e000000 0x2000000>;
++			no-map;
++		};
+ 	};
+ 
+ 	/*

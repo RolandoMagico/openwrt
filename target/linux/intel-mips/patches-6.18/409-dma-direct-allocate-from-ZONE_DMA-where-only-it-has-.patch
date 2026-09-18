@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 05:55:31 +0200
+Subject: dma-direct: allocate from ZONE_DMA where only it has an uncached
+ alias
+
+arch_dma_set_uncached() is allowed to fail, and dma_direct_alloc()
+handles that by freeing the pages and returning NULL. On an architecture
+that can alias all of memory uncached this never happens. On one that
+can only alias part of it, it happens or not depending on which pages
+the buddy allocator had to hand -- the same allocation from the same
+driver succeeds on a freshly booted machine and fails once the free
+lists have drifted upwards, and what the caller sees is an -ENOMEM on a
+machine with most of its memory free.
+
+Nothing rescues it either. The retry ladder in
+__dma_direct_alloc_pages() steps down through the zones on
+dma_coherent_ok(), which tests the device's addressing limit; a device
+whose mask covers all of memory passes that test for exactly the pages
+that have no uncached alias, so the ladder never runs.
+
+An architecture in that position already has a way to say where the
+alias exists: size ZONE_DMA to it. Then this is just a matter of asking
+for the right zone before allocating rather than discovering the answer
+afterwards, when the only remaining move is to fail.
+
+Made opt-in, because it is only correct for architectures that have
+placed ZONE_DMA deliberately. Selecting
+ARCH_DMA_SET_UNCACHED_ZONE_DMA_ONLY is the statement that ZONE_DMA is
+the aliasable window; everyone else is unaffected, and where the symbol
+is off the IS_ENABLED() compiles the whole thing away.
+
+This is close to what arch code used to do for itself, and on the
+platform that prompted it the vendor kernel still does. MIPS massaged
+the gfp flags of coherent allocations before the dma-direct conversion
+took the decision over, and AVM's 4.9 tree for this SoC keeps that code:
+massage_gfp_flags() in arch/mips/mm/dma-default.c adds __GFP_DMA to
+every coherent allocation made for a device that is not hardware
+coherent, unconditionally, without ever consulting coherent_dma_mask.
+What is added here is the same rule reached from the other side. The
+CONFIG_ARCH_HAS_DMA_SET_UNCACHED plus !dev_is_dma_coherent(dev) gate
+that dma_direct_alloc() already computes is exactly the statement "this
+allocation is about to be handed back as an uncached alias", which is
+the same set of allocations the vendor's single coherent = 1 call site
+covers. One rule, expressed once and generically, rather than per
+architecture.
+
+Note what is deliberately not used, because both alternatives look at
+first like they would do.
+
+zone_dma_limit cannot express this. dma_direct_optimal_gfp_mask()
+returns GFP_DMA only where a device's own phys_limit falls below
+zone_dma_limit, and the masters on the affected platform are ordinary
+32-bit ones whose phys_limit is 0xffffffff -- above any honest value of
+a variable whose meaning is where ZONE_DMA ends. Raising it far enough
+to trigger the test would be a false statement about the zone, and
+dma_coherent_ok() and the retry ladder read the same variable and would
+be wrong with it. The constraint here is not an addressing limit, which
+is why the addressing machinery has nowhere to put it.
+
+dev->bus_dma_limit would confine the allocation, and would additionally
+constrain streaming mappings -- which have no such problem, because
+dma_map_*() never takes an uncached alias of anything. Narrowing the
+device's addressing limit to describe a constraint that applies only to
+coherent allocations would break the DMA that currently works.
+
+The arch-side guard in arch_dma_set_uncached() stays exactly as loud as
+it was. With this in place it should never fire, which makes it an
+assertion rather than a condition: if it does, something reached the
+allocator by a path this does not cover, and that is worth a message and
+a backtrace.
+
+The cost is real and worth stating. These allocations now all come from
+one zone instead of from anywhere, so a workload that exhausts or
+fragments ZONE_DMA gets an honest allocation failure where previously it
+had a chance of succeeding. That is the intended trade: on the affected
+platform the alternative outcome was not success but a write into the
+register space aliased at the same address.
+
+Assisted-by: Claude:claude-fable-5
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/Kconfig b/arch/Kconfig
+index ee9fd0150f48..f05d789716fa 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -356,6 +356,15 @@ config ARCH_HAS_SET_DIRECT_MAP
+ config ARCH_HAS_DMA_SET_UNCACHED
+ 	bool
+ 
++#
++# Select if arch_dma_set_uncached can only alias part of memory, and the
++# architecture has sized ZONE_DMA to describe that part. dma-direct then
++# takes coherent allocations from ZONE_DMA, because anywhere else has no
++# uncached alias to hand back.
++#
++config ARCH_DMA_SET_UNCACHED_ZONE_DMA_ONLY
++	bool
++
+ #
+ # Select if the architectures provides the arch_dma_clear_uncached symbol
+ # to undo an in-place page table remap for uncached access.
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index eddfc62918d9..edf3c1401292 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -478,6 +478,7 @@ config LANTIQ
+ 
+ config INTEL_MIPS
+ 	bool "Intel MIPS interAptiv SoC based platforms"
++	select ARCH_DMA_SET_UNCACHED_ZONE_DMA_ONLY
+ 	select BOOT_RAW
+ 	select CEVT_R4K
+ 	select COMMON_CLK
+diff --git a/arch/mips/mm/dma-noncoherent.c b/arch/mips/mm/dma-noncoherent.c
+index e89b07a1e160..1d9a05e43b85 100644
+--- a/arch/mips/mm/dma-noncoherent.c
++++ b/arch/mips/mm/dma-noncoherent.c
+@@ -54,6 +54,13 @@ void arch_dma_prep_coherent(struct page *page, size_t size)
+  * Upper bound on the physical addresses an uncached alias may be taken of.
+  * Above it the uncached window maps registers rather than DRAM, so a coherent
+  * allocation placed there would be handed a register address.
++ *
++ * Coherent allocations are confined to this window before they are made --
++ * ZONE_DMA describes it and ARCH_DMA_SET_UNCACHED_ZONE_DMA_ONLY makes
++ * dma-direct allocate from there -- so an address arriving here that is
++ * above the line means something got past that, which is a bug rather than
++ * a condition. The check stays, and stays loud, because the alternative to
++ * catching it here is not catching it at all.
+  */
+ #define INTEL_MIPS_UNCAC_DRAM_LIMIT	(PHYS_OFFSET + SZ_256M)
+ 
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index cc334eb94b33..93f5d83aad67 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -239,6 +239,18 @@ void *dma_direct_alloc(struct device *dev, size_t size,
+ 			pr_warn_once("coherent DMA allocations not supported on this platform.\n");
+ 			return NULL;
+ 		}
++
++		/*
++		 * Where only part of memory can be aliased uncached, that part
++		 * is ZONE_DMA and the allocation has to come out of it: pages
++		 * from anywhere else have no alias to return. Ask for the zone
++		 * now rather than allocate first and discover it in
++		 * arch_dma_set_uncached(), which can only fail the allocation
++		 * by then.
++		 */
++		if (IS_ENABLED(CONFIG_ARCH_DMA_SET_UNCACHED_ZONE_DMA_ONLY) &&
++		    set_uncached)
++			gfp |= GFP_DMA;
+ 	}
+ 
+ 	/*

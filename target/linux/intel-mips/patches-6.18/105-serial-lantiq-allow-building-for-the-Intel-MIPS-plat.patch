@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:09:31 +0000
+Subject: serial: lantiq: allow building for the Intel MIPS platform
+
+The Lantiq ASC UART is the console device of the Intel MIPS (xRX500)
+family as well. Extend the SERIAL_LANTIQ dependency so it is
+selectable on INTEL_MIPS.
+
+From the 2018 intel-mips platform series ("serial: intel: Support
+more platform") by Songjun Wu <songjun.wu@linux.intel.com>:
+
+  https://lore.kernel.org/all/20180803030237.3366-1-songjun.wu@linux.intel.com/
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
+index 2b9c8b39d68f..cf85a773fe70 100644
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -1002,7 +1002,7 @@ config SERIAL_SIFIVE_CONSOLE
+ 
+ config SERIAL_LANTIQ
+ 	tristate "Lantiq serial driver"
+-	depends on (LANTIQ || X86) || COMPILE_TEST
++	depends on (LANTIQ || X86 || INTEL_MIPS) || COMPILE_TEST
+ 	select SERIAL_CORE
+ 	help
+ 	  Support for UART on Lantiq and Intel SoCs.

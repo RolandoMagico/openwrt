@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 22:31:56 +0200
+Subject: leds: lgm-sso: use the macro parameter in GET_SRC_OFFSET()
+
+GET_SRC_OFFSET(pinc) takes a parameter named pinc and then multiplies
+pin, so it silently picks up whatever local is called pin at the
+expansion site. Its only caller is sso_led_freq_set(), which has such a
+local: the pin number it was passed. The argument the call site actually
+supplies, off, is dropped.
+
+The two are not the same number. off comes from sso_led_pin_blink_off()
+and is relative to the pin's group -- 0..4 for pins 24..28, 0..2 for
+pins 29..31, each group having its own LED_BLINK_H8_* register -- while
+pin is absolute. The blink registers give every pin six bits: the FPID
+rank at off * 6, the GPTC rank at off * 6 + 2, and the two-bit
+clock-source select at off * 6 + 4. GET_FREQ_OFFSET() uses its
+parameters and lands on the first two correctly. GET_SRC_OFFSET()
+computes pin * 6 + 4, which is 148 through 172 for the pins of group 1
+and 178 through 190 for group 2, instead of the 4 through 28 the
+register has room for. GENMASK(high, low) and the freq_src << high that
+follows are then evaluated with shift counts past the width of the type,
+and the field the write was meant for is never touched.
+
+So the select that decides whether the hardware reads the pin's FPID
+rank or its GPTC rank is never written. The shift counts are undefined
+behaviour; where they wrap modulo the width of the type, as they do on
+MIPS, the mask and the value land on some other pin's bits in the same
+register instead. Pins 0..23 are unaffected, because sso_led_freq_set()
+returns early for group 0, and that is also how this survived: no device
+tree in tree drives a pin in either of the upper two groups.
+
+Bringing the write back inside the register is not on its own enough to
+make a GPTC-derived rate selectable. The same function masks and shifts
+both of these fields as though they were three bits wide, which a later
+patch in this series fixes -- but that fix has nothing to correct until
+the write lands in the register at all.
+
+Fixes: c3987cd2bca3 ("leds: lgm: Add LED controller driver for LGM SoC")
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index f66b7366a816..71db8c56d88d 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -25,7 +25,7 @@
+ #define LED_BLINK_H8_0			0x0
+ #define LED_BLINK_H8_1			0x4
+ #define GET_FREQ_OFFSET(pin, src)	(((pin) * 6) + ((src) * 2))
+-#define GET_SRC_OFFSET(pinc)		(((pin) * 6) + 4)
++#define GET_SRC_OFFSET(pinc)		(((pinc) * 6) + 4)
+ 
+ #define DUTY_CYCLE(x)			(0x8 + ((x) * 4))
+ #define SSO_CON0			0x2B0

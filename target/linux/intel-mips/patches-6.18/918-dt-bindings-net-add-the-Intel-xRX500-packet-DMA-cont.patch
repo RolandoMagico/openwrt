@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 15:30:38 +0200
+Subject: dt-bindings: net: add the Intel xRX500 packet DMA controller
+
+Four instances carry the traffic of the two switch macros. Describe them
+as what they are, a register window and an interrupt with no channel
+cells: a transmit channel is tied to a dequeue port of the packet buffer
+manager and fetches its descriptors from the window the manager stages
+them in, so there is nothing an arbitrary consumer could ask for.
+
+The thirteen properties that tune an instance in the vendor device tree
+are not carried over. They set the arbitration mode, the bus burst
+length, the channel polling interval, descriptor placement, prefetch and
+byte enables, and one of them is a software queue budget with no
+register behind it at all. No board file of the vendor's overrides any
+of them, and none of them can be board data, because they describe how
+the SoC wires its own fabric. They belong in the driver, keyed on the
+instance, where a value that reaches no register is visible as one.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/net/lantiq,xrx500-dma.yaml b/Documentation/devicetree/bindings/net/lantiq,xrx500-dma.yaml
+new file mode 100644
+index 000000000000..e9943d296777
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/lantiq,xrx500-dma.yaml
+@@ -0,0 +1,59 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/lantiq,xrx500-dma.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Intel xRX500 packet DMA controller
++
++maintainers:
++  - Grische <github@grische.xyz>
++
++description: |
++  One of the four packet DMA controllers of the Intel MIPS xRX500 (GRX500)
++  SoC family. Each carries one direction of one GSWIP-3.0 switch macro's
++  traffic, and its channels are hard-bound: a transmit channel is tied to a
++  dequeue port of the packet buffer manager and fetches its descriptors from
++  the window the manager stages them in, and a receive channel writes into a
++  ring in memory. The controller offers nothing to arbitrary consumers, so it
++  is not a dmaengine provider and has no channel cells; a driver reaches it
++  through the phandle of the endpoint that uses it.
++
++  Everything else about a controller -- its arbitration mode, bus burst
++  length, channel polling interval, descriptor placement and prefetch, and
++  the endianness of the descriptors it fetches -- is fixed for each of the
++  four instances by how the SoC wires it up, and belongs to the driver rather
++  than to the device tree.
++
++properties:
++  compatible:
++    const: lantiq,xrx500-dma
++
++  reg:
++    maxItems: 1
++
++  interrupts:
++    maxItems: 1
++    description:
++      Aggregate interrupt of the controller. A channel's own completion
++      interrupt is reported through it, and the driver reads the pending
++      channel from the controller's registers.
++
++required:
++  - compatible
++  - reg
++  - interrupts
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/irq.h>
++    #include <dt-bindings/interrupt-controller/mips-gic.h>
++
++    dma@1c100000 {
++            compatible = "lantiq,xrx500-dma";
++            reg = <0x1c100000 0x10000>;
++            interrupt-parent = <&gic>;
++            interrupts = <GIC_SHARED 67 IRQ_TYPE_LEVEL_HIGH>;
++    };

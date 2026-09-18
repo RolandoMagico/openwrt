@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 12:56:09 +0200
+Subject: net: dsa: lantiq: size the per-port tables for the whole family
+
+The per-port arrays in struct gswip_hw_info and in the two default tables of
+the common core are sized by GSWIP_MAX_PORTS, which is the port count of the
+GSWIP-2.x models. Later models in the family number their ports beyond that
+range, so the arrays have to be wide enough to hold an entry for the highest
+port number rather than for the largest port count.
+
+Separate the two meanings: GSWIP_MAX_PORTS becomes the width of the tables and
+GSWIP_2X_MAX_PORTS the port count of the models that have seven ports. Every
+table entry above the models' own port count is filled with the -1 sentinel,
+so a model that does not describe a port cannot reach a register through a
+zero-filled table slot.
+
+No functional change: both existing models keep a port count of seven, and
+every table entry below it keeps its value.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.c b/drivers/net/dsa/lantiq/lantiq_gswip.c
+index 4d699d8c16f9..9dbf81eead07 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.c
+@@ -457,21 +457,21 @@ static void gswip_shutdown(struct platform_device *pdev)
+ }
+ 
+ static const struct gswip_hw_info gswip_xrx200 = {
+-	.max_ports = GSWIP_MAX_PORTS,
++	.max_ports = GSWIP_2X_MAX_PORTS,
+ 	.allowed_cpu_ports = BIT(6),
+ 	.mii_cfg = {
+ 		[0] = GSWIP_MII_CFGp(0),
+ 		[1] = GSWIP_MII_CFGp(1),
+ 		[2 ... 4] = -1,
+ 		[5] = GSWIP_MII_CFGp(5),
+-		[6] = -1,
++		[6 ... GSWIP_MAX_PORTS - 1] = -1,
+ 	},
+ 	.mii_pcdu = {
+ 		[0] = GSWIP_MII_PCDU0,
+ 		[1] = GSWIP_MII_PCDU1,
+ 		[2 ... 4] = -1,
+ 		[5] = GSWIP_MII_PCDU5,
+-		[6] = -1,
++		[6 ... GSWIP_MAX_PORTS - 1] = -1,
+ 	},
+ 	.phylink_get_caps = gswip_xrx200_phylink_get_caps,
+ 	.pce_microcode = &gswip_pce_microcode,
+@@ -480,19 +480,19 @@ static const struct gswip_hw_info gswip_xrx200 = {
+ };
+ 
+ static const struct gswip_hw_info gswip_xrx300 = {
+-	.max_ports = GSWIP_MAX_PORTS,
++	.max_ports = GSWIP_2X_MAX_PORTS,
+ 	.allowed_cpu_ports = BIT(6),
+ 	.mii_cfg = {
+ 		[0] = GSWIP_MII_CFGp(0),
+ 		[1 ... 4] = -1,
+ 		[5] = GSWIP_MII_CFGp(5),
+-		[6] = -1,
++		[6 ... GSWIP_MAX_PORTS - 1] = -1,
+ 	},
+ 	.mii_pcdu = {
+ 		[0] = GSWIP_MII_PCDU0,
+ 		[1 ... 4] = -1,
+ 		[5] = GSWIP_MII_PCDU5,
+-		[6] = -1,
++		[6 ... GSWIP_MAX_PORTS - 1] = -1,
+ 	},
+ 	.phylink_get_caps = gswip_xrx300_phylink_get_caps,
+ 	.pce_microcode = &gswip_pce_microcode,
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.h b/drivers/net/dsa/lantiq/lantiq_gswip.h
+index 6991be8a4a7f..f2339d3f8f47 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.h
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.h
+@@ -245,7 +245,16 @@
+ 
+ #define GSWIP_VLAN_UNAWARE_PVID	0
+ 
+-#define GSWIP_MAX_PORTS		7
++/* Widest port count in the family. GSWIP-3.0 numbers its WAN port 15, so the
++ * per-port arrays below have to reach that far even though no single model
++ * uses every entry.
++ */
++#define GSWIP_MAX_PORTS		16
++
++/* Port count of the GSWIP-2.x models, which is also the width of the register
++ * blocks the tables in the common core describe.
++ */
++#define GSWIP_2X_MAX_PORTS	7
+ 
+ /**
+  * struct gswip_mdio_layout - placement of the MDIO master registers
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index 109664bb2878..e6ad07bcc309 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -137,6 +137,7 @@ static const struct gswip_mdio_layout gswip_mdio_layout_2x = {
+ 		GSWIP_MDIO_PHYp(0), GSWIP_MDIO_PHYp(1), GSWIP_MDIO_PHYp(2),
+ 		GSWIP_MDIO_PHYp(3), GSWIP_MDIO_PHYp(4), GSWIP_MDIO_PHYp(5),
+ 		GSWIP_MDIO_PHYp(6),
++		[GSWIP_2X_MAX_PORTS ... GSWIP_MAX_PORTS - 1] = -1,
+ 	},
+ };
+ 
+@@ -155,6 +156,7 @@ static const s16 gswip_mac_ctrl_2x[GSWIP_MAX_PORTS] = {
+ 	GSWIP_MAC_CTRL_BASEp(2), GSWIP_MAC_CTRL_BASEp(3),
+ 	GSWIP_MAC_CTRL_BASEp(4), GSWIP_MAC_CTRL_BASEp(5),
+ 	GSWIP_MAC_CTRL_BASEp(6),
++	[GSWIP_2X_MAX_PORTS ... GSWIP_MAX_PORTS - 1] = -1,
+ };
+ 
+ /* Returns the address of one register of a port's MAC block, or a negative

@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 29 Aug 2026 00:22:19 +0200
+Subject: leds: lgm-sso: take the shift clock rate from the device tree
+
+SSO_CON1.FCDSC divides the block's 25 MHz source down to the rate the
+output word is clocked out to the external shift register on: 25, 12.5,
+6.25 or 3.125 MHz. How slow a rate a board needs is a property of that
+shift register and of the trace to it, so it can only come from the
+device tree -- and the driver has the plumbing for it, a table and a
+lookup, with nothing wired to the input. sso_probe_gpios() hardcodes
+priv->gpio.shift_clk_freq to -1, which no table entry is below, so
+sso_register_shift_clk() takes its error path on every board it has ever
+run on: it warns "Invalid freq -1" and then programs the field to 0.
+
+Read it from an optional property instead. The name follows the
+intel,sso-update-rate-hz already in this binding, and the four rates are
+spelled out as an enum because the divider admits no others.
+
+Absent the property the field is still programmed to 0, so no board's
+hardware behaviour changes; what stops is the warning, which was never
+about the DT and only ever reported the driver's own placeholder. A
+value out of range still takes the same path and now says something
+true.
+
+The AVM FRITZ!Box 7580, a GRX550 board, is the first user: the vendor
+device tree asks for 3.125 MHz on it while every other board of that
+family leaves the default standing.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/leds/leds-lgm.yaml b/Documentation/devicetree/bindings/leds/leds-lgm.yaml
+index a5416d4ba19a..4cf5aa2cb92b 100644
+--- a/Documentation/devicetree/bindings/leds/leds-lgm.yaml
++++ b/Documentation/devicetree/bindings/leds/leds-lgm.yaml
+@@ -53,6 +53,15 @@ properties:
+     description:
+       Blink frequency for SOUTs in Hz.
+ 
++  intel,sso-shift-clk-frequency-hz:
++    description:
++      Frequency in Hz of the clock the output word is shifted out on. The
++      controller derives it from a 25 MHz source through a fixed divider of
++      1, 2, 4 or 8, so only those four rates exist. How slow a rate a board
++      needs depends on its shift register and on the trace to it.
++    enum: [3125000, 6250000, 12500000, 25000000]
++    default: 25000000
++
+   ssoled:
+     type: object
+     description:
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index 68e367cb4888..25725a4a330f 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -801,7 +801,18 @@ static int sso_probe_gpios(struct sso_led_priv *priv)
+ 		priv->gpio.freq = 0;
+ 
+ 	priv->gpio.edge = priv->variant->data_clk_edge;
+-	priv->gpio.shift_clk_freq = -1;
++
++	/*
++	 * How fast the output word is clocked out to the external shift
++	 * register. SSO_CON1.FCDSC divides a 25 MHz source by 1, 2, 4 or 8,
++	 * and how slow a rate a board needs is a property of that register and
++	 * of the trace between -- nothing the SoC can be asked about. Absent
++	 * the property, ask for the top of the table, which is the divider
++	 * setting the field has always been left at.
++	 */
++	if (device_property_read_u32(dev, "intel,sso-shift-clk-frequency-hz",
++				     &priv->gpio.shift_clk_freq))
++		priv->gpio.shift_clk_freq = shift_clk_freq_tbl[0];
+ 
+ 	ret = sso_gpio_hw_init(priv);
+ 	if (ret)

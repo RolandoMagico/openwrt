@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 17:07:47 +0200
+Subject: MIPS: intel-mips: enable PCIe in grx500_defconfig
+
+The xRX500 root complexes and the slim PHY that feeds them are now
+described in the SoC dtsi and driven by pcie-intel-gw.c and
+phy-intel-grx500-pcie.c, but none of it is reachable from a defconfig
+kernel: MIPS only gets a PCI bus if CONFIG_PCI is stated, and both
+drivers sit behind menus that default off.
+
+ - CONFIG_PCI. INTEL_MIPS selects HAVE_PCI and PCI_DRIVERS_GENERIC, but
+   HAVE_PCI only makes the PCI menu visible -- the bus itself is a plain
+   prompt with no default, so without this line the whole subsystem,
+   including drivers/pci/controller/, is compiled out.
+
+ - CONFIG_PCI_MSI, which is what makes CONFIG_PCIE_INTEL_GW selectable
+   at all: it "depends on PCI_MSI", and PCI_MSI has no default, so
+   asking for PCIE_INTEL_GW without it is silently dropped by
+   olddefconfig rather than reported.
+
+   This host bridge has no MSI: the four INTx lines reach the GIC over
+   their own interrupt-map entries and the DesignWare iMSI-RX block is
+   deliberately left alone by the driver's .msi_init hook, which clears
+   pp->has_msi_ctrl and so keeps both dw_pcie_msi_host_init() and the
+   MSI register programming in dw_pcie_msi_init() out of the picture.
+   PCI_MSI=y is therefore configuration-only. The bridge advertises no
+   MSI domain and does not set PCI_BUS_FLAGS_NO_MSI, so an endpoint
+   driver that asks for MSI lands in the PCI_MSI_ARCH_FALLBACKS path
+   that arch/mips/Kconfig turns on, where the __weak arch_setup_msi_irq()
+   returns -EINVAL; pci_enable_msi() fails cleanly and every well-behaved
+   driver falls back to INTx, which is the wiring that exists.
+
+ - CONFIG_PCIE_INTEL_GW for the root complexes, which pulls in
+   PCIE_DW_HOST and the DesignWare core underneath it.
+
+ - CONFIG_PHY_INTEL_GRX500_PCIE for the slim PHY. It selects GENERIC_PHY,
+   MFD_SYSCON and RESET_CONTROLLER on its own; the latter two are already
+   on from the INTEL_MIPS selects.
+
+CONFIG_PCIEPORTBUS stays off. The port services it would bind -- AER,
+PME, hotplug -- are all things this application block latches in IRNCR
+and that the driver deliberately leaves masked and unrequested, so
+enabling portdrv would buy nothing but a level line nobody clears.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index 50280ffee7df..98f812230054 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -73,6 +73,9 @@ CONFIG_IP6_NF_TARGET_REJECT=m
+ CONFIG_IP6_NF_MANGLE=m
+ CONFIG_ATM=m
+ CONFIG_ATM_BR2684=m
++CONFIG_PCI=y
++CONFIG_PCI_MSI=y
++CONFIG_PCIE_INTEL_GW=y
+ CONFIG_BLK_DEV_RAM=y
+ CONFIG_BLK_DEV_RAM_COUNT=4
+ CONFIG_BLK_DEV_RAM_SIZE=8192
+@@ -107,6 +110,7 @@ CONFIG_LEDS_TRIGGER_NETDEV=y
+ # CONFIG_MIPS_PLATFORM_DEVICES is not set
+ CONFIG_INTEL_CGU_CLK=y
+ # CONFIG_IOMMU_SUPPORT is not set
++CONFIG_PHY_INTEL_GRX500_PCIE=y
+ # CONFIG_MANDATORY_FILE_LOCKING is not set
+ CONFIG_QUOTA=y
+ # CONFIG_PRINT_QUOTA_WARNING is not set

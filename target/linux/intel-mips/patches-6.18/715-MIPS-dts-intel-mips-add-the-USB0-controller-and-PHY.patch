@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 19:36:53 +0200
+Subject: MIPS: dts: intel-mips: add the USB0 controller and PHY
+
+usb1 was described alone because the only board in the tree at the time
+was a FRITZ!Box 7560, whose vendor board file disables usb0, and a
+controller no board could enable would have been dead DT. The FRITZ!Box
+7590 makes that reasoning obsolete: AVM's HW226 board files disable
+neither controller, and its SoC-level nodes for both are enabled
+(AVM 4.9 arch/mips/boot/dts/lantiq/xrx500.dtsi). Two USB ports is one of
+the differences between the two boards.
+
+So describe usb0 as well, disabled like its sibling and enabled by
+whichever board file wires it. Its numbers are the vendor's, and they
+are the same numbers the tree already carried in prose in the block
+comment: core at 0x1a300000, PHY at 0x1a400000, GIC_SHARED 54 for the
+core, RCU reset bank 1 bit 4, chip-top configuration word at +0x18,
+GCLK_USB0 for the gate clock. GIC_SHARED 54 is not otherwise claimed in
+this dtsi.
+
+Bank 1 bit 4 and the +0x18 word have independent corroboration beyond
+the vendor tree. Documentation/devicetree/bindings/mips/lantiq/rcu.txt
+documents the xRX200's two USB PHYs with the same pairing -- bank 1 bit
+4 with the config word at +0x18, bank 1 bit 5 with the word at +0x34 --
+which is the split this SoC keeps, with the word moved from the RCU to
+the chip-top syscon.
+
+The block comment needed correcting rather than extending. It asserted
+that "the vendor tree disables usb0 on all of them" and that "its pins
+are not bonded out to anything": the first is now false, and the second
+was never sourced -- AVM's evidence only ever showed the glue node
+disabled on the 7560, with usb0_phy left enabled, which says nothing
+about bonding. It also explained the absent over-current interrupt by
+naming the DECT and WLAN buttons, which is the FRITZ!Box 7560's pinout;
+on the 7590 pad 2 is the WLAN button but pad 7 is CLKOUT1. The
+conclusion holds on both boards -- no board routes over-current, which
+is why the vendor deletes all four pinctrl_usb* nodes -- but the stated
+reason did not generalise, so it now names both boards.
+
+The same unsourced bonding claim in the FRITZ!Box 7560 board file is
+corrected the same way: usb0 is disabled there because the vendor
+disables it, and what its pins reach is unknown.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 3c4d9d9673ad..6cda1e5d7b0d 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -394,6 +394,31 @@ pcie2: pcie@18e00000 {
+ 	 * word; intel,syscon's argument is that controller's AXI
+ 	 * configuration offset.
+ 	 */
++	usb0_phy: phy@1a400000 {
++		compatible = "intel,grx500-usb-phy";
++		reg = <0x1a400000 0x10000>;
++		#phy-cells = <0>;
++		clocks = <&cgu GCLK_USB0>;
++		resets = <&rcu_reset1 4 4>;
++		reset-names = "phy";
++		intel,syscon = <&chiptop 0x18>;
++		status = "disabled";
++	};
++
++	usb0: usb@1a300000 {
++		compatible = "snps,dwc3";
++		reg = <0x1a300000 0x10000>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 54 IRQ_TYPE_LEVEL_HIGH>;
++
++		dr_mode = "host";
++		snps,dis_rxdet_inp3_quirk;
++		phys = <&usb0_phy>;
++		phy-names = "usb3-phy";
++		status = "disabled";
++	};
++
+ 	usb1_phy: phy@1a600000 {
+ 		compatible = "intel,grx500-usb-phy";
+ 		reg = <0x1a600000 0x10000>;

@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 16:24:22 +0000
+Subject: MIPS: dts: intel-mips: wire the FRITZ!Box 7560 LEDs, buttons and DECT
+ reset
+
+Now that the SoC dtsi describes the Equilibrium pin controller and its
+two GPIO banks, attach the board's GPIO consumers.
+
+All nine lines come from AVM's own board description,
+arch/mips/boot/dts/lantiq/avm/grx350_common.dtsi in the 4.9 BSP, which
+exports each of them individually through the out-of-tree
+"avm,avm_gpio_generic" shim under the &avm_gpio node. The shim is not
+ported -- gpio-leds, gpio-keys-polled and gpio-hog cover everything it
+provided -- but the bank, pin number and active level are transcribed
+unchanged:
+
+  gpio_avm_led_power       gpio1  4 HIGH  ->  green:power
+  gpio_avm_led_internet    gpio0 18 HIGH  ->  green:internet
+  gpio_avm_led_festnetz    gpio0  3 HIGH  ->  green:festnetz
+  gpio_avm_led_wlan        gpio0 14 HIGH  ->  green:wlan
+  gpio_avm_led_info        gpio0  0 HIGH  ->  green:info
+  gpio_avm_led_info_red    gpio1  2 HIGH  ->  red:info
+  gpio_avm_button_dect     gpio0  7 LOW   ->  KEY_PHONE
+  gpio_avm_button_wlan     gpio0  2 LOW   ->  KEY_RFKILL
+  gpio_avm_dect_reset      gpio0 10 HIGH  ->  hogged output-high
+
+Bank-1 pins 4 and 2 are SoC pins 36 and 34, which the vendor tree also
+lists in its "vcodec" pin group, and green:festnetz sits on pin 3, which
+the vendor tree lists under "25Mhz". Those groups are unused on this
+board and are not declared in our pinctrl node, so claiming the pads as
+GPIOs muxes them to mux value 0, which is what the LEDs need.
+
+The keys use gpio-keys-polled because the GPIO banks intentionally do
+not act as an interrupt controller; a 100 ms poll interval is well
+inside what both short and long presses need.
+
+The power LED defaults to "on": the lamp is already lit when the kernel
+starts, and blinking it off until userspace comes up would read as a
+failed boot.
+led-boot / led-running / led-failsafe / led-upgrade / led-wifi aliases
+follow the OpenWrt convention so the generic diag.sh drives them
+without a board-specific hook.
+
+The DECT reset line is hogged asserted. There is no DECT driver in this
+tree, so asserting the reset keeps the chip quiesced rather than
+half-initialised.
+
+USB VBUS (gpio0 6) and the PCIe reset lines (gpio0 8, 9, 16) are left
+unclaimed on purpose; they belong to the USB and PCIe phases and are
+noted as such in the source.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+index 6521ce1d66cb..5712bba4be3b 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -4,6 +4,8 @@
+ 
+ #include <dt-bindings/interrupt-controller/mips-gic.h>
+ #include <dt-bindings/clock/intel,grx500-clk.h>
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
+ 
+ #include "xrx500.dtsi"
+ #include "seale_avm_fritz7560.dtsi"
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+index eed611b4e9b1..fc303f1393ed 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -81,3 +81,98 @@ reserved-memory {
+ 		ranges;
+ 	};
+ };
++
++/ {
++	leds {
++		compatible = "gpio-leds";
++
++		/*
++		 * Bank 1, pin 4 == SoC pin 36. Lit as soon as the driver
++		 * probes. The lamp is already on when the kernel starts, and
++		 * blinking it off mid-boot would read as a failed boot.
++		 * The led-boot / led-running aliases hand it to userspace
++		 * afterwards.
++		 */
++		led_power: led-0 {
++			label = "green:power";
++			gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
++			default-state = "on";
++		};
++
++		led_internet: led-1 {
++			label = "green:internet";
++			gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		led_festnetz: led-2 {
++			label = "green:festnetz";
++			gpios = <&gpio0 3 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		led_wlan: led-3 {
++			label = "green:wlan";
++			gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		led_info: led-4 {
++			label = "green:info";
++			gpios = <&gpio0 0 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		/* Bank 1, pin 2 == SoC pin 34. */
++		led_info_red: led-5 {
++			label = "red:info";
++			gpios = <&gpio1 2 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++	};
++
++	/*
++	 * Polled rather than interrupt-driven: the GPIO banks do not
++	 * publish an irq domain (see xrx500.dtsi). 100 ms is fast enough
++	 * for both the short-press and the long-press handlers.
++	 */
++	keys {
++		compatible = "gpio-keys-polled";
++		poll-interval = <100>;
++
++		button-dect {
++			label = "dect";
++			linux,code = <KEY_PHONE>;
++			gpios = <&gpio0 7 GPIO_ACTIVE_LOW>;
++		};
++
++		button-wlan {
++			label = "wlan";
++			linux,code = <KEY_RFKILL>;
++			gpios = <&gpio0 2 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	aliases {
++		led-boot = &led_power;
++		led-running = &led_power;
++		led-failsafe = &led_info_red;
++		led-upgrade = &led_info;
++		led-wifi = &led_wlan;
++	};
++};
++
++/*
++ * DECT reset, active high. No DECT driver exists in this tree, so the
++ * line is hogged and driven asserted at boot to hold the Dialog DECT
++ * companion chip quiesced instead of leaving it half-initialised and
++ * chattering on the shared SSI bus.
++ */
++&gpio0 {
++	dect-reset-hog {
++		gpio-hog;
++		gpios = <10 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "dect-reset";
++	};
++};

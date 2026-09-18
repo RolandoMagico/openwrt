@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 22:23:35 +0200
+Subject: MIPS: dts: intel-mips: add the USB1 controller, PHY and reset bank 1
+
+Describe the second of the SoC's two DWC3 USB controllers and its PHY,
+plus the RCU reset bank the PHY's reset line lives in. Everything is
+disabled here; whether a USB port is populated, and how VBUS reaches
+it, is a board property.
+
+usb0 is omitted rather than declared and disabled. The vendor tree
+disables it on every board in the GRX350 family (AVM 4.9
+arch/mips/boot/dts/lantiq/avm/grx350_common.dtsi) because its pins are
+not bonded out on any of them, and describing a controller nothing can
+use, only to switch it off again everywhere, would be dead DT. Its
+numbers are recorded in the comment so a board that does populate it
+does not have to rediscover them.
+
+The controller is a flattened snps,dwc3 node with no glue wrapper. The
+vendor wraps it in a lantiq,dwc3-grx500 parent whose driver sets the
+AXI endianness field in the chip-top syscon and then calls
+of_platform_populate(); that field is now owned by the PHY driver, and
+the dwc3 core binds snps,dwc3 from DT on its own and takes its own
+optional clocks, resets and generic PHYs. The upstream direction is the
+same one: CONFIG_USB_DWC3_GENERIC_PLAT's help text says platforms using
+dwc3-of-simple can switch to it by flattening the dwc3 child node.
+
+Dropping the wrapper also drops the "usb1" alias. The vendor glue calls
+of_alias_get_id(node, "usb") and returns -ENODEV when the node is not
+in /aliases, then uses the id only to interpolate into an error
+message; nothing else in either tree reads it.
+
+intel,syscon-offset names this controller's AXI configuration word in
+the chip-top syscon at +0x34 (usb0's is +0x18). The vendor encodes the
+same number as its glue node's own reg property and reads it back with
+of_get_address() as a syscon offset, untranslated, on a node sitting
+under a ranges-bearing bus -- a reg that is not an address. The
+established idiom on this platform is a syscon phandle plus a named
+driver-private property, as the PCIe root complexes already do with
+intel,inbound-shift and intel,outbound-shift against the same syscon.
+
+The PHY carries no interrupt. The vendor's GIC_SHARED 50 on this node
+is over-current only, and there is no over-current path on this
+hardware -- the pads that would feed it are the DECT and WLAN buttons,
+which is why the vendor board files delete their own pinctrl_usb*
+nodes outright.
+
+rcu_reset1 is new. RCU_RST_REQ/RCU_RST_STAT at +0x10/+0x14 hold 32
+lines and the USB PHY resets are not among them; they live in a second,
+non-adjacent pair, request at +0x48 and status at +0x24, both already
+inside this node's 0x100 window. The vendor needs no such node because
+its reset driver (AVM 4.9 drivers/reset/reset-intel-syscon.c) presents
+both banks as one controller with nr_resets = 64 and #reset-cells =
+<1>, splitting the id itself as regidx = id >> 5 and regbit = id & 31.
+Its <&rcu0 37> for this PHY is therefore bank 1 bit 5, which the
+mainline lantiq,xrx200-reset binding spells <&rcu_reset1 5 5> -- the
+request and status bit being the same position, as everywhere else on
+this SoC.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 604e523a6cd2..925890e8ee1e 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -82,6 +82,18 @@ rcu_reset0: reset-controller@10 {
+ 			#reset-cells = <2>;
+ 		};
+ 
++		/*
++		 * Second reset bank. RCU_RST_REQ2 is at 0x48 and
++		 * RCU_RST_STAT2 at 0x24, so a vendor reset id of 5 translates
++		 * to <&rcu_reset1 5 5>.
++		 */
++		rcu_reset1: reset-controller@48 {
++			compatible = "lantiq,xrx200-reset";
++			reg = <0x48 0x4>,	/* RCU_RST_REQ2 */
++			      <0x24 0x4>;	/* RCU_RST_STAT2 */
++			#reset-cells = <2>;
++		};
++
+ 		/*
+ 		 * Restart handler. Bit 30 of RCU_RST_REQ triggers the SoC
+ 		 * reset, and the write must be a read-modify-write under the
+@@ -337,4 +349,36 @@ pcie2: pcie@18e00000 {
+ 		intel,outbound-shift = <12>;
+ 		status = "disabled";
+ 	};
++
++	/*
++	 * Two Synopsys DesignWare USB3 DRD controllers, described as plain
++	 * snps,dwc3 nodes. The PHY driver owns the chip-top AXI endianness
++	 * word; intel,syscon's argument is that controller's AXI
++	 * configuration offset.
++	 */
++	usb1_phy: phy@1a600000 {
++		compatible = "intel,grx500-usb-phy";
++		reg = <0x1a600000 0x10000>;
++		#phy-cells = <0>;
++		clocks = <&cgu GCLK_USB1>;
++		resets = <&rcu_reset1 5 5>;
++		reset-names = "phy";
++		intel,syscon = <&chiptop>;
++		intel,syscon-offset = <0x34>;
++		status = "disabled";
++	};
++
++	usb1: usb@1a500000 {
++		compatible = "snps,dwc3";
++		reg = <0x1a500000 0x10000>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 83 IRQ_TYPE_LEVEL_HIGH>;
++
++		dr_mode = "host";
++		snps,dis_rxdet_inp3_quirk;
++		phys = <&usb1_phy>;
++		phy-names = "usb3-phy";
++		status = "disabled";
++	};
+ };

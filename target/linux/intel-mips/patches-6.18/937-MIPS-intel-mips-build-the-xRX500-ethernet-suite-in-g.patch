@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 10:33:04 +0000
+Subject: MIPS: intel-mips: build the xRX500 ethernet suite in grx500_defconfig
+
+grx500_defconfig turned on neither CONFIG_NETDEVICES nor the driver
+suite this platform exists for, so `make grx500_defconfig && make
+vmlinux` compiled nothing at all under drivers/net/ethernet/lantiq/.
+The in-tree defconfig therefore gave the series' largest body of new
+code zero compile coverage: a warning introduced anywhere in the
+ethernet suite could not be caught by building the platform's own
+defconfig, which is exactly what happened during bring-up.
+
+Enable the suite with CONFIG_NETDEVICES=y, CONFIG_INTEL_XRX500_NET=y,
+CONFIG_INTEL_XRX500_BM=y and CONFIG_INTEL_XRX500_CBM_CONDUIT=y for the
+buffer manager and its conduit, and CONFIG_NET_DSA=y with
+CONFIG_NET_DSA_LANTIQ_GSWIP_XRX500=m for the switch macros.
+
+This is inert for the image the port actually ships: OpenWrt builds
+this target from its own kernel config, not from arch/mips/configs.
+What it buys is that the defconfig now compiles the code it claims to
+describe.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/configs/grx500_defconfig b/arch/mips/configs/grx500_defconfig
+index 6438d6a1b0f5..1c7f7655a73e 100644
+--- a/arch/mips/configs/grx500_defconfig
++++ b/arch/mips/configs/grx500_defconfig
+@@ -82,6 +82,12 @@ CONFIG_PCIE_INTEL_GW=y
+ CONFIG_BLK_DEV_RAM=y
+ CONFIG_BLK_DEV_RAM_COUNT=4
+ CONFIG_BLK_DEV_RAM_SIZE=8192
++CONFIG_NETDEVICES=y
++CONFIG_INTEL_XRX500_NET=y
++CONFIG_INTEL_XRX500_BM=y
++CONFIG_INTEL_XRX500_CBM_CONDUIT=y
++CONFIG_NET_DSA=y
++CONFIG_NET_DSA_LANTIQ_GSWIP_XRX500=m
+ CONFIG_INPUT=y
+ CONFIG_INPUT_EVDEV=y
+ CONFIG_INPUT_KEYBOARD=y

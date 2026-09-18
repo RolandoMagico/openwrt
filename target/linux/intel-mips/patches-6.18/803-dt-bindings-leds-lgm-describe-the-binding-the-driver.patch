@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 13:34:35 +0200
+Subject: dt-bindings: leds: lgm: describe the binding the driver implements
+
+There is no device tree that satisfies both this schema and the driver
+it documents, and nothing has noticed because intel,lgm-ssoled has no
+in-tree DTS user anywhere. Four separate defects, each independently
+fatal:
+
+  - compatible is a const, which forbids the "syscon" string. The
+    driver's only route to its registers is
+    syscon_node_to_regmap(dev->of_node), and that returns -EINVAL
+    unless of_device_is_compatible(np, "syscon") holds. A node written
+    to the schema does not probe.
+
+  - the LED container is documented as led-controller, while the driver
+    asks for a child node named exactly ssoled. Nothing warns about the
+    difference: sso_led_dt_parse() returns 0 when the named child is
+    absent, so a DT written to the schema registers no LEDs and reports
+    success.
+
+  - the per-LED gpio property is documented as led-gpios, but the
+    driver calls devm_fwnode_gpiod_get() with a NULL con_id, which
+    looks for "gpios" and then "gpio". The documented name arrived in
+    commit 121164481b79 ("dt-bindings: leds: intel,lgm: Add missing
+    'led-gpios' property"), a reasonable schema fix that nothing then
+    checked against the code.
+
+  - reg is capped at 2 and the node name pattern at ^led@[0-2]$. That
+    is one board's LED count masquerading as a property of the block:
+    reg is the controller pin number, the block has 32 pins and the
+    driver bounds it against SSO_LED_MAX_NUM. Both the cap and the
+    pattern have to move, since children above led@2 fail the pattern
+    independently of the cap.
+
+Fix all four against the driver rather than against any board, and add
+a second compatible while here: the same block appears on Intel's
+GRX500 family, where the shift clock runs on the other edge. The driver
+patch that follows keys the edge off the compatible; nothing else about
+the two differs, which is why they share this binding rather than
+getting a second one.
+
+The example moves with the schema, and its own long-standing
+inconsistency goes with it -- led@2 declared reg = <2> while pointing
+its gpio at pin 23, so the node named one pin and drove another.
+
+Fixes: b113a7f19810 ("dt-bindings: leds: Add bindings for Intel LGM SoC")
+Fixes: 121164481b79 ("dt-bindings: leds: intel,lgm: Add missing 'led-gpios' property")
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/leds/leds-lgm.yaml b/Documentation/devicetree/bindings/leds/leds-lgm.yaml
+index 8b3b3bf1eaf2..a5416d4ba19a 100644
+--- a/Documentation/devicetree/bindings/leds/leds-lgm.yaml
++++ b/Documentation/devicetree/bindings/leds/leds-lgm.yaml
+@@ -4,15 +4,28 @@
+ $id: http://devicetree.org/schemas/leds/leds-lgm.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: Intel Lightning Mountain (LGM) SoC LED Serial Shift Output (SSO) Controller driver
++title: Intel LGM and GRX500 SoC LED Serial Shift Output (SSO) Controller
+ 
+ maintainers:
+   - Zhu, Yi Xin <Yixin.zhu@intel.com>
+   - Amireddy Mallikarjuna reddy <mallikarjunax.reddy@intel.com>
+ 
++description: |
++  The controller shifts a 32 bit output word out to an external shift
++  register, one bit per pin, and holds an eight bit duty cycle per pin.
++
++  The node is also a syscon: the driver reaches the register block through
++  syscon_node_to_regmap(), which refuses a node whose compatible does not
++  carry the "syscon" string, so that string is part of the binding rather
++  than an option.
++
+ properties:
+   compatible:
+-    const: intel,lgm-ssoled
++    items:
++      - enum:
++          - intel,grx500-ssoled
++          - intel,lgm-ssoled
++      - const: syscon
+ 
+   reg:
+     maxItems: 1
+@@ -40,7 +53,7 @@ properties:
+     description:
+       Blink frequency for SOUTs in Hz.
+ 
+-  led-controller:
++  ssoled:
+     type: object
+     description:
+       This sub-node must contain a sub-node for each leds.
+@@ -55,17 +68,17 @@ properties:
+         const: 0
+ 
+     patternProperties:
+-      "^led@[0-2]$":
++      "^led@1?[0-9a-f]$":
+         $ref: common.yaml#
+         unevaluatedProperties: false
+ 
+         properties:
+           reg:
+-            description: Index of the LED.
++            description: Number of the controller pin driving this LED.
+             minimum: 0
+-            maximum: 2
++            maximum: 31
+ 
+-          led-gpios:
++          gpios:
+             maxItems: 1
+ 
+           intel,sso-hw-trigger:
+@@ -103,7 +116,7 @@ examples:
+     #include <dt-bindings/leds/common.h>
+ 
+     ssogpio: ssogpio@e0d40000 {
+-      compatible = "intel,lgm-ssoled";
++      compatible = "intel,lgm-ssoled", "syscon";
+       reg = <0xE0D40000 0x2E4>;
+       gpio-controller;
+       #gpio-cells = <2>;
+@@ -114,7 +127,7 @@ examples:
+       clock-names = "sso", "fpid";
+       intel,sso-update-rate-hz = <250000>;
+ 
+-      led-controller {
++      ssoled {
+         #address-cells = <1>;
+         #size-cells = <0>;
+ 
+@@ -122,14 +135,14 @@ examples:
+           reg = <0>;
+           function = "gphy";
+           color = <LED_COLOR_ID_GREEN>;
+-          led-gpios = <&ssogpio 0 0>;
++          gpios = <&ssogpio 0 0>;
+         };
+ 
+         led@2 {
+           reg = <2>;
+           function = LED_FUNCTION_POWER;
+           color = <LED_COLOR_ID_GREEN>;
+-          led-gpios = <&ssogpio 23 0>;
++          gpios = <&ssogpio 2 0>;
+         };
+       };
+     };

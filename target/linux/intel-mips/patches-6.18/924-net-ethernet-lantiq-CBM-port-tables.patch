@@ -1,0 +1,513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:23:50 +0000
+Subject: net: ethernet: lantiq: CBM port tables
+
+Add cbm_ports.c, the CBM port tables. They hold the per-datapath-port
+dequeue port, TMU queue and descriptor-count rows, and the lookups over
+them.
+
+cbm_dp_egress_res_get() resolves a datapath port's dequeue port, TMU
+egress port, queue and DMA binding from one row, because the four
+numbers are one hardware binding and cannot be updated apart. The
+dequeue port comes out of epg_lookup_table, and the TMU queue and DMA
+binding are the DQM_DMA rows of cbm_config.c in the vendor's GPL
+release.
+
+The table holds the rows the datapath serves end to end and no others,
+datapath ports 2 to 5 for the LAN ports and 15 for the WAN port.
+
+conf_dqm_cpu_port() configures the three CPU DQM rows (dequeue ports
+2/1/3 with queues 35/34/36). It reserves the ports and programs each DQM
+CPU port with its flat TMU egress path.
+
+Nothing builds this code yet. The buffer manager, the traffic manager
+and the DMA driver resolve symbols against each other, so they are wired
+into the build together once the last of them exists.
+
+Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
+cqm/grx500/cbm.c and cbm_config.c/h, which carry no copyright notice
+of their own; the file headers name them as the origin.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+new file mode 100644
+index 000000000000..e9b2845ff22b
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_ports.c
+@@ -0,0 +1,473 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c, cbm_config.c and
++ * cbm_config.h.
++ *
++ * CBM port tables: the per-datapath-port dequeue, TMU queue and
++ * descriptor-count rows transcribed from the vendor's xrx500_cbm_config[],
++ * and the lookups over them.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/types.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/list.h>
++#include <linux/bitops.h>
++#include <linux/printk.h>
++#include <linux/string.h>
++
++#include "cbm.h"
++#include "../../tmu/drv_tmu_ll.h"
++
++/*
++ * Registry storage — AVM cbm.c:99-101. spin_lock_init runs once from
++ * cbm_configure_dqm_cpu_ports() (AVM does it in probe at cbm.c:5505, right
++ * before configure_ports). All list ops are under spin_lock_irqsave.
++ */
++static LIST_HEAD(pmac_mapping_list);
++/*!< spin lock for cbm port mapping list*/
++static spinlock_t cbm_port_mapping;
++
++/* AVM cbm.c:61 — CBM_PORT_MAX = 64 (AVM cbm.h:210). */
++static struct cbm_dqm_port_info dqm_port_info[CBM_PORT_MAX] = { { 0 } };
++
++/*
++ * cbm_dqm_port_num_desc — descriptor count recorded for DQM port @idx by
++ * conf_dqm_cpu_port below, or 0 for a port no config row covers.
++ *
++ * AVM reads dqm_port_info[idx].deq_info.num_desc straight out of the array
++ * inside init_cbm_dqm_cpu_port (AVM cbm.c:1431/1435), which sits in the same
++ * translation unit as the storage; our port splits the two across cbm_ports.c
++ * and cbm_dma.c, so the read goes through this accessor instead.
++ *
++ * The zero for an unconfigured port is load-bearing, not a don't-care: AVM
++ * gates the dptr write on it (AVM cbm.c:1439-1441) and DQ port 0 — which no
++ * config row covers, and which exists only so the buffer-free API has a port
++ * to return segments on — is deliberately left with its reset descriptor
++ * count. See the for_each_online_cpu loop in cbm_xrx500_probe.
++ */
++u32 cbm_dqm_port_num_desc(int idx)
++{
++	if (idx < 0 || idx >= CBM_PORT_MAX)
++		return 0;
++	return dqm_port_info[idx].deq_info.num_desc;
++}
++
++/*
++ * AVM cbm.h:128-140 — EQM/DQM port-config discriminator. Full value set kept
++ * verbatim for documentation even though only DQM_CPU_TYPE / NONE_TYPE are
++ * handled by the minimal configure_ports below.
++ */
++enum EQM_DQM_PORT_TYPE {
++	DQM_CPU_TYPE = 0,
++	DQM_SCPU_TYPE = 5,
++	DQM_DMA_TYPE = 6,
++	DQM_LDMA_TYPE = 23,
++	DQM_WAVE_TYPE = 24,
++	EQM_CPU_TYPE = 100,
++	EQM_DMA_TYPE = 200,
++	EQM_TOE_TYPE = 9,
++	EQM_DL_TYPE = 12,
++	EQM_VRX318_TYPE = 15,
++	NONE_TYPE = 0xffff
++};
++
++/* AVM cbm_config.h:14-19 verbatim. */
++struct dqm_cpu_port {
++	u32 tmu_port;
++	u32 tmu_queue;
++	u32 cpu_port_type;
++	u32 num_desc;
++};
++
++/*
++ * AVM cbm_config.h:50-64, union REDUCED to the one ported member.
++ */
++struct cqm_config {
++	u32 type;
++	union {
++		struct dqm_cpu_port dqm_cpu;
++	} data;
++};
++
++/*
++ * The three DQM-CPU rows — AVM cbm_config.c:6-29 verbatim (values AND row
++ * order: port2/q35/DP_F_DEQ_CPU, port1/q34/DP_F_DEQ_DL, port3/q36/
++ * DP_F_DEQ_MPE, each num_desc=2; the commented-out port0/q33/DEQ_CPU1 row is
++ * dropped with CONFIG_CBM_LS_ENABLE off). NONE_TYPE terminator per the AVM
++ * configure_ports walk contract.
++ */
++static const struct cqm_config xrx500_cbm_config[] = {
++	{ .type = DQM_CPU_TYPE,
++	  .data.dqm_cpu.tmu_port = 2,
++	  .data.dqm_cpu.tmu_queue = 35,
++	  .data.dqm_cpu.cpu_port_type = DP_F_DEQ_CPU,
++	  .data.dqm_cpu.num_desc = 2 },
++	{
++		.type = DQM_CPU_TYPE,
++		.data.dqm_cpu.tmu_port = 1,
++		.data.dqm_cpu.tmu_queue = 34,
++		.data.dqm_cpu.cpu_port_type = DP_F_DEQ_DL,
++		.data.dqm_cpu.num_desc = 2 },
++	{ .type = DQM_CPU_TYPE,
++	  .data.dqm_cpu.tmu_port = 3,
++	  .data.dqm_cpu.tmu_queue = 36,
++	  .data.dqm_cpu.cpu_port_type = DP_F_DEQ_MPE,
++	  .data.dqm_cpu.num_desc = 2 },
++	{ .type = NONE_TYPE },
++};
++
++/* AVM cbm.c:412-446 verbatim (adaptation (b) logging only). */
++static struct cbm_pmac_port_map *cbm_add_to_list(
++	struct cbm_pmac_port_map *val)
++{
++	struct cbm_pmac_port_map *ptr = NULL;
++	int i = 0;
++	unsigned long flags;
++
++	pr_debug("cbm: \n new linked list\n");
++	ptr = kmalloc(
++		sizeof(struct cbm_pmac_port_map), GFP_ATOMIC);
++	if (!ptr) {
++		pr_err("cbm: \n Node creation failed\n");
++		return NULL;
++	}
++	pr_debug("cbm: \n %s : 1\n", __func__);
++	ptr->pmac = val->pmac;
++	ptr->egp_port_map = val->egp_port_map;
++	for (i = 0; i < val->qid_num; i++)
++		ptr->qids[i] = val->qids[i];
++	ptr->qid_num = val->qid_num;
++	ptr->egp_type = val->egp_type;
++	ptr->owner = 0;
++	ptr->dev = 0;
++	ptr->dev_port = 0;
++	ptr->flags = P_ALLOCATED;
++	pr_debug("cbm: \n %s : 2\n", __func__);
++	spin_lock_irqsave(&cbm_port_mapping, flags);
++	/* Init the list within the struct. */
++	INIT_LIST_HEAD(&ptr->list);
++	/* Add this struct to the tail of the list. */
++	list_add_tail(&ptr->list, &pmac_mapping_list);
++	spin_unlock_irqrestore(&cbm_port_mapping, flags);
++	return ptr;
++}
++
++/*
++ * Static here (non-static in AVM's single cbm.c TU); this TU is the only
++ * consumer.
++ */
++static struct cbm_egp_map epg_lookup_table[] = {
++	{ 0, 0, 0 },
++	{ 0, CBM_PMAC_DYNAMIC, DP_F_DIRECT },
++	{ 1, 0, DP_F_MPE_ACCEL },
++	{ 1, CBM_PMAC_DYNAMIC, DP_F_DIRECTLINK },
++	{ CBM_PORT_NOT_APPL, CBM_PMAC_DYNAMIC, DP_F_FAST_WLAN | DP_F_FAST_DSL },
++	{ 5, CBM_PMAC_NOT_APPL, DP_F_LRO },
++	{ 6, 1, DP_F_FAST_ETH_LAN },
++	{ 7, 2, DP_F_FAST_ETH_LAN },
++	{ 8, 3, DP_F_FAST_ETH_LAN },
++	{ 9, 4, DP_F_FAST_ETH_LAN },
++	{ 10, 5, DP_F_FAST_ETH_LAN },
++	{ 11, 6, DP_F_FAST_ETH_LAN },
++	{ 12, 1, DP_F_FAST_ETH_LAN },
++	{ 13, 2, DP_F_FAST_ETH_LAN },
++	{ 14, 3, DP_F_FAST_ETH_LAN },
++	{ 15, 4, DP_F_FAST_ETH_LAN },
++	{ 16, 5, DP_F_FAST_ETH_LAN },
++	{ 17, 6, DP_F_FAST_ETH_LAN },
++	{ 18, CBM_PMAC_NOT_APPL, DP_F_FAST_DSL_DOWNSTREAM },
++	{ 19, 15, DP_F_FAST_ETH_WAN },
++	{ 20, CBM_PMAC_NOT_APPL, DP_F_CHECKSUM },
++	{ 21, CBM_PMAC_NOT_APPL, DP_F_DIRECTPATH_RX },
++	{ 23, CBM_PMAC_DYNAMIC, DP_F_FAST_DSL },
++	{ CBM_PORT_NOT_APPL, CBM_PMAC_DYNAMIC, DP_F_FAST_WLAN },
++	{ CBM_PORT_NOT_APPL, CBM_PMAC_DYNAMIC, DP_F_FAST_WLAN },
++	{ CBM_PORT_NOT_APPL, CBM_PMAC_DYNAMIC, DP_F_FAST_WLAN },
++	{ CBM_PORT_NOT_APPL, CBM_PMAC_DYNAMIC, DP_F_PORT_TUNNEL_DECAP },
++};
++
++/* AVM cbm.c:602-624 verbatim. */
++static u32 get_matching_EP(
++	u32 cbm_port,
++	u32 flags,
++	u32 *pmac)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(epg_lookup_table); i++) {
++		pr_debug("cbm: %s: %d %d %d\r\n", __func__,
++			 epg_lookup_table[i].epg,
++			 epg_lookup_table[i].port_type,
++			 epg_lookup_table[i].pmac);
++		pr_debug("cbm: %s: %d %d \r\n", __func__, cbm_port, flags);
++		if ((epg_lookup_table[i].epg == cbm_port) &&
++		    (epg_lookup_table[i].port_type == flags)) {
++			/*flags = epg_lookup_table[i].port_type;*/
++			*pmac = epg_lookup_table[i].pmac;
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/*
++ * DQM-DMA rows of AVM's xrx500_cbm_config[] (cqm/grx500/cbm_config.c): CBM
++ * dequeue port -> TMU queue + the DMA controller and channel that drains it.
++ * num_desc is 2 on every row and lives in hdma.c as CBM_DQM_DESC_NUM;
++ * tmu_queue_nos is 1 on every row here.
++ *
++ * dma_ctrl keeps AVM's own encoding (1 = DMA1TX, 2 = DMA2TX), not the cid
++ * values of enum dma_controller — this table is a transcription of the vendor
++ * rows and translating it in place would make it un-diffable against them.
++ *
++ * The dp-15 row is the one that matters: dequeue 19 is drained by DMA1TX,
++ * a different controller from every LAN port, not merely a different channel.
++ *
++ * Only the rows this driver can serve end to end are carried, because this
++ * table IS the admissibility test - it is what decides which ports the CBM
++ * probe programs DQM and TMU state for. The vendor's remaining DQM-DMA rows
++ * are deliberately absent:
++ *
++ * deq 6 and 11 (dp 1 and 6) are real GSWIP-L ports, but no board here wires
++ * them and hdma_port_chan_tbl() has no channel for either, so admitting them
++ * would program egress state at probe for a port that does not exist on the
++ * board. - deq 12..17 are the
++ * high-priority twins of the six LAN ports (AVM's intel,highprio-lan). They
++ * carry the same pmac values as the primaries, which take precedence in the
++ * lookup below, so these rows could never be selected even if they were here.
++ * - deq 18 and 20..22 are the DSL, checksum and directpath ports, which are
++ * not Ethernet and have no netdev.
++ */
++static const struct {
++	u32 deq_port;
++	u32 tmu_queue;
++	u32 dma_ctrl;
++	u32 dma_chan;
++} cbm_dqm_dma_eth_rows[] = {
++	{  7, 17, 2,  2 },
++	{  8, 18, 2,  3 },
++	{  9, 19, 2,  4 },
++	{ 10, 20, 2,  5 },
++	{ 19, 28, 1, 15 },
++};
++
++/*
++ * cbm_dp_egress_res_get - resolve a datapath port's egress resources.
++ *
++ * Return: 0 with @res filled, or -EINVAL if @dp_port_id is not an Ethernet
++ * datapath port on this silicon.
++ */
++int cbm_dp_egress_res_get(u32 dp_port_id, struct cbm_dp_egress_res *res)
++{
++	u32 deq = CBM_PORT_INVALID;
++	int i;
++
++	if (!res)
++		return -EINVAL;
++
++	/*
++	 * Both blocks carry the same pmac values, so taking the first keeps
++	 * the primary.
++	 */
++	for (i = 0; i < ARRAY_SIZE(epg_lookup_table); i++) {
++		if (epg_lookup_table[i].pmac != dp_port_id)
++			continue;
++		if (epg_lookup_table[i].port_type != DP_F_FAST_ETH_LAN &&
++		    epg_lookup_table[i].port_type != DP_F_FAST_ETH_WAN)
++			continue;
++		deq = epg_lookup_table[i].epg;
++		break;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(cbm_dqm_dma_eth_rows); i++) {
++		if (cbm_dqm_dma_eth_rows[i].deq_port != deq)
++			continue;
++		res->deq_port  = deq;
++		res->tmu_queue = cbm_dqm_dma_eth_rows[i].tmu_queue;
++		res->dma_ctrl  = cbm_dqm_dma_eth_rows[i].dma_ctrl;
++		res->dma_chan  = cbm_dqm_dma_eth_rows[i].dma_chan;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
++/* AVM cbm.c:625-644 verbatim. */
++static u32 assign_port_from_DT(
++	u32 flags,
++	u32 cbm_port)
++{
++	int i, result = CBM_NOTFOUND;
++
++	for (i = 0; i < ARRAY_SIZE(epg_lookup_table); i++) {
++		if (epg_lookup_table[i].port_type == flags) {
++			if ((flags == DP_F_FAST_WLAN) &&
++			    (epg_lookup_table[i].epg != CBM_PORT_NOT_APPL))
++				continue;
++			epg_lookup_table[i].epg = cbm_port;
++			result = CBM_SUCCESS;
++			break;
++		}
++	}
++	return result;
++}
++
++/* AVM cbm.c:5031-5052 verbatim — SW high-watermark bookkeeping only (the
++ * dynamic port allocator reads it back at AVM cbm.c:914); no register
++ * writes.
++ */
++static void reserved_ports_highest(struct cbm_tmu_res *tmu_res, int flag_set)
++{
++	static struct cbm_tmu_res high_tmu_res = { 0 };
++
++	if (flag_set) {
++		if (high_tmu_res.tmu_port < tmu_res->tmu_port)
++			high_tmu_res.tmu_port = tmu_res->tmu_port;
++		if (high_tmu_res.cbm_deq_port < tmu_res->cbm_deq_port)
++			high_tmu_res.cbm_deq_port = tmu_res->cbm_deq_port;
++
++		if ((high_tmu_res.tmu_q < tmu_res->tmu_q) && (tmu_res->tmu_q != 255))
++			high_tmu_res.tmu_q = tmu_res->tmu_q;
++		if ((high_tmu_res.tmu_sched < tmu_res->tmu_sched) && (tmu_res->tmu_q != 255))
++			high_tmu_res.tmu_sched = tmu_res->tmu_sched;
++	} else {
++		tmu_res->cbm_deq_port = high_tmu_res.cbm_deq_port;
++		tmu_res->tmu_port = high_tmu_res.tmu_port;
++		tmu_res->tmu_sched = high_tmu_res.tmu_sched;
++		tmu_res->tmu_q = high_tmu_res.tmu_q;
++	}
++}
++
++/* AVM cbm.c:5069-5077 verbatim. */
++#define RESERVE_PORTS(tmp_res, tmu_port, tmu_queue)         \
++	do {                                                \
++		tmp_res.cbm_deq_port = tmu_port;            \
++		tmp_res.tmu_port = tmu_port;                \
++		tmp_res.tmu_sched = (tmu_queue)-SBID_START; \
++		tmp_res.tmu_q = tmu_queue;                  \
++		reserved_ports_highest(&tmp_res, 1);        \
++	} while (0)
++
++/* AVM cbm.c:5129-5229. */
++static int conf_dqm_cpu_port(const struct dqm_cpu_port *cpu_ptr)
++{
++	u32 tmu_port, flags = 0;
++	struct cbm_tmu_res tmp_res;
++	struct cbm_pmac_port_map local_entry = { 0 };
++	u32 ep, res;
++
++	tmu_port = cpu_ptr->tmu_port;
++	RESERVE_PORTS(tmp_res, tmu_port, cpu_ptr->tmu_queue);
++	memset(&local_entry, 0, sizeof(local_entry));
++	dqm_port_info[tmu_port].def_qid = cpu_ptr->tmu_queue;
++	dqm_port_info[tmu_port].def_schd = cpu_ptr->tmu_queue - SBID_START;
++	dqm_port_info[tmu_port].deq_info.num_desc = cpu_ptr->num_desc;
++	dqm_port_info[tmu_port].deq_info.port_no = tmu_port;
++	dqm_port_info[tmu_port].deq_info.dma_tx_chan = 255;
++	dqm_port_info[tmu_port].num_free_entries = (tmu_port > 3) ? 32 : 1;
++	/*config cbm/dma port*/
++	init_cbm_dqm_cpu_port(tmu_port);
++	/*config the tmu queue and scheduler*/
++	tmu_create_flat_egress_path(1, tmu_port,
++				    cpu_ptr->tmu_queue - SBID_START,
++				    cpu_ptr->tmu_queue, 1);
++	if (tmu_port >= 5) {
++		flags = DP_F_FAST_WLAN;
++		assign_port_from_DT(DP_F_FAST_WLAN, tmu_port);
++		goto ASSIGN_FLAGS;
++	} else if (tmu_port == 4) {
++		flags = DP_F_FAST_WLAN | DP_F_FAST_DSL;
++		assign_port_from_DT(DP_F_FAST_WLAN | DP_F_FAST_DSL, tmu_port);
++		goto ASSIGN_FLAGS;
++	}
++
++	if (cpu_ptr->cpu_port_type == DP_F_DEQ_CPU) {
++		flags = 0;
++		assign_port_from_DT(0, tmu_port);
++		assign_port_from_DT(DP_F_DIRECT, tmu_port);
++	} else if (cpu_ptr->cpu_port_type == DP_F_DEQ_CPU1) {
++		flags = 0;
++	} else if (cpu_ptr->cpu_port_type == DP_F_DEQ_MPE) {
++		flags = DP_F_MPE_ACCEL;
++		assign_port_from_DT(DP_F_MPE_ACCEL, tmu_port);
++	} else if (cpu_ptr->cpu_port_type == DP_F_DEQ_DL) {
++		flags = DP_F_DIRECTLINK;
++		assign_port_from_DT(DP_F_DIRECTLINK, tmu_port);
++	}
++/*if(tmu_port != 0) {*/
++/*TMU/CBM port  with pmac 0 is fixed for cpu port*/
++	if (cpu_ptr->cpu_port_type == DP_F_DEQ_CPU) {
++		local_entry.pmac = 0;
++		local_entry.egp_type = 0;
++		cbm_program_cpu_qidt(cpu_ptr->tmu_queue);
++	} else {
++		res = get_matching_EP(tmu_port, flags, &ep);
++		if (res) {
++			local_entry.egp_type = flags;
++			local_entry.pmac = ep;
++			if (ep == CBM_PMAC_DYNAMIC) {
++				pr_debug("cbm: ep is dynamic %d\r\n", tmu_port);
++				/*break;*/
++				goto ASSIGN_FLAGS;
++			}
++		} else {
++			pr_err("cbm: mapping missing for phys port %d\r\n", tmu_port);
++			return CBM_FAILURE;
++		}
++	}
++	local_entry.egp_port_map |= BIT(tmu_port);
++	local_entry.qids[local_entry.qid_num] = dqm_port_info[tmu_port].def_qid;
++	local_entry.qid_num++;
++	local_entry.owner = 0;
++	local_entry.dev = 0;
++	local_entry.dev_port = 0;
++	local_entry.flags = P_ALLOCATED;
++	cbm_add_to_list(&local_entry);
++ASSIGN_FLAGS:
++	dqm_port_info[tmu_port].egp_type = flags;
++	cpu_ptr = NULL;
++	return CBM_SUCCESS;
++}
++
++/*
++ * AVM cbm.c:5365-5405, MINIMAL: only DQM_CPU_TYPE + NONE_TYPE are ported.
++ * Any other row type is a hard CBM_FAILURE with a pr_err — the matching
++ * conf_*_port functions are not ported yet, and silently skipping a row
++ * would desync the walk from the AVM config table.
++ */
++static int configure_ports(const struct cqm_config *port_config)
++{
++	int result;
++
++	while (port_config->type != NONE_TYPE) {
++		switch (port_config->type) {
++		case DQM_CPU_TYPE:
++			result = conf_dqm_cpu_port(&port_config->data.dqm_cpu);
++			break;
++		default:
++			pr_err("cbm: configure_ports: unported port type %u\n",
++			       port_config->type);
++			result = CBM_FAILURE;
++			break;
++		}
++		if (result)
++			return CBM_FAILURE;
++		port_config++;
++	}
++	return CBM_SUCCESS;
++}
++
++int cbm_configure_dqm_cpu_ports(void)
++{
++	static bool registry_lock_ready;
++
++	if (!registry_lock_ready) {
++		spin_lock_init(&cbm_port_mapping);
++		registry_lock_ready = true;
++	}
++	return configure_ports(&xrx500_cbm_config[0]);
++}

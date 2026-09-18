@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 16:25:12 +0200
+Subject: MIPS: dts: intel-mips: enable PCIe on the FRITZ!Box 7560
+
+All three root complexes are populated on this board: RC0 and RC1 carry
+the two WiFi radios, RC2 the VRX318 DSL companion. Enable the three
+ports and the three PHYs, and give them the board policy the SoC dtsi
+deliberately leaves out.
+
+The reset lines are gpio0 9, 8 and 16, active low -- the PERST# inputs
+of the three slots. Bank, pin and polarity are hardware truth rather
+than a reading of the vendor tree: the 4.9 kernel drives exactly these
+on this device and enumerates an endpoint behind every port. The three
+pads were left unclaimed when the LEDs and buttons landed, precisely so
+this change could take them; update that note accordingly.
+
+Inbound byte swapping is enabled on the two radio ports and disabled on
+RC2. The SoC is big endian and the DWC core is not, so inbound DMA gets
+swapped on the way through -- except for the VRX318, whose driver
+already presents its shared memory the way the host wants it, and a
+second swap would undo the first. The vendor tree reaches the same
+split from the other direction: grx_common.dtsi turns inbound-swap on
+for all three ports, and vrx318.dtsi, included only by boards carrying
+that chip, turns it back off on RC2. Outbound is never swapped.
+
+Spread spectrum clocking is on, on all three PHYs, which is what this
+hardware has always run with: the vendor board file enables it and the
+vendor PHY driver reads exactly the spelling the board file uses. We
+ask for the same behaviour, spelling the property the way a mainline
+driver reads it. (The property that goes unread in the vendor tree is
+its SoC-level one, not the board override.)
+
+Two vendor properties are not carried over. intel,rst-interval is a
+name nothing reads -- mainline calls the same knob reset-assert-ms and
+already defaults it to the 100 ms the vendor asks for -- and intel,iatu
+is moot because the driver suppresses iATU programming structurally,
+through its own child config accessors, rather than by a DT flag.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+index 66a861434fc9..8d29b03f2b5a 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -186,3 +186,52 @@ dect-reset-hog {
+ 		line-name = "dect-reset";
+ 	};
+ };
++
++&pcie_phy0 {
++	status = "okay";
++	intel,ssc-enable = <1>;
++};
++
++&pcie_phy1 {
++	status = "okay";
++	intel,ssc-enable = <1>;
++};
++
++&pcie_phy2 {
++	status = "okay";
++	intel,ssc-enable = <1>;
++};
++
++/*
++ * Inbound byte swapping is enabled on the two radio ports and disabled
++ * on RC2. This SoC is big endian and the DWC core is not, so inbound
++ * DMA is byte-swapped on the way through -- except for the VRX318,
++ * whose driver already presents its shared memory in the endianness the
++ * host expects, and swapping again would undo it. The vendor tree
++ * arrives at the same split: grx_common.dtsi sets inbound-swap on all
++ * three, and vrx318.dtsi, included only by boards carrying that chip,
++ * clears it on RC2.
++ *
++ * Outbound is never swapped, on any port.
++ */
++&pcie0 {
++	status = "okay";
++	intel,inbound-swap = <1>;
++	intel,outbound-swap = <0>;
++	reset-gpios = <&gpio0 9 GPIO_ACTIVE_LOW>;
++};
++
++&pcie1 {
++	status = "okay";
++	intel,inbound-swap = <1>;
++	intel,outbound-swap = <0>;
++	reset-gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
++};
++
++/* VRX318 DSL companion -- see the inbound-swap note above. */
++&pcie2 {
++	status = "okay";
++	intel,inbound-swap = <0>;
++	intel,outbound-swap = <0>;
++	reset-gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
++};

@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 13:34:58 +0200
+Subject: leds: lgm-sso: take the shift clock edge from the compatible
+
+SSO_CON0.RZFL selects which edge of the shift clock the data line is
+driven on. The driver hardcodes it to 0, the rising edge, through a
+DATA_CLK_EDGE define that no DT property and no match data can reach.
+That is right for Lightning Mountain and wrong for GRX500.
+
+The vendor driver for this SoC settles it, and does so in source rather
+than by measurement: it defaults the edge to falling and treats rising
+as an opt-in device-tree property, "intel,sso-rising", which no board
+device tree in any of its releases sets. Every shipping board on this
+SoC therefore runs with RZFL set.
+
+So carry the edge as per-compatible match data. intel,lgm-ssoled keeps
+the rising edge it has always had, byte for byte; intel,grx500-ssoled
+selects falling. A struct rather than a bare value because RZFL is
+unlikely to be the last such difference, and because the value 0 cannot
+be told apart from absent match data.
+
+SSO_CON0.BLINK_R is the other bit where the two forks disagree -- this
+one sets it whenever an update rate is configured and the vendor clears
+it unconditionally -- and it is deliberately left alone. Unlike the
+edge, no failure mechanism for it is known and neither fork's source
+argues for its choice, so there is nothing here to key a difference
+off.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index 96e327ca5d55..b546875b491d 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -52,7 +52,10 @@
+ #define MAX_FREQ_RANK			10
+ #define DEF_GPTC_CLK_RATE		200000000
+ #define SSO_DEF_BRIGHTNESS		LED_HALF
+-#define DATA_CLK_EDGE			0 /* 0-rising, 1-falling */
++
++/* SSO_CON0.RZFL: the shift clock edge the data line is driven on */
++#define DATA_CLK_EDGE_RISING		0
++#define DATA_CLK_EDGE_FALLING		1
+ 
+ static const u32 freq_div_tbl[] = {4000, 2000, 1000, 800};
+ static const int freq_tbl[] = {2, 4, 8, 10, 50000, 100000, 200000, 250000};
+@@ -129,10 +132,21 @@ struct sso_gpio {
+ 	u32 alloc_bitmap;
+ };
+ 
++/*
++ * Per-compatible hardware differences. The shift clock edge is one: it is a
++ * property of the board's external shift register rather than something the
++ * SoC can be asked about, and no two SoC families this block appears on have
++ * been observed agreeing on it.
++ */
++struct sso_led_variant {
++	unsigned int data_clk_edge;
++};
++
+ struct sso_led_priv {
+ 	struct regmap *mmap;
+ 	struct device *dev;
+ 	struct platform_device *pdev;
++	const struct sso_led_variant *variant;
+ 	struct clk_bulk_data clocks[2];
+ 	u32 fpid_clkrate;
+ 	u32 gptc_clkrate;
+@@ -754,7 +768,7 @@ static int sso_probe_gpios(struct sso_led_priv *priv)
+ 				     &priv->gpio.freq))
+ 		priv->gpio.freq = 0;
+ 
+-	priv->gpio.edge = DATA_CLK_EDGE;
++	priv->gpio.edge = priv->variant->data_clk_edge;
+ 	priv->gpio.shift_clk_freq = -1;
+ 
+ 	ret = sso_gpio_hw_init(priv);
+@@ -783,6 +797,7 @@ static int intel_sso_led_probe(struct platform_device *pdev)
+ 
+ 	priv->pdev = pdev;
+ 	priv->dev = dev;
++	priv->variant = device_get_match_data(dev);
+ 
+ 	/* gate clock */
+ 	priv->clocks[0].id = "sso";
+@@ -847,8 +862,17 @@ static void intel_sso_led_remove(struct platform_device *pdev)
+ 	}
+ }
+ 
++static const struct sso_led_variant grx500_ssoled = {
++	.data_clk_edge = DATA_CLK_EDGE_FALLING,
++};
++
++static const struct sso_led_variant lgm_ssoled = {
++	.data_clk_edge = DATA_CLK_EDGE_RISING,
++};
++
+ static const struct of_device_id of_sso_led_match[] = {
+-	{ .compatible = "intel,lgm-ssoled" },
++	{ .compatible = "intel,grx500-ssoled", .data = &grx500_ssoled },
++	{ .compatible = "intel,lgm-ssoled", .data = &lgm_ssoled },
+ 	{}
+ };
+ 

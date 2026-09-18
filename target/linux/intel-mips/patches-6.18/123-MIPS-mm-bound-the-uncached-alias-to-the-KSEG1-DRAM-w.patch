@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 19:34:00 +0200
+Subject: MIPS: mm: bound the uncached alias to the KSEG1 DRAM window
+
+arch_dma_set_uncached() computes an uncached alias for every physical
+address it is handed, and on intel-mips (Lantiq/Intel xRX500) not every
+physical address has one.
+
+The SegCtl this platform boots under maps kernel VA 0xA0000000-0xBFFFFFFF
+uncached onto physical 0x20000000-0x3FFFFFFF, and only the lower half of
+that is DRAM. The upper half -- VA 0xB0000000 and up -- is the SoC's
+register space, which appears there at its nominal address plus
+0x20000000, and which every ioremap() on this platform is served out of.
+So the uncached alias of DRAM is exactly the first 256 MiB, and
+PHYS_OFFSET + SZ_256M is where it stops being one.
+
+The vendor kernel states the same window three ways. Its plat_ioremap()
+maps [PHYS_OFFSET, PHYS_OFFSET + GRX500_UNCACHED_RAM_IOREMAP_SIZE)
+through CKSEG1 and the register range 0x10000000-0x1FFFFFFF through a
+flat GRX500_REG_IOREMAP_PHYS_VIRT_OFFSET of 0xA0000000, that size
+constant being 0x10000000 (vendor GPL release of Linux 4.9,
+arch/mips/include/asm/mach-lantiq/ioremap.h). It caps its CMA region at
+PHYS_OFFSET + min(ZONE_DMA_SIZE, SZ_256M) because "the system has only
+256MB uncached address available" (arch/mips/kernel/setup.c). And the
+window size is a constant in every release; only the ZONE_DMA sub-window
+carved out of it is configurable.
+
+Above the line the alias is a register address, and what happens then
+depends on whether anything is decoded there. On an unpopulated hole it
+is a data bus error: a coherent page at physical 0x31477000 aliases onto
+nominal 0x11477000, nothing answers, and a kernel-mode memcpy through it
+panicked this silicon. On a populated block there is no fault at all --
+the write lands in the register while the device goes on reading the
+untouched DRAM page, and the damage surfaces in a block with no
+connection to the driver that allocated.
+
+Nothing else on this platform bounds where a coherent allocation lands.
+The DMA mask does not: xhci-plat and dwc3 both ask for DMA_BIT_MASK(64),
+CONFIG_ARCH_DMA_ADDR_T_64BIT is unset so it truncates to 0xffffffff, and
+dma_coherent_ok() then accepts every physical address in the machine.
+The zones do not: there is no ZONE_DMA32 on a 32-bit kernel, MIPS never
+assigns zone_dma_limit so it stays below PHYS_OFFSET and
+dma_direct_optimal_gfp_mask() never picks GFP_DMA, and ZONE_NORMAL runs
+from 0x21000000 to the top of RAM. CONFIG_CMA is not set and no DT node
+carries dma-coherent or a restricted-dma-pool. On a 512 MiB board that
+leaves roughly 256 MiB freely allocatable and unusable, with the
+placement decided by the buddy allocator.
+
+Boards at 256 MiB cannot reach the line and are unaffected. On the one
+that can, the exposure is not first probe -- early allocations come off
+the low end of the free lists, because memblock frees ascending and
+__free_pages_core() adds with FPI_TO_TAIL -- but runtime growth: a
+dma_pool page added on hotplug, a ring expansion, a stream context
+array. That is the shape of a latent, non-reproducible bug, which is the
+argument for catching it here rather than triaging it later.
+
+So bound it and fail closed. dma_direct_alloc() already handles an
+ERR_PTR from this function: it frees the pages and returns NULL, and the
+driver sees an ordinary allocation failure. A visible -ENOMEM under
+memory pressure on one board is a better trade than a silent write into
+SoC registers, and the check costs a compare on a path that already does
+a virt-to-phys.
+
+Failing closed silently would not be, though. dma_direct_alloc() drops
+the errno, so what the log gets is the driver's own report of an
+allocation that returned nothing, and on a board with hundreds of
+megabytes free that reads as a leak somewhere else:
+
+  ath10k_pci 0000:01:00.0: failed to alloc htt rx: -12
+
+The rate-limited line therefore names the allocation and the bound it
+crossed, so a burst of refusals is visible as a burst; and the one-shot
+WARN is there for the backtrace, because this function is handed an
+address and a length and no caller identity. Every coherent allocation
+on the platform arrives through dma_direct_alloc(), so a return address
+names that and nothing else -- the stack is the only thing that says
+which driver asked.
+
+This function is the single point every dma_alloc_coherent() on the
+platform passes through.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/mm/dma-noncoherent.c b/arch/mips/mm/dma-noncoherent.c
+index 96400a9fd294..e89b07a1e160 100644
+--- a/arch/mips/mm/dma-noncoherent.c
++++ b/arch/mips/mm/dma-noncoherent.c
+@@ -7,6 +7,7 @@
+ #include <linux/dma-direct.h>
+ #include <linux/dma-map-ops.h>
+ #include <linux/highmem.h>
++#include <linux/sizes.h>
+ 
+ #include <asm/cache.h>
+ #include <asm/cpu-type.h>
+@@ -49,8 +50,38 @@ void arch_dma_prep_coherent(struct page *page, size_t size)
+ 	dma_cache_wback_inv((unsigned long)page_address(page), size);
+ }
+ 
++/*
++ * Upper bound on the physical addresses an uncached alias may be taken of.
++ * Above it the uncached window maps registers rather than DRAM, so a coherent
++ * allocation placed there would be handed a register address.
++ */
++#define INTEL_MIPS_UNCAC_DRAM_LIMIT	(PHYS_OFFSET + SZ_256M)
++
+ void *arch_dma_set_uncached(void *addr, size_t size)
+ {
++	unsigned long pa = __pa(addr);
++
++	if (IS_ENABLED(CONFIG_INTEL_MIPS) &&
++	    pa + size > INTEL_MIPS_UNCAC_DRAM_LIMIT) {
++		/*
++		 * Say so. dma_direct_alloc() discards this errno and hands
++		 * the caller a plain NULL, so a refusal reads as ordinary
++		 * memory pressure -- on a board with hundreds of MiB free,
++		 * and only once the free lists have drifted above the bound,
++		 * which is why it does not reproduce on a freshly booted
++		 * machine.
++		 *
++		 * The rate-limited line identifies every refusal; the
++		 * one-shot backtrace identifies the caller, which nothing in
++		 * this frame can.
++		 */
++		pr_err_ratelimited("uncached alias refused: pa 0x%lx size %zu, KSEG1 limit 0x%lx\n",
++				   pa, size, INTEL_MIPS_UNCAC_DRAM_LIMIT);
++		WARN_ONCE(1, "coherent DMA allocation above the KSEG1 DRAM window\n");
++
++		return ERR_PTR(-ENOMEM);
++	}
++
+ 	/*
+ 	 * __pa() yields an address measured from physical zero on the legacy
+ 	 * memory map, which is also where the uncached window at UNCAC_BASE
+@@ -59,9 +90,9 @@ void *arch_dma_set_uncached(void *addr, size_t size)
+ 	 * of DRAM, so the anchor has to be taken back out.
+ 	 */
+ 	if (IS_ENABLED(CONFIG_EVA))
+-		return (void *)(__pa(addr) - PHYS_OFFSET + UNCAC_BASE);
++		return (void *)(pa - PHYS_OFFSET + UNCAC_BASE);
+ 
+-	return (void *)(__pa(addr) + UNCAC_BASE);
++	return (void *)(pa + UNCAC_BASE);
+ }
+ 
+ static inline void dma_sync_virt_for_device(void *addr, size_t size,

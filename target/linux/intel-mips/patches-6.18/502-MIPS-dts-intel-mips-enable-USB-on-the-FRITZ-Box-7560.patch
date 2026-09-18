@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 22:23:36 +0200
+Subject: MIPS: dts: intel-mips: enable USB on the FRITZ!Box 7560
+
+The box has one USB host port, on the SoC's usb1; usb0 is not bonded
+out. Enable the controller and its PHY and give the PHY the VBUS supply
+it needs.
+
+Port power is software controlled through gpio0 line 6, active high.
+That polarity is one of the few AVM annotations worth trusting, because
+two independent things in the vendor tree state it: the board file
+marks the line GPIO_ACTIVE_HIGH (AVM 4.9 arch/mips/boot/dts/lantiq/avm/
+grx350_common.dtsi, gpio_avm_usb_power_enable) and the shim that drives
+it uses gpiod_set_value(), which honours the flag. Contrast the LED
+annotations in the same file, which are wrong precisely because that
+shim never read them.
+
+The vendor does not model this as a regulator at all. It patches
+drivers/usb/host/xhci.c to resolve the line through an AVM-private
+alias, fails module init when the alias is missing, forces it low in
+xhci_hcd_init(), and raises it from a delayed work item 100 ms after
+xhci_run_finished(). A regulator-fixed consumed by the PHY through
+vbus-supply needs no patches to shared code and raises VBUS in
+phy .power_on, i.e. before the controller starts rather than after --
+a stricter ordering, and the one the USB spec asks for. It is stricter
+in a way that has not been tested on this hardware yet, so if a device
+fails to enumerate, that 100 ms post-start delay is the first vendor
+behaviour to reproduce.
+
+The Phase-14 placeholder in the pin map goes away with this: gpio0 6 is
+now claimed, by the regulator, the same way gpio0 8, 9 and 16 are
+claimed by the PCIe root complexes.
+
+No pinmux. The pad comes up as a plain GPIO, which is all the regulator
+needs, and there is nothing to mux it to: the vendor deletes every USB
+pinctrl node it declares, and pinctrl-equilibrium has no USB function
+or group at all.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+index 060ca4b593c8..cf26ea178c63 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dtsi
+@@ -262,3 +262,23 @@ &pcie2 {
+ 	intel,outbound-swap = <0>;
+ 	reset-gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
+ };
++
++/ {
++	usb_vbus: regulator-usb-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb_vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&gpio0 6 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++};
++
++&usb1_phy {
++	status = "okay";
++	vbus-supply = <&usb_vbus>;
++};
++
++&usb1 {
++	status = "okay";
++};

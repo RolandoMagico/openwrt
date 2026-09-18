@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 14 Aug 2026 09:59:59 +0200
+Subject: MIPS: dts: intel-mips: wire the RCU software reset as restart handler
+
+Asking this SoC to reboot prints "reboot: Restarting system" and then
+stops there forever. Nothing in the tree registers a restart handler, so
+machine_restart() finds _machine_restart NULL after do_kernel_restart()
+walks an empty notifier chain, and drops into machine_hang(), which
+masks every interrupt and parks the CPU in wait. The only way out is the
+mains switch. On a board whose sole debug channel is a serial cable that
+is already tiresome by hand, and it is fatal to anything that has to
+reboot unattended -- a firmware upgrade being the obvious one.
+
+The reset the vendor firmware uses is a single bit. AVM's 4.9 BSP
+registers intel_reset_restart_handler() out of
+drivers/reset/reset-intel-syscon.c, and the whole handler is one call
+asserting the line it numbers RCU_RD_SRST == 30: a read-modify-write
+setting bit 30 of RCU_RST_REQ, offset 0x10 into the RCU block, physical
+0x16000010. That bit is the SoC's global software reset.
+
+Reaching it costs nothing new here, because the RCU is already described
+as "simple-mfd"/"syscon" -- reset-lantiq.c needs it that way to hand out
+the GPHY reset lines. When a syscon-reboot node carries no "regmap"
+phandle the driver falls back to syscon_node_to_regmap() on its parent,
+which is precisely that regmap, so a child node with a compatible, an
+offset and a bit is the entire binding; no reg property is involved.
+bcm63268.dtsi describes its reset the same way, as a child of the
+pll_cntl syscon.
+
+Both mask and value are stated on purpose. syscon-reboot still honours
+an older binding in which a mask with no value means "write this word",
+so a mask-only node would clear every other bit of RCU_RST_REQ on its
+way to setting one. Giving the pair selects regmap_update_bits() and
+reproduces the vendor sequence exactly.
+
+Global SRST is also the right scope, rather than resetting only the
+cluster Linux runs on. The GRX350 has two interAptiv clusters, and on
+the FRITZ!Box 7560 the second one is executing AVM's bootcore from its
+own kernel image for as long as the board is powered. Bit 30 resets the
+chip, both clusters included, which is what the vendor firmware does on
+every reboot and what leaves the bootcore restarted from its entry point
+instead of running on underneath a freshly started Linux.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index c311c2ed7595..8426bfbed168 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -72,6 +72,19 @@ rcu_reset0: reset-controller@10 {
+ 			reg = <0x10 0x4>, <0x14 0x4>;
+ 			#reset-cells = <2>;
+ 		};
++
++		/*
++		 * Restart handler. Bit 30 of RCU_RST_REQ triggers the SoC
++		 * reset, and the write must be a read-modify-write under the
++		 * mask: a legacy full-word write clears reset lines that are
++		 * latched elsewhere in the same register.
++		 */
++		reboot {
++			compatible = "syscon-reboot";
++			offset = <0x10>;	/* RCU_RST_REQ */
++			mask = <0x40000000>;	/* RCU_RD_SRST */
++			value = <0x40000000>;
++		};
+ 	};
+ 
+ 	asc0: serial@16600000 {

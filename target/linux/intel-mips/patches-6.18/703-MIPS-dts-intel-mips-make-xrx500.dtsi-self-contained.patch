@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 01:25:03 +0200
+Subject: MIPS: dts: intel-mips: make xrx500.dtsi self-contained
+
+xrx500.dtsi uses GIC_SHARED and the CLK_* / GCLK_* clock cell values but
+includes neither header, relying on every board file to include them first.
+That works only because all three currently do, in the right order, and it
+means the SoC description cannot be included by anything except a file that
+already knows what it needs.
+
+Move the two includes into xrx500.dtsi and drop them from the board files.
+No DTB changes: the macros and their expansions are identical, only the
+point of definition moves.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/easy350_anywan.dts b/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+index 725df1e2d556..99f88146c189 100644
+--- a/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
++++ b/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+@@ -2,9 +2,6 @@
+ // Copyright (C) 2026 Grische <github@grische.xyz>
+ /dts-v1/;
+ 
+-#include <dt-bindings/interrupt-controller/mips-gic.h>
+-#include <dt-bindings/clock/intel,grx500-clk.h>
+-
+ #include "xrx500.dtsi"
+ 
+ / {
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+index 7eb39d6d7403..c2987174553d 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7560.dts
+@@ -2,8 +2,6 @@
+ // Copyright (C) 2026 Grische <github@grische.xyz>
+ /dts-v1/;
+ 
+-#include <dt-bindings/interrupt-controller/mips-gic.h>
+-#include <dt-bindings/clock/intel,grx500-clk.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/input/input.h>
+ 
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 297d1145371a..3ab98685650d 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -7,9 +7,6 @@
+  */
+ /dts-v1/;
+ 
+-#include <dt-bindings/interrupt-controller/mips-gic.h>
+-#include <dt-bindings/clock/intel,grx500-clk.h>
+-
+ #include "xrx500.dtsi"
+ 
+ / {
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index f1640c4368b3..27011ed47f43 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -1,6 +1,9 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ // Copyright (C) 2026 Grische <github@grische.xyz>
+ 
++#include <dt-bindings/interrupt-controller/mips-gic.h>
++#include <dt-bindings/clock/intel,grx500-clk.h>
++
+ / {
+ 	#address-cells = <1>;
+ 	#size-cells = <1>;

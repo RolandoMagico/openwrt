@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 12:55:11 +0200
+Subject: MIPS: dts: intel-mips: give the 512 MiB boards their full memory back
+
+Both GRX550 boards carry 512 MiB and declare 256. Take the cap out.
+
+The cap was never a statement about the memory. "MIPS: dts: intel-mips:
+cap the FRITZ!Box 7590 at the uncached window" put it in as a
+coherent-DMA-correctness measure: above PHYS_OFFSET + SZ_256M the KSEG1
+alias of a page is a register address, and with no way to steer the page
+allocator away from those pages, the only lever left was to stop
+declaring them. It cost the 7590 half its RAM to keep one class of
+allocation honest, and the 7580 inherited the same node for the same
+reason.
+
+That lever is no longer the only one. ZONE_DMA is now sized to the
+uncached window and dma-direct allocates every uncached coherent buffer
+from it, so the bound is enforced where the allocation happens instead
+of by the width of a memory node. The two changes hold exactly the same
+line; this one just stops charging the board 256 MiB for it.
+
+Recovering the width was parked rather than abandoned, and what parked
+it was a boot failure that turned out not to be about memory at all.
+With the zones split, ordinary GFP_KERNEL pages start coming from above
+0x30000000, and the first module then loaded into a reserved-instruction
+exception. The defect is in OpenWrt's generic hack patch 301-02, which
+replaces the module allocator with a linear-map one so that modules can
+be built -mno-long-calls: it places module text with no jal-region
+constraint, judges reachability against a 512 MiB window when a jal
+reaches 256, and writes PLT trampolines into a kmalloc buffer that
+nothing ever flushes to the I-cache. All three are fixed on the OpenWrt
+side. Nothing in this kernel was implicated, which is why nothing else
+here changes.
+
+Tested on a FRITZ!Box 7590: MemTotal reports the full width, the zones
+split at 0x30000000, modules load, both QCA9984 radios come up across a
+down/up cycle, and a tmpfs large enough to force allocations above the
+window round-trips its contents intact -- with no reserved-instruction
+exception, no data bus error and no refusal from the
+arch_dma_set_uncached() guard.
+
+The shm-rng-seed reservation goes back to being real -- 0x3dfb0000 falls
+inside the node again -- so the note above reserved-memory says which
+regions the uncached bound applies to rather than claiming all of them
+are below it. And the memory node now carries the container coupling
+that the width depends on: it is safe only while no second kernel record
+starts the boot loader that declares 256 MiB and fences the fabric off
+above it.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7580.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7580.dts
+index 57e5c4e7daaf..ea3a1b4ca81d 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7580.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7580.dts
+@@ -31,13 +31,24 @@ avm-hw-revision {
+ 	};
+ 
+ 	/*
+-	 * Capped at the top of the uncached window (PHYS_OFFSET + SZ_256M):
+-	 * above it the KSEG1 alias of a page is a register address, so no
+-	 * coherent allocation may land there.
++	 * 512 MiB DDR at PHYS_OFFSET, the full part -- the same shape as the
++	 * FRITZ!Box 7590, whose node carries the derivation.
++	 *
++	 * Only the first half has an uncached alias: above
++	 * PHYS_OFFSET + SZ_256M the KSEG1 alias of a page is a register
++	 * address rather than DRAM. ZONE_DMA is sized to that window and
++	 * dma-direct takes every uncached coherent allocation from there, so
++	 * the bound is enforced by the allocator rather than by leaving half
++	 * the board undeclared. Cached access is good across the whole node.
++	 *
++	 * Single-kernel containers only, for the same reason as on the 7590:
++	 * this board has no boot loader blob of its own either, and the one
++	 * it would have to borrow declares 256 MiB and fences the fabric off
++	 * above that -- over exactly the half this node adds.
+ 	 */
+ 	memory@20000000 {
+ 		device_type = "memory";
+-		reg = <0x20000000 0x10000000>;
++		reg = <0x20000000 0x20000000>;
+ 	};
+ 
+ 	/*
+@@ -66,10 +77,12 @@ chosen {
+ 	};
+ 
+ 	/*
+-	 * Every region below must stay under PHYS_OFFSET + SZ_256M; the
+-	 * uncached alias above that address reaches registers, not DRAM. The
+-	 * addresses are the vendor's, stated once for the whole GRX550
+-	 * family.
++	 * Any region below that a device reaches through the uncached alias
++	 * must stay under PHYS_OFFSET + SZ_256M; above that address the
++	 * alias reaches registers, not DRAM. The seed buffer at the end is
++	 * the one that sits higher, and may, because it is no-map and this
++	 * kernel never reaches it at all. The addresses are the vendor's,
++	 * stated once for the whole GRX550 family.
+ 	 */
+ 	reserved-memory {
+ 		#address-cells = <1>;
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 0125c91f084f..766949961be1 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -31,13 +31,28 @@ avm-hw-revision {
+ 	};
+ 
+ 	/*
+-	 * Capped at the top of the uncached window (PHYS_OFFSET + SZ_256M):
+-	 * above it the KSEG1 alias of a page is a register address, so no
+-	 * coherent allocation may land there.
++	 * 512 MiB DDR at PHYS_OFFSET, the full part.
++	 *
++	 * Only the first half of it has an uncached alias: above
++	 * PHYS_OFFSET + SZ_256M the KSEG1 alias of a page is a register
++	 * address rather than DRAM. That bound has not moved. What moved is
++	 * where it is enforced -- ZONE_DMA is sized to the window and
++	 * dma-direct takes every uncached coherent allocation from there --
++	 * so holding it no longer costs the board half its memory. Cached
++	 * access is good across the whole node; KSEG0 covers all of it.
++	 *
++	 * The width is coupled to the boot container, and the coupling is
++	 * exact rather than stylistic: it is safe only while the second
++	 * CPU's boot loader stays unstarted. That firmware declares 256 MiB
++	 * and programs a deny-all fabric region over everything above it --
++	 * precisely the half this node adds -- and the first access to that
++	 * half then faults or hangs. There is no boot loader blob for this
++	 * board, so the way it stays unstarted is to ship the kernel in a
++	 * single-kernel container, which is what the image recipe does.
+ 	 */
+ 	memory@20000000 {
+ 		device_type = "memory";
+-		reg = <0x20000000 0x10000000>;
++		reg = <0x20000000 0x20000000>;
+ 	};
+ 
+ 	/*
+@@ -66,8 +81,11 @@ chosen {
+ 	};
+ 
+ 	/*
+-	 * Every region below must stay under PHYS_OFFSET + SZ_256M; the
+-	 * uncached alias above that address reaches registers, not DRAM.
++	 * Any region below that a device reaches through the uncached alias
++	 * must stay under PHYS_OFFSET + SZ_256M; above that address the
++	 * alias reaches registers, not DRAM. The seed buffer at the end is
++	 * the one that sits higher, and may, because it is no-map and this
++	 * kernel never reaches it at all.
+ 	 */
+ 	reserved-memory {
+ 		#address-cells = <1>;

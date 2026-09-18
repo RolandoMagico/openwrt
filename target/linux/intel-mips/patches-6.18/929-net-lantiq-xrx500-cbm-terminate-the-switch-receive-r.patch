@@ -1,0 +1,940 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 14:20:57 +0200
+Subject: net: lantiq: xrx500-cbm: terminate the switch receive ring on the CPU
+
+The LAN switch writes received frames into a descriptor ring in memory
+over a receive DMA channel. With a peripheral-to-peripheral relay in
+place, that ring is never read by software. The relay hands every frame
+to the second switch instance's transmit channel, the frame re-enters
+the buffer manager on the far side, and a load spreader distributes
+completions over four interrupt lines. That buys receive spreading in
+hardware at the price of the whole dequeue-manager and load-spreader
+layer, and it puts the frame through two switch macros and three DMA
+controllers before the processor sees it.
+
+Consume the ring directly instead. The conduit allocates a ring of its own,
+resets the channel and points it there, and polls it from a NAPI context with
+generic receive offload. Nothing of the dequeue manager, the load spreader or
+the second switch instance is involved, and the frame crosses the datapath
+once.
+
+The frame is copied into a socket buffer rather than handed up on the ring
+buffer. The switch header is eight bytes and the engine addresses memory in
+eight-byte units, so the Ethernet header can be aligned for the engine or
+aligned for the network layer but not for both, and an unaligned network
+header on this architecture is a fault rather than a slowdown. A parameter
+asks the engine for a byte offset inside the buffer, which is what a
+copy-free path would need. The buffer is sized for the largest offset the
+field can hold and for a frame check sequence, because the descriptor is
+armed with what is left of the buffer behind the offset: sizing it for the
+frame alone would shorten the frame that fits instead of growing the buffer,
+and at the largest offset even a minimum-size buffer would report every frame
+as malformed.
+
+The source port arrives in the switch header rather than in the descriptor,
+whose endpoint field is zero on this path, so the header stays in the socket
+buffer until it is consumed and the ports are counted by it. A switch tagger
+takes that over once the ports are network devices of their own. The frame
+takes its protocol from eth_type_trans(), which returns it rather than
+storing it; a socket buffer that reaches the stack without one matches no
+protocol handler, and the core then accounts the drop against the device.
+The received header is laid out as in datapath/datapath_api_gswip30.h,
+lines 353 to 386, of the AVM GPL release.
+
+A descriptor the ring rejects is counted on the interface as well as in the
+driver's own statistics, so a ring full of nonsense does not look like an
+idle interface to ordinary tools, and the first few of them are dumped at
+debug level, bounded by a fixed count, because neither count says which
+field was wrong. A rejected descriptor is rearmed like any other, and the
+transfer of ownership back to a device that does not snoop the caches sits
+next to the rearm so that every path reaches it. A failure to unmask the
+channel after a poll is reported rather than discarded: a receive path that
+goes silent with nothing to read is the failure mode hardest to tell from a
+dead one.
+
+Receive ownership is off by default, so that loading the driver leaves
+the ring to whatever already consumes it. Taking the ring over stops the
+relay channel first. That stop is the only thing standing between a ring
+this driver has taken over and a relay a previous boot may have left
+running.
+
+The comments state the constraints. Their sources in the AVM GPL release
+are these files:
+
+- drivers/dma/intel/hdma.h, which carries one descriptor structure per
+  strapping
+- cqm/grx500/lantiq_cbm_api.h line 72, the receive channel wired as a
+  switch target
+- the receive ring seeding in drivers/dma/intel/hdma.c, the order in
+  which a receive descriptor is handed over
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500-cbm.c b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+index 25e1d6cb08a2..a9d63d9325f1 100644
+--- a/drivers/net/ethernet/lantiq/xrx500-cbm.c
++++ b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+@@ -18,11 +18,13 @@
+  * recycle the segment after egress.
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/bitops.h>
+ #include <linux/build_bug.h>
+ #include <linux/cleanup.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
++#include <linux/dma-mapping.h>
+ #include <linux/err.h>
+ #include <linux/errno.h>
+ #include <linux/etherdevice.h>
+@@ -49,6 +51,15 @@
+ #include <asm/barrier.h>
+ #include <asm/io.h>
+ 
++/*
++ * Channel management of the receive DMA controller is owned by the DMA
++ * driver, because a per-channel access on that controller is a
++ * select-then-touch pair whose lock lives there and because its interrupt
++ * line is claimed there. The receive path below drives its channel through
++ * that interface.
++ */
++#include "dma/lantiq_dmax.h"
++
+ #define XRX500_CBM_DRV_NAME "xrx500-cbm"
+ 
+ /*
+@@ -366,6 +377,80 @@ static const struct xrx500_cbm_egress xrx500_cbm_egress_tbl[] = {
+ #define CBM_TXD_DW3_BYTE_OFF_SHIFT	23
+ #define CBM_TXD_DW3_LEN_MASK		0x0000FFFFU
+ 
++/*
++ * The same eight-byte header arrives ahead of every received frame. Only the
++ * source port is consumed here; it is the switch port the frame came in on,
++ * in the high nibble of byte 2. The receive descriptor's endpoint field is
++ * zero on this path, so the header is the only source-port information
++ * there is.
++ */
++#define PMAC_RX_HDR_LEN			8
++#define PMAC_RX_SPPID_NUM		16
++
++/* Receive DMA ring */
++
++/**
++ * struct xrx500_cbm_rxd - one receive descriptor.
++ * @dw0:  classification result, produced by the switch, unused here.
++ * @dw1:  colour and endpoint; the endpoint is zero on this path.
++ * @addr: where the engine writes the frame.
++ * @ctl:  ownership, packet delimiters, byte offset and length.
++ *
++ * Sixteen bytes, and the two words of each pair are transposed on a
++ * big-endian processor because the datapath crossbar's own byte order does
++ * not follow the core's. Reproducing the transposition is deliberate:
++ * treating it as a defect and swapping the words back puts every field in
++ * the wrong place.
++ *
++ * @ctl is the commit word in both directions. The engine hands a descriptor
++ * back by clearing ownership in it, and the driver hands one over by setting
++ * ownership in it once everything else is in place. Its field positions are
++ * the same either way round.
++ */
++struct xrx500_cbm_rxd {
++#ifdef __BIG_ENDIAN
++	u32 dw1;
++	u32 dw0;
++	u32 ctl;
++	u32 addr;
++#else
++	u32 dw0;
++	u32 dw1;
++	u32 addr;
++	u32 ctl;
++#endif
++};
++
++static_assert(sizeof(struct xrx500_cbm_rxd) == 16);
++
++#define CBM_RXD_CTL_LEN			GENMASK(15, 0)
++#define CBM_RXD_CTL_QID			GENMASK(22, 19)
++#define CBM_RXD_CTL_BOFF		GENMASK(25, 23)
++#define CBM_RXD_CTL_EOP			BIT(28)
++#define CBM_RXD_CTL_SOP			BIT(29)
++#define CBM_RXD_CTL_C			BIT(30)
++#define CBM_RXD_CTL_OWN			BIT(31)
++
++/*
++ * The switch's own receive channel, and the peripheral-to-peripheral consumer
++ * that walks its ring in the topology this driver replaces. Only channel zero
++ * of the receive controller is wired as a switch target, so there is one
++ * hardware receive queue; spreading receive work over the other processors is
++ * a software concern.
++ */
++#define CBM_RX_CHAN			DMA2RX_GSWIP_R_CLASS0
++#define CBM_RX_RELAY_CHAN		DMA1TX_LAN_SWITCH_CLASS0
++
++/*
++ * Ring geometry. The descriptor length field is twelve bits wide, and a ring
++ * short enough to be overrun by one burst of receive traffic shows up as
++ * transport-level retransmission rather than as a driver error, so the lower
++ * bound is generous rather than minimal.
++ */
++#define CBM_RX_RING_MIN			16U
++#define CBM_RX_RING_MAX			1024U
++#define CBM_RX_RING_DEFAULT		256U
++
+ /* Driver state */
+ 
+ /**
+@@ -408,6 +493,69 @@ struct xrx500_cbm_stats {
+ 	u64 polls;
+ };
+ 
++/**
++ * struct xrx500_cbm_rx_stats - receive accounting.
++ * @polls:       poll invocations.
++ * @completions: descriptors handed back by the engine.
++ * @bytes:       bytes in those descriptors, switch header included.
++ * @delivered:   frames handed to the network stack.
++ * @wraps:       times consumption passed the end of the ring.
++ * @malformed:   descriptors whose length or delimiters made no sense.
++ * @drop_noskb:  frames dropped because no socket buffer was available.
++ */
++struct xrx500_cbm_rx_stats {
++	u64 polls;
++	u64 completions;
++	u64 bytes;
++	u64 delivered;
++	u64 wraps;
++	u64 malformed;
++	u64 drop_noskb;
++};
++
++/**
++ * struct xrx500_cbm_rx_buf - one ring buffer.
++ * @va:  page-fragment base.
++ * @dma: streaming mapping of the frame area inside it.
++ */
++struct xrx500_cbm_rx_buf {
++	void *va;
++	dma_addr_t dma;
++};
++
++/**
++ * struct xrx500_cbm_rx - receive ring state.
++ * @napi:      poll context; there is one ring, so there is one of these.
++ * @ring:      the descriptor ring, mapped uncached.
++ * @ring_pa:   bus address of the ring, which is what the engine is given.
++ * @ring_len:  descriptors in the ring.
++ * @buf:       one entry per descriptor.
++ * @next:      descriptor consumption resumes here.
++ * @buf_len:   bytes of a ring buffer the engine may write.
++ * @boff:      byte offset requested of the engine inside a ring buffer.
++ * @traced:    malformed descriptors dumped so far.
++ * @active:    the ring is live and the poll may be scheduled.
++ * @aborted:   consumption gave up; the ring is left alone for inspection.
++ * @stats:     receive accounting.
++ * @sppid:     frames seen per source port, which is what the switch header
++ *             carries and what a per-port demultiplexer will key on.
++ */
++struct xrx500_cbm_rx {
++	struct napi_struct napi;
++	struct xrx500_cbm_rxd *ring;
++	dma_addr_t ring_pa;
++	unsigned int ring_len;
++	struct xrx500_cbm_rx_buf *buf;
++	unsigned int next;
++	unsigned int buf_len;
++	unsigned int boff;
++	unsigned int traced;
++	bool active;
++	bool aborted;
++	struct xrx500_cbm_rx_stats stats;
++	u64 sppid[PMAC_RX_SPPID_NUM];
++};
++
+ /**
+  * struct xrx500_cbm - conduit driver state.
+  * @dev:         backing platform device.
+@@ -432,6 +580,7 @@ struct xrx500_cbm_stats {
+  *               back-pressure path on a pool that is never really exhausted.
+  *               Guarded by the transmit lock, which both spenders hold.
+  * @closing:     the device is going down; the release poll must not rearm.
++ * @rx:          receive ring state.
+  */
+ struct xrx500_cbm {
+ 	struct device *dev;
+@@ -461,6 +610,8 @@ struct xrx500_cbm {
+ 	struct xrx500_cbm_stats stats;
+ 	unsigned int force_empty;
+ 	bool closing;
++
++	struct xrx500_cbm_rx rx;
+ };
+ 
+ /*
+@@ -490,6 +641,51 @@ static bool own_dma_chan;
+ module_param(own_dma_chan, bool, 0444);
+ MODULE_PARM_DESC(own_dma_chan, "program the transmit DMA channel");
+ 
++/*
++ * Terminate the switch's receive ring on the processor. Off by default,
++ * because the existing datapath consumes the same ring through a
++ * peripheral-to-peripheral copy into the second switch instance and only one
++ * consumer of a ring can be right.
++ */
++static bool own_rx;
++module_param(own_rx, bool, 0444);
++MODULE_PARM_DESC(own_rx, "terminate the switch receive ring on the CPU");
++
++/*
++ * Descriptors in the receive ring. Settable, because the ring is built when
++ * the device comes up, so a size can be changed without a reboot.
++ */
++static unsigned int rx_ring_size = CBM_RX_RING_DEFAULT;
++module_param(rx_ring_size, uint, 0644);
++MODULE_PARM_DESC(rx_ring_size, "descriptors in the receive ring");
++
++/*
++ * Byte offset asked of the engine inside each ring buffer, sampled when the
++ * device comes up. A copy-free receive path would need the engine to honour
++ * the descriptor's byte-offset field in this direction; the consuming code
++ * reads back the offset the engine reports either way, so any value here is
++ * safe.
++ */
++static unsigned int rx_boff;
++module_param(rx_boff, uint, 0644);
++MODULE_PARM_DESC(rx_boff, "byte offset requested of the receive engine");
++
++/* Give up consuming the ring after this many malformed descriptors. */
++static unsigned int rx_errcap = 32;
++module_param(rx_errcap, uint, 0644);
++MODULE_PARM_DESC(rx_errcap, "stop consuming after this many bad descriptors");
++
++/* Writing this reports the receive counters and the state of the ring. */
++static int rx_report;
++static int xrx500_cbm_set_rx_report(const char *val,
++				    const struct kernel_param *kp);
++static const struct kernel_param_ops xrx500_cbm_rx_report_ops = {
++	.set = xrx500_cbm_set_rx_report,
++	.get = param_get_int,
++};
++module_param_cb(rx_report, &xrx500_cbm_rx_report_ops, &rx_report, 0644);
++MODULE_PARM_DESC(rx_report, "write to log receive counters");
++
+ /* Writing this reports the transmit counters and the free-segment count. */
+ static int tx_report;
+ static int xrx500_cbm_set_report(const char *val,
+@@ -1484,13 +1680,480 @@ static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
+ 	return NETDEV_TX_OK;
+ }
+ 
++/* Receive */
++
++/*
++ * Read one descriptor. The ring is mapped uncached, so no cache maintenance
++ * belongs here, but the commit word has to be read before the fields it
++ * guards, because it is what decides whether they mean anything.
++ */
++static void xrx500_cbm_rxd_read(const struct xrx500_cbm_rxd *src,
++				struct xrx500_cbm_rxd *dst)
++{
++	dst->ctl = READ_ONCE(src->ctl);
++	rmb();	/* ownership before the fields it guards */
++	dst->dw0 = READ_ONCE(src->dw0);
++	dst->dw1 = READ_ONCE(src->dw1);
++	dst->addr = READ_ONCE(src->addr);
++}
++
++/*
++ * Hand a descriptor to the engine. Address, delimiters, offset and capacity
++ * go first with ownership still clear, then ownership on its own, so the
++ * engine can never see a descriptor it owns whose address or length is stale.
++ */
++static void xrx500_cbm_rxd_arm(struct xrx500_cbm_rxd *d, dma_addr_t addr,
++			       u32 boff, u32 len)
++{
++	u32 ctl = CBM_RXD_CTL_SOP | CBM_RXD_CTL_EOP |
++		  FIELD_PREP(CBM_RXD_CTL_BOFF, boff) |
++		  FIELD_PREP(CBM_RXD_CTL_LEN, len);
++
++	WRITE_ONCE(d->addr, (u32)addr);
++	WRITE_ONCE(d->ctl, ctl);
++	wmb();	/* the descriptor body before ownership transfers */
++	WRITE_ONCE(d->ctl, ctl | CBM_RXD_CTL_OWN);
++	wmb();	/* ownership before the next descriptor is touched */
++}
++
++/*
++ * A descriptor the ring hands back malformed is counted twice over, on the
++ * ring and on the interface, but a count does not say which field was wrong.
++ * Dump the first few of them so that does not need a rebuild to find out.
++ * Only the first few: a ring that fills with nonsense would otherwise cost a
++ * line per descriptor, and the ring is abandoned after rx_errcap of them
++ * anyway.
++ */
++#define XRX500_CBM_RX_TRACE_MAX		8
++
++static void xrx500_cbm_rx_trace(struct xrx500_cbm *priv, unsigned int idx,
++				const struct xrx500_cbm_rxd *d)
++{
++	u32 ctl = d->ctl;
++
++	netdev_dbg(priv->ndev,
++		   "rx desc[%u] dw0=0x%08x dw1=0x%08x addr=0x%08x ctl=0x%08x own=%u c=%u sop=%u eop=%u boff=%lu qid=%lu len=%lu\n",
++		   idx, d->dw0, d->dw1, d->addr, ctl,
++		   !!(ctl & CBM_RXD_CTL_OWN), !!(ctl & CBM_RXD_CTL_C),
++		   !!(ctl & CBM_RXD_CTL_SOP), !!(ctl & CBM_RXD_CTL_EOP),
++		   FIELD_GET(CBM_RXD_CTL_BOFF, ctl),
++		   FIELD_GET(CBM_RXD_CTL_QID, ctl),
++		   FIELD_GET(CBM_RXD_CTL_LEN, ctl));
++}
++
++/*
++ * Stop consuming without disturbing anything else. The channel keeps its
++ * ring and stays on; with no descriptor rearmed it fills the ring once and
++ * then stalls, which leaves the descriptors that caused this readable.
++ */
++static void xrx500_cbm_rx_abort(struct xrx500_cbm *priv, const char *why)
++{
++	if (priv->rx.aborted)
++		return;
++
++	priv->rx.aborted = true;
++	netdev_err(priv->ndev, "receive stopped: %s\n", why);
++	netdev_err(priv->ndev,
++		   "the ring is left as it is; no descriptor will be rearmed\n");
++}
++
++static bool xrx500_cbm_rxd_sane(const struct xrx500_cbm_rx *rx, u32 ctl)
++{
++	u32 len = FIELD_GET(CBM_RXD_CTL_LEN, ctl);
++	u32 boff = FIELD_GET(CBM_RXD_CTL_BOFF, ctl);
++
++	if (len < PMAC_RX_HDR_LEN + ETH_HLEN)
++		return false;
++	if (boff + len > rx->buf_len)
++		return false;
++	/* A frame that is neither the start nor the end of one is a split. */
++	return (ctl & CBM_RXD_CTL_SOP) && (ctl & CBM_RXD_CTL_EOP);
++}
++
++/**
++ * xrx500_cbm_rx_one() - deliver the frame in one completed descriptor.
++ * @priv: driver state.
++ * @idx:  descriptor index, which is also the ring buffer index.
++ * @d:    the descriptor, already read out of the ring and checked.
++ *
++ * The frame is copied into a socket buffer rather than handed up on the ring
++ * buffer itself. The switch header is eight bytes and the engine addresses
++ * memory in eight-byte units, so a frame's Ethernet header can be aligned
++ * for the engine or aligned for the network layer, but not for both; on this
++ * architecture an unaligned network header is a fault rather than a slowdown,
++ * so the copy is what makes the alignment right.
++ *
++ * The source port arrives in the switch header, not in the descriptor, so the
++ * header is kept in the socket buffer until it is consumed here. A switch
++ * tagger takes that over once the ports are network devices of their own.
++ */
++static void xrx500_cbm_rx_one(struct xrx500_cbm *priv, unsigned int idx,
++			      const struct xrx500_cbm_rxd *d)
++{
++	struct xrx500_cbm_rx *rx = &priv->rx;
++	struct xrx500_cbm_rx_buf *buf = &rx->buf[idx];
++	u32 len = FIELD_GET(CBM_RXD_CTL_LEN, d->ctl);
++	u32 boff = FIELD_GET(CBM_RXD_CTL_BOFF, d->ctl);
++	struct net_device *ndev = priv->ndev;
++	struct sk_buff *skb;
++	const u8 *frame;
++	u32 sppid;
++
++	/*
++	 * The engine wrote this buffer behind the processor's back. What makes
++	 * the read below safe is that the buffer's cache lines were
++	 * invalidated when it was handed to the device, and are invalidated
++	 * again by the caller before it is handed back, so no line covering it
++	 * can be resident and stale. The call is what the streaming interface
++	 * requires here and is what carries that on cores that also need a
++	 * post-transfer invalidate.
++	 */
++	dma_sync_single_range_for_cpu(priv->dev, buf->dma, 0, boff + len,
++				      DMA_FROM_DEVICE);
++
++	frame = (const u8 *)buf->va + boff;
++	rx->stats.bytes += len;
++
++	sppid = frame[2] >> 4;
++	rx->sppid[sppid]++;
++
++	skb = napi_alloc_skb(&rx->napi, len);
++	if (!skb) {
++		rx->stats.drop_noskb++;
++		dev_core_stats_rx_dropped_inc(ndev);
++		return;
++	}
++
++	memcpy(skb_put(skb, len), frame, len);
++	skb_pull(skb, PMAC_RX_HDR_LEN);
++	dev_sw_netstats_rx_add(ndev, len - PMAC_RX_HDR_LEN);
++
++	/*
++	 * The protocol has to be taken from the return value. This helper
++	 * classifies the frame, sets its device and consumes the Ethernet
++	 * header, but it does not store the protocol; a socket buffer that
++	 * reaches the stack without one matches no protocol handler and is
++	 * dropped there, which counts against the device rather than against
++	 * anything this driver can see.
++	 */
++	skb->protocol = eth_type_trans(skb, ndev);
++	rx->stats.delivered++;
++	napi_gro_receive(&rx->napi, skb);
++}
++
++static int xrx500_cbm_rx_poll(struct napi_struct *napi, int budget)
++{
++	struct xrx500_cbm_rx *rx = container_of(napi, struct xrx500_cbm_rx,
++						napi);
++	struct xrx500_cbm *priv = container_of(rx, struct xrx500_cbm, rx);
++	int done = 0;
++
++	rx->stats.polls++;
++
++	while (done < budget && !rx->aborted) {
++		unsigned int idx = rx->next;
++		struct xrx500_cbm_rxd d;
++
++		xrx500_cbm_rxd_read(&rx->ring[idx], &d);
++
++		/* Still the engine's, or back but not completed. */
++		if ((d.ctl & CBM_RXD_CTL_OWN) || !(d.ctl & CBM_RXD_CTL_C))
++			break;
++
++		rx->stats.completions++;
++
++		if (xrx500_cbm_rxd_sane(rx, d.ctl)) {
++			xrx500_cbm_rx_one(priv, idx, &d);
++		} else {
++			rx->stats.malformed++;
++			/*
++			 * Also account it on the interface, so that a ring
++			 * full of nonsense is visible to the ordinary tools
++			 * rather than only to this driver's own report.
++			 */
++			priv->ndev->stats.rx_errors++;
++			if (rx->traced < XRX500_CBM_RX_TRACE_MAX) {
++				rx->traced++;
++				xrx500_cbm_rx_trace(priv, idx, &d);
++			}
++			if (rx->stats.malformed >= rx_errcap) {
++				xrx500_cbm_rx_abort(priv,
++						    "too many bad descriptors");
++				break;
++			}
++		}
++
++		/*
++		 * The buffer goes back to a device that does not snoop the
++		 * caches, so it is handed over here rather than where the
++		 * frame is consumed: a descriptor this driver rejected is
++		 * rearmed too, and that path never looked at the buffer.
++		 */
++		dma_sync_single_range_for_device(priv->dev, rx->buf[idx].dma, 0,
++						 rx->buf_len, DMA_FROM_DEVICE);
++
++		xrx500_cbm_rxd_arm(&rx->ring[idx], rx->buf[idx].dma, rx->boff,
++				   rx->buf_len - rx->boff);
++
++		rx->next = idx + 1;
++		if (rx->next == rx->ring_len) {
++			rx->next = 0;
++			rx->stats.wraps++;
++		}
++		done++;
++	}
++
++	/*
++	 * Unmasking the channel is what makes the next frame arrive, so a
++	 * failure here is a receive path that goes quiet with nothing to read.
++	 * Say so instead.
++	 */
++	if (done < budget && napi_complete_done(napi, done) &&
++	    !rx->aborted && READ_ONCE(rx->active) &&
++	    ltq_dma_chan_irq_enable(CBM_RX_CHAN))
++		xrx500_cbm_rx_abort(priv, "channel interrupt not rearmed");
++
++	return done;
++}
++
++/*
++ * Channel completion. The driver that owns the receive controller masks the
++ * channel's interrupt before calling this and runs it out of a softirq, so
++ * scheduling the poll is all there is to do; the poll unmasks the channel
++ * again when it has drained the ring.
++ */
++static int xrx500_cbm_rx_intr(u32 chan, void *data, int flags)
++{
++	struct xrx500_cbm *priv = data;
++
++	if (priv && READ_ONCE(priv->rx.active) && !priv->rx.aborted)
++		napi_schedule(&priv->rx.napi);
++
++	return 0;
++}
++
++static void xrx500_cbm_rx_ring_free(struct xrx500_cbm *priv)
++{
++	struct xrx500_cbm_rx *rx = &priv->rx;
++	unsigned int i;
++
++	if (rx->buf) {
++		for (i = 0; i < rx->ring_len; i++) {
++			if (!rx->buf[i].va)
++				continue;
++			dma_unmap_single(priv->dev, rx->buf[i].dma,
++					 rx->buf_len, DMA_FROM_DEVICE);
++			kfree(rx->buf[i].va);
++		}
++		kfree(rx->buf);
++		rx->buf = NULL;
++	}
++
++	if (rx->ring) {
++		dma_free_coherent(priv->dev,
++				  rx->ring_len * sizeof(*rx->ring), rx->ring,
++				  rx->ring_pa);
++		rx->ring = NULL;
++	}
++}
++
++/**
++ * xrx500_cbm_rx_ring_alloc() - build the receive ring and its buffers.
++ * @priv: driver state.
++ *
++ * The coherent allocator is what the ring has to come from: on this platform
++ * it returns an uncached mapping and refuses any page the uncached window
++ * does not reach, which is exactly the constraint a descriptor ring is under.
++ * The frame buffers have no such constraint and are ordinary allocations
++ * mapped for the device, so they may live anywhere in memory.
++ *
++ * Return: 0 on success, negative errno otherwise.
++ */
++static int xrx500_cbm_rx_ring_alloc(struct xrx500_cbm *priv)
++{
++	struct xrx500_cbm_rx *rx = &priv->rx;
++	unsigned int len = READ_ONCE(rx_ring_size);
++	unsigned int boff = READ_ONCE(rx_boff);
++	unsigned int i;
++
++	/* Both are writable, so each is sampled once and then validated. */
++	if (len < CBM_RX_RING_MIN || len > CBM_RX_RING_MAX) {
++		netdev_err(priv->ndev, "receive ring size %u out of range\n",
++			   len);
++		return -EINVAL;
++	}
++
++	/* The descriptor's byte-offset field is three bits wide. */
++	if (boff > FIELD_MAX(CBM_RXD_CTL_BOFF)) {
++		netdev_err(priv->ndev, "receive byte offset %u out of range\n",
++			   boff);
++		return -EINVAL;
++	}
++
++	rx->ring_len = len;
++	rx->boff = boff;
++
++	/*
++	 * A buffer has to hold the switch header, the largest frame the switch
++	 * can deliver and the frame check sequence in case this direction ever
++	 * keeps it, and it has to hold all of that behind the largest byte
++	 * offset the engine can be asked for — the descriptor is armed with
++	 * the remainder, so an offset shortens the frame that fits rather than
++	 * growing the buffer. Anything longer than this is rejected as
++	 * malformed, so the margin is what keeps a legitimate frame out of
++	 * that count.
++	 */
++	rx->buf_len = ALIGN(PMAC_RX_HDR_LEN + VLAN_ETH_FRAME_LEN + ETH_FCS_LEN +
++			    FIELD_MAX(CBM_RXD_CTL_BOFF), 8);
++	rx->next = 0;
++	rx->traced = 0;
++	rx->aborted = false;
++	memset(&rx->stats, 0, sizeof(rx->stats));
++	memset(rx->sppid, 0, sizeof(rx->sppid));
++
++	rx->ring = dma_alloc_coherent(priv->dev,
++				      rx->ring_len * sizeof(*rx->ring),
++				      &rx->ring_pa, GFP_KERNEL);
++	if (!rx->ring)
++		return -ENOMEM;
++
++	rx->buf = kcalloc(rx->ring_len, sizeof(*rx->buf), GFP_KERNEL);
++	if (!rx->buf)
++		goto err;
++
++	for (i = 0; i < rx->ring_len; i++) {
++		/*
++		 * A slab allocation of this size is aligned to a cache line
++		 * and occupies whole lines, which is what a buffer mapped for
++		 * a device that does not snoop the caches has to be.
++		 */
++		rx->buf[i].va = kmalloc(rx->buf_len, GFP_KERNEL);
++		if (!rx->buf[i].va)
++			goto err;
++
++		rx->buf[i].dma = dma_map_single(priv->dev, rx->buf[i].va,
++						rx->buf_len, DMA_FROM_DEVICE);
++		if (dma_mapping_error(priv->dev, rx->buf[i].dma)) {
++			kfree(rx->buf[i].va);
++			rx->buf[i].va = NULL;
++			goto err;
++		}
++
++		xrx500_cbm_rxd_arm(&rx->ring[i], rx->buf[i].dma, rx->boff,
++				   rx->buf_len - rx->boff);
++	}
++
++	netdev_info(priv->ndev,
++		    "receive ring at %pad: %u descriptors of %u bytes, offset %u\n",
++		    &rx->ring_pa, rx->ring_len, rx->buf_len, rx->boff);
++	return 0;
++
++err:
++	xrx500_cbm_rx_ring_free(priv);
++	return -ENOMEM;
++}
++
++/**
++ * xrx500_cbm_rx_take() - point the switch's receive channel at this ring.
++ * @priv: driver state.
++ *
++ * The channel has been running against a ring of its own, so its internal
++ * descriptor index is wherever the last frame left it. Giving it a new base
++ * does not move that index, and a consumer starting at descriptor zero
++ * against an engine starting anywhere else looks exactly like a receive path
++ * that delivers nothing until the engine happens to lap the ring. So the
++ * channel is reset first, which is also what puts both sides at zero.
++ *
++ * In the topology this driver replaces the same ring is consumed by a
++ * peripheral-to-peripheral copy into the second switch instance's transmit
++ * channel, which walks the very same descriptors. That consumer is stopped
++ * before the base changes, and it is stopped after the reset, so a controller
++ * that is not there at all is discovered while the existing path is still
++ * whole.
++ *
++ * Return: 0 on success, negative errno otherwise.
++ */
++static int xrx500_cbm_rx_take(struct xrx500_cbm *priv)
++{
++	dma_addr_t cur;
++	int ret;
++
++	ret = ltq_dma_chan_reset(CBM_RX_CHAN);
++	if (ret)
++		return ret;
++
++	ltq_dma_chan_irq_disable(CBM_RX_RELAY_CHAN);
++	ltq_dma_chan_off(CBM_RX_RELAY_CHAN);
++
++	/*
++	 * Release the ring the channel used to have, so that the bookkeeping
++	 * the other driver keeps for it stops describing a ring this one now
++	 * owns the base of.
++	 */
++	ltq_dma_chan_desc_free(CBM_RX_CHAN);
++
++	ret = ltq_dma_chan_desc_cfg(CBM_RX_CHAN, priv->rx.ring_pa,
++				    priv->rx.ring_len);
++	if (ret)
++		goto err;
++
++	ret = ltq_dma_chan_on(CBM_RX_CHAN);
++	if (ret)
++		goto err;
++
++	ret = ltq_dma_chan_irq_enable(CBM_RX_CHAN);
++	if (ret)
++		goto err;
++
++	cur = ltq_dma_chan_get_curr_desc_addr(CBM_RX_CHAN);
++	netdev_info(priv->ndev, "receive channel taken, engine at %pad\n", &cur);
++	return 0;
++
++err:
++	netdev_err(priv->ndev,
++		   "receive channel not taken: %d; the existing receive path is down until a reboot\n",
++		   ret);
++	return ret;
++}
++
++static void xrx500_cbm_rx_release(struct xrx500_cbm *priv)
++{
++	ltq_dma_chan_irq_disable(CBM_RX_CHAN);
++	ltq_dma_chan_off(CBM_RX_CHAN);
++}
++
+ /* Network device */
+ 
+ static int xrx500_cbm_open(struct net_device *ndev)
+ {
+ 	struct xrx500_cbm *priv = netdev_priv(ndev);
++	int ret;
+ 
+ 	WRITE_ONCE(priv->closing, false);
++
++	if (own_rx) {
++		scoped_guard(mutex, &xrx500_cbm_lock)
++			ret = xrx500_cbm_rx_ring_alloc(priv);
++		if (ret)
++			return ret;
++
++		napi_enable(&priv->rx.napi);
++		WRITE_ONCE(priv->rx.active, true);
++
++		ret = xrx500_cbm_rx_take(priv);
++		if (ret) {
++			WRITE_ONCE(priv->rx.active, false);
++			xrx500_cbm_rx_release(priv);
++			napi_disable(&priv->rx.napi);
++			scoped_guard(mutex, &xrx500_cbm_lock)
++				xrx500_cbm_rx_ring_free(priv);
++			return ret;
++		}
++
++		/* Anything the engine completed before the poll existed. */
++		napi_schedule(&priv->rx.napi);
++	}
++
+ 	netif_start_queue(ndev);
+ 	/*
+ 	 * The conduit's link is the switch's CPU port, which has no
+@@ -1517,6 +2180,23 @@ static int xrx500_cbm_stop(struct net_device *ndev)
+ 	 */
+ 	WRITE_ONCE(priv->closing, true);
+ 	timer_delete_sync(&priv->restart);
++
++	if (READ_ONCE(priv->rx.active)) {
++		/*
++		 * Order matters: stop new polls being scheduled, then stop
++		 * the engine, then wait for the poll that may be running, and
++		 * only then release what it reads. A poll already past its
++		 * completion can rearm the channel interrupt behind the
++		 * release, so the mask is reasserted once nothing can poll.
++		 */
++		WRITE_ONCE(priv->rx.active, false);
++		xrx500_cbm_rx_release(priv);
++		napi_disable(&priv->rx.napi);
++		ltq_dma_chan_irq_disable(CBM_RX_CHAN);
++		scoped_guard(mutex, &xrx500_cbm_lock)
++			xrx500_cbm_rx_ring_free(priv);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1553,6 +2233,58 @@ static int xrx500_cbm_set_report(const char *val,
+ 	return 0;
+ }
+ 
++static int xrx500_cbm_set_rx_report(const char *val,
++				    const struct kernel_param *kp)
++{
++	struct xrx500_cbm_rx *rx;
++	struct xrx500_cbm *priv;
++	unsigned int armed = 0;
++	unsigned int done = 0;
++	unsigned int i;
++	int ret = param_set_int(val, kp);
++
++	if (ret)
++		return ret;
++
++	guard(mutex)(&xrx500_cbm_lock);
++	priv = xrx500_cbm_singleton;
++	if (!priv)
++		return 0;
++
++	rx = &priv->rx;
++	if (!rx->ring) {
++		pr_info("%s: receive ring not built (own_rx=%u)\n",
++			XRX500_CBM_DRV_NAME, own_rx);
++		return 0;
++	}
++
++	for (i = 0; i < rx->ring_len; i++) {
++		u32 ctl = READ_ONCE(rx->ring[i].ctl);
++
++		if (ctl & CBM_RXD_CTL_OWN)
++			armed++;
++		else if (ctl & CBM_RXD_CTL_C)
++			done++;
++	}
++
++	pr_info("%s: ring=%u buf=%u boff=%u next=%u armed=%u completed=%u%s\n",
++		XRX500_CBM_DRV_NAME, rx->ring_len, rx->buf_len, rx->boff,
++		rx->next, armed, done, rx->aborted ? " ABORTED" : "");
++	pr_info("%s: polls=%llu completions=%llu bytes=%llu delivered=%llu wraps=%llu\n",
++		XRX500_CBM_DRV_NAME, rx->stats.polls, rx->stats.completions,
++		rx->stats.bytes, rx->stats.delivered, rx->stats.wraps);
++	pr_info("%s: malformed=%llu drop_noskb=%llu\n",
++		XRX500_CBM_DRV_NAME, rx->stats.malformed,
++		rx->stats.drop_noskb);
++
++	for (i = 0; i < PMAC_RX_SPPID_NUM; i++)
++		if (rx->sppid[i])
++			pr_info("%s: source port %u: %llu frames\n",
++				XRX500_CBM_DRV_NAME, i, rx->sppid[i]);
++
++	return 0;
++}
++
+ static int xrx500_cbm_set_force_empty(const char *val,
+ 				      const struct kernel_param *kp)
+ {
+@@ -1856,6 +2588,25 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	else
+ 		xrx500_cbm_dma_chan_check(priv);
+ 
++	netif_napi_add(ndev, &priv->rx.napi, xrx500_cbm_rx_poll);
++
++	/*
++	 * The completion callback is registered once and for the lifetime of
++	 * the binding, rather than when the device comes up, so that going
++	 * down and up again does not repeatedly install and clear a callback
++	 * in a driver this one does not own. It does nothing until the ring
++	 * is live, which is what the ownership flag it reads is for.
++	 */
++	if (own_rx) {
++		ret = ltq_dma_chan_pseudo_irq_handler_callback_cfg(CBM_RX_CHAN,
++								   xrx500_cbm_rx_intr,
++								   priv);
++		if (ret) {
++			dev_err(dev, "receive completion callback: %d\n", ret);
++			goto err_qidt;
++		}
++	}
++
+ 	ndev->netdev_ops = &xrx500_cbm_netdev_ops;
+ 	ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+ 	ndev->needed_headroom = 0;
+@@ -1900,6 +2651,21 @@ static void xrx500_cbm_remove(struct platform_device *pdev)
+ 	mutex_unlock(&xrx500_cbm_lock);
+ 
+ 	unregister_netdev(priv->ndev);
++
++	/*
++	 * The completion callback is held by the receive controller's driver,
++	 * which outlives this one, so its data pointer has to stop referring
++	 * to state that is about to be freed. The channel is already off and
++	 * its interrupt masked by the time this runs, so nothing can raise a
++	 * new completion; a completion already being dispatched when this
++	 * store lands is a window only an unbind can reach, and this driver is
++	 * built in.
++	 */
++	if (own_rx)
++		ltq_dma_chan_pseudo_irq_handler_callback_cfg(CBM_RX_CHAN,
++							     xrx500_cbm_rx_intr,
++							     NULL);
++
+ 	timer_shutdown_sync(&priv->restart);
+ 	xrx500_cbm_qidt_set(priv, priv->eg.dp_port, 0);
+ 	free_netdev(priv->ndev);

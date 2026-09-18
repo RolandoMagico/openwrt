@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 13:00:13 +0200
+Subject: net: dsa: lantiq: let a model ask for an MDIO settle delay
+
+The bus accessors start a transaction by writing the busy bit along with the
+opcode and then poll for that bit to clear. That is only sound if the bit
+takes the written value. On models where the busy bit is raised by the
+hardware a short time after the control register is written, the first poll
+happens while the bit is still clear, so the accessor reads the data register
+of the previous transaction and every read is one register behind.
+
+Carry the delay in the per-model MDIO layout and apply it after the control
+write in both directions.
+
+No functional change: the default layout asks for no delay, and udelay(0) is
+a no-op.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.h b/drivers/net/dsa/lantiq/lantiq_gswip.h
+index 2d973f348593..c082e1beda0d 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.h
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.h
+@@ -266,6 +266,7 @@
+  * @mdc_cfg1: MDC clock configuration 1, holding the clock divider
+  * @mdc_cfg1_mask: bits of @mdc_cfg1 the bus setup owns
+  * @mdc_cfg1_val: value the bus setup writes into those bits
++ * @settle_us: delay between starting a transaction and polling for its end
+  * @phy: per-port PHY address and link force register, -1 if the port has none
+  *
+  * GSWIP-2.x keeps these registers in an address region of their own and
+@@ -282,6 +283,7 @@ struct gswip_mdio_layout {
+ 	u16 mdc_cfg1;
+ 	u16 mdc_cfg1_mask;
+ 	u16 mdc_cfg1_val;
++	u16 settle_us;
+ 	s16 phy[GSWIP_MAX_PORTS];
+ };
+ 
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index b92d15d063c1..2991a7572c62 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -177,6 +177,11 @@ static const s16 gswip_rmon_table_2x[GSWIP_MAX_PORTS] = {
+ 	[GSWIP_2X_MAX_PORTS ... GSWIP_MAX_PORTS - 1] = -1,
+ };
+ 
++/* Some models raise the busy bit themselves a short time after the control
++ * register is written, rather than taking it from the written value. Polling
++ * for the bit to clear before that happens returns the result of the previous
++ * transaction, so a model that behaves that way asks for a settle delay.
++ */
+ static int gswip_mdio_poll(struct gswip_priv *priv)
+ {
+ 	u32 ctrl;
+@@ -202,6 +207,7 @@ static int gswip_mdio_wr(struct mii_bus *bus, int addr, int reg, u16 val)
+ 		     GSWIP_MDIO_CTRL_BUSY | GSWIP_MDIO_CTRL_WR |
+ 		     ((addr & GSWIP_MDIO_CTRL_PHYAD_MASK) << GSWIP_MDIO_CTRL_PHYAD_SHIFT) |
+ 		     (reg & GSWIP_MDIO_CTRL_REGAD_MASK));
++	udelay(priv->mdio_layout->settle_us);
+ 
+ 	return 0;
+ }
+@@ -222,6 +228,7 @@ static int gswip_mdio_rd(struct mii_bus *bus, int addr, int reg)
+ 		     GSWIP_MDIO_CTRL_BUSY | GSWIP_MDIO_CTRL_RD |
+ 		     ((addr & GSWIP_MDIO_CTRL_PHYAD_MASK) << GSWIP_MDIO_CTRL_PHYAD_SHIFT) |
+ 		     (reg & GSWIP_MDIO_CTRL_REGAD_MASK));
++	udelay(priv->mdio_layout->settle_us);
+ 
+ 	err = gswip_mdio_poll(priv);
+ 	if (err) {

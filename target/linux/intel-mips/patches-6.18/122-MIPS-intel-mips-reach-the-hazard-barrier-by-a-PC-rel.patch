@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:49:40 +0200
+Subject: MIPS: intel-mips: reach the hazard barrier by a PC-relative branch
+
+platform_eva_init programs the segmentation registers and then needs an
+instruction hazard barrier twice: once before reading CP0 SegCtl back to
+set the K bit, and once at the end. It got both by calling out to
+mips_ihb with "jal", an absolute jump that encodes the low 28 bits of
+the target's link-time address and takes the top four from the PC. So it
+depends on mips_ihb having been linked into the same 256 MB region as
+the code doing the jump, and on the address the linker chose being the
+address the CPU is actually running under.
+
+That is a bad thing to depend on here. smp_slave_setup expands this same
+macro on a secondary VPE arriving from the VMB firmware, before EVA is
+programmed, under whatever segmentation the firmware happened to leave. The
+whole point of the macro is that the address environment is not yet the one
+the kernel was linked for.
+
+A vendor GPL release of Linux 4.9.337 removes the dependency: the jal
+sites become "bal" to a macro-local trampoline that inlines what
+mips_ihb is (arch/mips/include/asm/mach-lantiq/kernel-entry-init.h). bal
+is PC-relative with a 16-bit offset, so it resolves against where the
+code is really executing, and the trampoline is a handful of
+instructions away. mips_ihb's body is exactly ".set MIPS_ISA_LEVEL_RAW;
+jr.hb ra; nop" (arch/mips/kernel/entry.S:179), so inlining it is not an
+approximation. A "b" over the trampoline keeps the fallthrough right.
+
+Both boards boot four VPEs today and the jal resolves correctly, so this
+fixes no observed failure. It removes a latent address dependency from the
+one place in the kernel that cannot assume its addresses.
+
+Two details are specific to how our copy of the macro is shaped.
+
+The label names use the \@ macro-invocation counter, because this macro
+is expanded twice in the same file -- from kernel_entry_setup at
+arch/mips/kernel/head.S:88 and from smp_slave_setup at :152 -- and fixed
+names would be a duplicate-symbol error. Assembling the construct
+standalone confirms it: the two expansions emit platform_eva_init_1_*
+and platform_eva_init_3_*.
+
+The trampoline is placed inside the macro's existing ".set push / .set
+reorder" region rather than after the ".set pop", which is where the
+vendor puts it. head.S is under ".set noreorder" at file scope, so past
+the pop the assembler would stop filling delay slots and the "b" over
+the trampoline would take "jr.hb ra" as its own delay-slot instruction.
+Inside the region the assembler fills both branches with nops, and
+push/pop also scopes the MIPS_ISA_LEVEL_RAW that jr.hb needs instead of
+leaking it to the rest of the file. The vendor's four-variant macro has
+a different shape around the pop; ours has a single variant, so only two
+bal sites apply.
+
+There is a third expansion site, outside head.S and easy to miss:
+arch/mips/kernel/cps-vec.S:129 calls eva_init, which under CONFIG_EVA is
+nothing but platform_eva_init (asm/eva.h:30-32). Both changes hold there
+for the same reasons rather than by luck. \@ counts per assembler run,
+so cps-vec.S numbers its own expansion independently of head.S's; the
+labels are never .globl, so they are STB_LOCAL and cannot collide across
+object files at link time; and the trampoline lives inside the macro's
+own ".set push ... .set reorder ... .set pop" region, so it neither
+inherits nor disturbs the reorder state of whichever file expands it.
+That last point is what makes the placement argument above a property of
+the macro rather than a head.S-specific accident.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/include/asm/mach-intel-mips/kernel-entry-init.h b/arch/mips/include/asm/mach-intel-mips/kernel-entry-init.h
+index b91b9186a2d9..3e0ef5ec2587 100644
+--- a/arch/mips/include/asm/mach-intel-mips/kernel-entry-init.h
++++ b/arch/mips/include/asm/mach-intel-mips/kernel-entry-init.h
+@@ -78,13 +78,25 @@
+ 	or      t0, t2
+ 	mtc0    t0, $5, 4
+ 
+-	jal     mips_ihb
++	bal     platform_eva_init_\@_mips_ihb
+ 	mfc0    t0, $16, 5
+ 	li      t2, 0x40000000      /* K bit */
+ 	or      t0, t0, t2
+ 	mtc0    t0, $16, 5
+ 	sync
+-	jal     mips_ihb
++	bal     platform_eva_init_\@_mips_ihb
++
++	b       platform_eva_init_\@_end
++	/*
++	 * mips_ihb inlined as a PC-relative trampoline. The \@ macro
++	 * invocation counter keeps the labels distinct: this macro is
++	 * expanded twice, from kernel_entry_setup and from smp_slave_setup.
++	 */
++platform_eva_init_\@_mips_ihb:
++	.set    MIPS_ISA_LEVEL_RAW
++	jr.hb   ra
++	nop
++platform_eva_init_\@_end:
+ 
+ 	.set    pop
+ 	.endm

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 6 Sep 2026 11:26:05 +0200
+Subject: dt-bindings: net: dsa: lantiq,gswip: describe the xRX500 switch
+ interrupt
+
+Each GSWIP-3.0 macro raises one shared interrupt, aggregating everything it
+can report: the buffer manager, the parser and classification engine, the
+MAC block, and the store and fetch DMA blocks.
+
+Optional, because no driver takes it: this switch reaches the same state by
+polling. It is a fact about the block either way.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml b/Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml
+index a4bc851a74a4..4aedd6f51add 100644
+--- a/Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml
++++ b/Documentation/devicetree/bindings/net/dsa/lantiq,gswip.yaml
+@@ -38,6 +38,13 @@ properties:
+ 
+   dma-noncoherent: true
+ 
++  interrupts:
++    maxItems: 1
++    description:
++      The macro's aggregated interrupt, raised by the buffer manager, the
++      parser and classification engine, the MAC block and the store and
++      fetch DMA blocks.
++
+   clocks:
+     items:
+       - description: switch core clock
+@@ -320,6 +327,8 @@ examples:
+     switch@1c000000 {
+             compatible = "lantiq,xrx500-gswip";
+             reg = <0x1c000000 0x4000>;
++            interrupt-parent = <&gic>;
++            interrupts = <0 48 4>;
+             clocks = <&cgu 22>, <&cgu 125>;
+             clock-names = "freq", "gate";
+             dsa,member = <0 0>;

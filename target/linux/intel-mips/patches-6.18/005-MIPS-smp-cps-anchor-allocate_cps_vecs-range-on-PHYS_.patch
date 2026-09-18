@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:00:41 +0000
+Subject: MIPS: smp-cps: anchor allocate_cps_vecs range on PHYS_OFFSET
+
+allocate_cps_vecs() restricts the BEV/CPS exception-vector allocation
+to the physical-address window addressable through KSEG1. The
+hard-coded [0x0, CSEGX_SIZE - 1] range assumes the standard MIPS layout
+where KSEG1 maps the low 512 MiB.
+
+Under EVA segmentation the same KSEG1 virtual range is mapped to a
+PHYS_OFFSET-shifted aperture instead, so the legacy range matches no
+registered memory at all. memblock_phys_alloc_range() then fails,
+core_entry_reg stays zero, cps_prepare_cpus() bails out via err_out
+without populating mips_cps_cluster_bootcfg, and the secondary CPU
+bring-up later dereferences a NULL pointer in cps_boot_secondary().
+
+This is reachable in tree. arch/mips/include/asm/mach-malta/spaces.h
+sets PHYS_OFFSET to 0x80000000 under CONFIG_EVA and MIPS_MALTA selects
+SYS_SUPPORTS_MIPS_CPS, so Malta + EVA + CPS SMP is a legal
+configuration that hits it.
+
+Anchor the range on PHYS_OFFSET. Where PHYS_OFFSET is zero the range is
+bit-identical to the current one; on EVA platforms it shifts to the RAM
+window KSEG1 actually addresses.
+
+Fixes: 5e9d13bd3de8 ("MIPS: Allows relocation exception vectors everywhere")
+Assisted-by: Claude:claude-opus-4-7
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/kernel/smp-cps.c b/arch/mips/kernel/smp-cps.c
+index 22d4f9ff3ae2..e2094922cec0 100644
+--- a/arch/mips/kernel/smp-cps.c
++++ b/arch/mips/kernel/smp-cps.c
+@@ -154,9 +154,16 @@ static bool __init check_64bit_reset(void)
+ 
+ static int __init allocate_cps_vecs(void)
+ {
+-	/* Try to allocate in KSEG1 first */
++	/*
++	 * Try to allocate in the physical-address window addressable through
++	 * KSEG1. On standard MIPS this is the low 512 MiB, but on platforms
++	 * with EVA segmentation the same KSEG1 virtual range is mapped to a
++	 * PHYS_OFFSET-shifted RAM aperture, so anchor the range on
++	 * PHYS_OFFSET to allow allocation from real RAM on those systems.
++	 */
+ 	cps_vec_pa = memblock_phys_alloc_range(BEV_VEC_SIZE, BEV_VEC_ALIGN,
+-						0x0, CSEGX_SIZE - 1);
++						PHYS_OFFSET,
++						PHYS_OFFSET + CSEGX_SIZE - 1);
+ 
+ 	if (cps_vec_pa)
+ 		core_entry_reg = CKSEG1ADDR(cps_vec_pa) &

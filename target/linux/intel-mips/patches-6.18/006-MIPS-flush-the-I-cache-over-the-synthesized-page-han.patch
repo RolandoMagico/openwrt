@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 27 Aug 2026 12:50:54 +0200
+Subject: MIPS: flush the I-cache over the synthesized page handlers
+
+build_clear_page() and build_copy_page() do not compile anything at
+build time; they assemble MIPS machine code into .text at boot, through
+uasm, into the regions between __clear_page_start/__clear_page_end and
+__copy_page_start/__copy_page_end. Those stores go out through the
+D-cache. Nothing then tells the I-cache that the instructions it may
+already hold for those addresses are stale, and the very next thing
+that happens is the CPU fetching and executing them.
+
+arch/mips/mm/tlbex.c, the other place in the architecture that
+synthesizes into .text, already invalidates. flush_tlb_handlers() calls
+local_flush_icache_range() over handle_tlbl, handle_tlbs, handle_tlbm
+and tlbmiss_handler_setup_pgd; each of the three refill-handler builders
+flushes the vector it has just written; and traps.c does the same for
+the exception-vector copies. page.c is the exception, and
+there is no reason for it to be one: synthesized instructions have to
+be made visible to the fetch path, and generic architecture code must
+not assume any particular CPU's cpu_has_ic_fills_f_dc behaviour makes
+that happen by itself.
+
+Add the flush at the end of each builder. The cost is one invalidate
+over a few hundred bytes, once, at boot.
+
+The ordering was checked for every cache flavour that calls these
+builders, not just the one this was found on: r4k_cache_init(),
+octeon_cache_init() and r3k_cache_init() all assign
+local_flush_icache_range before calling them, so there is no path that
+reaches the new call through a NULL pointer. r4k_cache_init() later
+re-points local_flush_icache_range at b5k_instruction_hazard for
+BMIPS5000, but only after the builders have run.
+
+A vendor GPL release of Linux 4.9.337 carries the same flush in the
+same two places, which is corroboration rather than the argument.
+
+page.c did not include asm/cacheflush.h; it does now.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/mm/page.c b/arch/mips/mm/page.c
+index 1df237bd4a72..fa7f9a85f6fe 100644
+--- a/arch/mips/mm/page.c
++++ b/arch/mips/mm/page.c
+@@ -15,6 +15,7 @@
+ #include <linux/proc_fs.h>
+ 
+ #include <asm/bugs.h>
++#include <asm/cacheflush.h>
+ #include <asm/cacheops.h>
+ #include <asm/cpu-type.h>
+ #include <asm/inst.h>
+@@ -352,6 +353,9 @@ void build_clear_page(void)
+ 	for (i = 0; i < (buf - &__clear_page_start); i++)
+ 		pr_debug("\t.word 0x%08x\n", (&__clear_page_start)[i]);
+ 	pr_debug("\t.set pop\n");
++
++	local_flush_icache_range((unsigned long)&__clear_page_start,
++				 (unsigned long)&__clear_page_end);
+ }
+ 
+ static void build_copy_load(u32 **buf, int reg, int off)
+@@ -598,6 +602,9 @@ void build_copy_page(void)
+ 	for (i = 0; i < (buf - &__copy_page_start); i++)
+ 		pr_debug("\t.word 0x%08x\n", (&__copy_page_start)[i]);
+ 	pr_debug("\t.set pop\n");
++
++	local_flush_icache_range((unsigned long)&__copy_page_start,
++				 (unsigned long)&__copy_page_end);
+ }
+ 
+ #ifdef CONFIG_SIBYTE_DMA_PAGEOPS

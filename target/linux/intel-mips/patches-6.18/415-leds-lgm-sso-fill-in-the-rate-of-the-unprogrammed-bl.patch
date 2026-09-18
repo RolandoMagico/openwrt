@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 2 Sep 2026 12:17:34 +0200
+Subject: leds: lgm-sso: fill in the rate of the unprogrammed blink rank
+
+sso_init_freq() stores 0 for rank 0 and delay_to_freq_idx() divides by
+it. A blink_set with both delays zero -- what the timer trigger passes
+on a fresh activation, and what the LED core documents as "pick a
+sensible default" -- computes (1000 / priv->freq[0]) / 2. MIPS builds
+pass -mno-check-zero-division, so it does not trap: both delays come
+back as 4294967295, the software blink timer is armed some 49 days out
+and the lamp latches in whichever phase it happened to be in. An
+architecture that does trap gets a division-by-zero oops in blink_set
+instead.
+
+Rank 0 is not a rate of its own. sso_led_freq_set() returns early for
+it, leaving the pin's blink registers as found, and a zero in those
+registers is -- in the same encoding that function writes for the ranks
+it does program, source select 0 for FPID and rate 0 for freq_div_tbl[0]
+-- the rate of rank 1. On the 8 kHz FPID clock these SoCs carry, that is
+2 Hz, and 2 Hz is what a pin whose blink registers have never been
+written blinks at.
+
+Store that rate instead of zero. The both-zero default becomes 250 ms on
+and 250 ms off, which is what the pin will do, and desc->blink_rate
+stops reading 0 for an LED with no intel,sso-blink-rate-hz.
+
+A requested rate of 2 Hz or less now selects rank 0 rather than rank 1,
+so it is served by the blink registers as found instead of being written
+there. Both are the same rate.
+
+No device tree in tree sets intel,sso-hw-blink, without which
+delay_to_freq_idx() is never reached.
+
+Fixes: c3987cd2bca3 ("leds: lgm: Add LED controller driver for LGM SoC")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/leds/blink/leds-lgm-sso.c b/drivers/leds/blink/leds-lgm-sso.c
+index ede959c4dc94..dda4e4fa7980 100644
+--- a/drivers/leds/blink/leds-lgm-sso.c
++++ b/drivers/leds/blink/leds-lgm-sso.c
+@@ -440,7 +440,13 @@ static void sso_init_freq(struct sso_led_priv *priv)
+ {
+ 	int i;
+ 
+-	priv->freq[0] = 0;
++	/*
++	 * Rank 0 is not a rate of its own: sso_led_freq_set() skips it and the
++	 * pin keeps whatever its blink registers hold. Those are zero at
++	 * reset, which in the encoding the function writes for every other
++	 * rank is the FPID source at freq_div_tbl[0] -- the rate of rank 1.
++	 */
++	priv->freq[0] = priv->fpid_clkrate / freq_div_tbl[0];
+ 	for (i = 1; i < MAX_FREQ_RANK; i++) {
+ 		if (i < MAX_FPID_FREQ_RANK) {
+ 			priv->freq[i] = priv->fpid_clkrate / freq_div_tbl[i - 1];

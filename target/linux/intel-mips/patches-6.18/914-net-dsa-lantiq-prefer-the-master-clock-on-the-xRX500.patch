@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 13:18:46 +0200
+Subject: net: dsa: lantiq: prefer the master clock on the xRX500 integrated
+ PHYs
+
+Every integrated PHY of this family faces a switch port, so it should carry
+the master clock of a gigabit link rather than take it from whatever is
+plugged in. The vendor driver sets the preference before every
+autonegotiation; setting it once as the PHY comes up is enough, because a
+restart only rewrites the advertisement bits of the same register and leaves
+the preference alone.
+
+The rest of the link handling needs nothing from this model. The common
+function library's policy already applies: the switch's own polling master is
+off, and phylink writes the link state, speed, duplex and pause into the
+per-port register the per-model table names.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index a936ad76c5e6..fe66779c3c95 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -29,6 +29,7 @@
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_platform.h>
++#include <linux/phy.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
+@@ -147,6 +148,12 @@
+  */
+ #define GSWIP_XRX500_BM_QUEUE_GCTRL_GL_MOD	GENMASK(11, 10)
+ 
++/* Identity the integrated gigabit PHYs answer with, and the mask the driver
++ * matches it under.
++ */
++#define GSWIP_XRX500_GPHY_ID			0xd565a408
++#define GSWIP_XRX500_GPHY_ID_MASK		0xfffffff8
++
+ /* Register window of one switch macro, in 32-bit words. */
+ #define GSWIP_XRX500_MAX_REGISTER		0xFFF
+ 
+@@ -761,6 +768,17 @@ static void gswip_xrx500_r_phylink_get_caps(struct dsa_switch *ds, int port,
+ 		MAC_10 | MAC_100 | MAC_1000;
+ }
+ 
++/* Every one of these PHYs faces a switch port, so it should carry the
++ * master clock of a gigabit link rather than take it from the far end. The
++ * preference survives an autonegotiation restart, which only rewrites the
++ * advertisement bits of the same register, so setting it once as the PHY
++ * comes up is enough.
++ */
++static int gswip_xrx500_gphy_fixup(struct phy_device *phydev)
++{
++	return phy_set_bits(phydev, MII_CTRL1000, CTL1000_PREFER_MASTER);
++}
++
+ /* The block presents its registers in the byte order of the CPU it sits on,
+  * and this platform does not mangle memory-mapped accesses, so the plain
+  * accessors reach them unchanged. Asking for the native format instead would
+@@ -958,7 +976,32 @@ static struct platform_driver gswip_xrx500_driver = {
+ 	},
+ };
+ 
+-module_platform_driver(gswip_xrx500_driver);
++static int __init gswip_xrx500_init(void)
++{
++	int err;
++
++	err = phy_register_fixup_for_uid(GSWIP_XRX500_GPHY_ID,
++					 GSWIP_XRX500_GPHY_ID_MASK,
++					 gswip_xrx500_gphy_fixup);
++	if (err)
++		return err;
++
++	err = platform_driver_register(&gswip_xrx500_driver);
++	if (err)
++		phy_unregister_fixup_for_uid(GSWIP_XRX500_GPHY_ID,
++					     GSWIP_XRX500_GPHY_ID_MASK);
++
++	return err;
++}
++module_init(gswip_xrx500_init);
++
++static void __exit gswip_xrx500_exit(void)
++{
++	platform_driver_unregister(&gswip_xrx500_driver);
++	phy_unregister_fixup_for_uid(GSWIP_XRX500_GPHY_ID,
++				     GSWIP_XRX500_GPHY_ID_MASK);
++}
++module_exit(gswip_xrx500_exit);
+ 
+ MODULE_AUTHOR("Grische <github@grische.xyz>");
+ MODULE_DESCRIPTION("Lantiq / Intel GSWIP 3.0 switch driver");

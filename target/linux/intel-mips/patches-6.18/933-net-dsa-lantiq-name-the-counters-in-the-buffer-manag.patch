@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 02:16:24 +0200
+Subject: net: dsa: lantiq: name the counters in the buffer manager's counter
+ RAM
+
+The counter numbers appear as bare hexadecimal in the string table and
+nowhere else, so a reader has to take on trust that 0x1F is the received
+packet count and 0x0C the transmitted one. Give each counter a name and
+use it in the table.
+
+The names are needed on their own account: the standardised statistics
+groups read the same counters from a second place, and two places
+spelling a counter number differently is a defect waiting to happen.
+
+No functional change - every entry expands to the number it held.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index 2991a7572c62..8c0ac89caee7 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -63,47 +63,92 @@ struct gswip_rmon_cnt_desc {
+ 
+ #define MIB_DESC(_size, _offset, _name) {.size = _size, .offset = _offset, .name = _name}
+ 
++/*
++ * Counters inside one port's bank of the buffer manager's counter RAM. A
++ * counter occupies one entry, except for the four byte counts, which occupy
++ * the named entry and the one above it.
++ */
++enum gswip_rmon_counter {
++	GSWIP_RMON_TX_64B_PKTS = 0x00,
++	GSWIP_RMON_TX_127B_PKTS = 0x01,
++	GSWIP_RMON_TX_255B_PKTS = 0x02,
++	GSWIP_RMON_TX_511B_PKTS = 0x03,
++	GSWIP_RMON_TX_1023B_PKTS = 0x04,
++	GSWIP_RMON_TX_MAXB_PKTS = 0x05,
++	GSWIP_RMON_TX_UNICAST_PKTS = 0x06,
++	GSWIP_RMON_TX_MULTICAST_PKTS = 0x07,
++	GSWIP_RMON_TX_SINGLE_COLL = 0x08,
++	GSWIP_RMON_TX_MULT_COLL = 0x09,
++	GSWIP_RMON_TX_LATE_COLL = 0x0A,
++	GSWIP_RMON_TX_EXCESS_COLL = 0x0B,
++	GSWIP_RMON_TX_GOOD_PKTS = 0x0C,
++	GSWIP_RMON_TX_PAUSE = 0x0D,
++	GSWIP_RMON_TX_GOOD_BYTES = 0x0E,
++	GSWIP_RMON_TX_DROPPED_PKTS = 0x10,
++	GSWIP_RMON_TX_ACM_DROPPED_PKTS = 0x11,
++	GSWIP_RMON_RX_64B_PKTS = 0x12,
++	GSWIP_RMON_RX_127B_PKTS = 0x13,
++	GSWIP_RMON_RX_255B_PKTS = 0x14,
++	GSWIP_RMON_RX_511B_PKTS = 0x15,
++	GSWIP_RMON_RX_1023B_PKTS = 0x16,
++	GSWIP_RMON_RX_MAXB_PKTS = 0x17,
++	GSWIP_RMON_RX_DROPPED_PKTS = 0x18,
++	GSWIP_RMON_RX_FILTERED_PKTS = 0x19,
++	GSWIP_RMON_RX_ALIGN_ERROR_PKTS = 0x1A,
++	GSWIP_RMON_RX_OVERSIZE_GOOD_PKTS = 0x1B,
++	GSWIP_RMON_RX_OVERSIZE_ERROR_PKTS = 0x1C,
++	GSWIP_RMON_RX_UNDERSIZE_GOOD_PKTS = 0x1D,
++	GSWIP_RMON_RX_UNDERSIZE_ERROR_PKTS = 0x1E,
++	GSWIP_RMON_RX_GOOD_PKTS = 0x1F,
++	GSWIP_RMON_RX_GOOD_PAUSE_PKTS = 0x20,
++	GSWIP_RMON_RX_FCS_ERROR_PKTS = 0x21,
++	GSWIP_RMON_RX_MULTICAST_PKTS = 0x22,
++	GSWIP_RMON_RX_UNICAST_PKTS = 0x23,
++	GSWIP_RMON_RX_GOOD_BYTES = 0x24,
++	GSWIP_RMON_RX_BAD_BYTES = 0x26,
++};
++
+ static const struct gswip_rmon_cnt_desc gswip_rmon_cnt[] = {
+ 	/** Receive Packet Count (only packets that are accepted and not discarded). */
+-	MIB_DESC(1, 0x1F, "RxGoodPkts"),
+-	MIB_DESC(1, 0x23, "RxUnicastPkts"),
+-	MIB_DESC(1, 0x22, "RxMulticastPkts"),
+-	MIB_DESC(1, 0x21, "RxFCSErrorPkts"),
+-	MIB_DESC(1, 0x1D, "RxUnderSizeGoodPkts"),
+-	MIB_DESC(1, 0x1E, "RxUnderSizeErrorPkts"),
+-	MIB_DESC(1, 0x1B, "RxOversizeGoodPkts"),
+-	MIB_DESC(1, 0x1C, "RxOversizeErrorPkts"),
+-	MIB_DESC(1, 0x20, "RxGoodPausePkts"),
+-	MIB_DESC(1, 0x1A, "RxAlignErrorPkts"),
+-	MIB_DESC(1, 0x12, "Rx64BytePkts"),
+-	MIB_DESC(1, 0x13, "Rx127BytePkts"),
+-	MIB_DESC(1, 0x14, "Rx255BytePkts"),
+-	MIB_DESC(1, 0x15, "Rx511BytePkts"),
+-	MIB_DESC(1, 0x16, "Rx1023BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_GOOD_PKTS, "RxGoodPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_UNICAST_PKTS, "RxUnicastPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_MULTICAST_PKTS, "RxMulticastPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_FCS_ERROR_PKTS, "RxFCSErrorPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_UNDERSIZE_GOOD_PKTS, "RxUnderSizeGoodPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_UNDERSIZE_ERROR_PKTS, "RxUnderSizeErrorPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_OVERSIZE_GOOD_PKTS, "RxOversizeGoodPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_OVERSIZE_ERROR_PKTS, "RxOversizeErrorPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_GOOD_PAUSE_PKTS, "RxGoodPausePkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_ALIGN_ERROR_PKTS, "RxAlignErrorPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_64B_PKTS, "Rx64BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_127B_PKTS, "Rx127BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_255B_PKTS, "Rx255BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_511B_PKTS, "Rx511BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_1023B_PKTS, "Rx1023BytePkts"),
+ 	/** Receive Size 1024-1522 (or more, if configured) Packet Count. */
+-	MIB_DESC(1, 0x17, "RxMaxBytePkts"),
+-	MIB_DESC(1, 0x18, "RxDroppedPkts"),
+-	MIB_DESC(1, 0x19, "RxFilteredPkts"),
+-	MIB_DESC(2, 0x24, "RxGoodBytes"),
+-	MIB_DESC(2, 0x26, "RxBadBytes"),
+-	MIB_DESC(1, 0x11, "TxAcmDroppedPkts"),
+-	MIB_DESC(1, 0x0C, "TxGoodPkts"),
+-	MIB_DESC(1, 0x06, "TxUnicastPkts"),
+-	MIB_DESC(1, 0x07, "TxMulticastPkts"),
+-	MIB_DESC(1, 0x00, "Tx64BytePkts"),
+-	MIB_DESC(1, 0x01, "Tx127BytePkts"),
+-	MIB_DESC(1, 0x02, "Tx255BytePkts"),
+-	MIB_DESC(1, 0x03, "Tx511BytePkts"),
+-	MIB_DESC(1, 0x04, "Tx1023BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_MAXB_PKTS, "RxMaxBytePkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_DROPPED_PKTS, "RxDroppedPkts"),
++	MIB_DESC(1, GSWIP_RMON_RX_FILTERED_PKTS, "RxFilteredPkts"),
++	MIB_DESC(2, GSWIP_RMON_RX_GOOD_BYTES, "RxGoodBytes"),
++	MIB_DESC(2, GSWIP_RMON_RX_BAD_BYTES, "RxBadBytes"),
++	MIB_DESC(1, GSWIP_RMON_TX_ACM_DROPPED_PKTS, "TxAcmDroppedPkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_GOOD_PKTS, "TxGoodPkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_UNICAST_PKTS, "TxUnicastPkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_MULTICAST_PKTS, "TxMulticastPkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_64B_PKTS, "Tx64BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_127B_PKTS, "Tx127BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_255B_PKTS, "Tx255BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_511B_PKTS, "Tx511BytePkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_1023B_PKTS, "Tx1023BytePkts"),
+ 	/** Transmit Size 1024-1522 (or more, if configured) Packet Count. */
+-	MIB_DESC(1, 0x05, "TxMaxBytePkts"),
+-	MIB_DESC(1, 0x08, "TxSingleCollCount"),
+-	MIB_DESC(1, 0x09, "TxMultCollCount"),
+-	MIB_DESC(1, 0x0A, "TxLateCollCount"),
+-	MIB_DESC(1, 0x0B, "TxExcessCollCount"),
+-	MIB_DESC(1, 0x0D, "TxPauseCount"),
+-	MIB_DESC(1, 0x10, "TxDroppedPkts"),
+-	MIB_DESC(2, 0x0E, "TxGoodBytes"),
++	MIB_DESC(1, GSWIP_RMON_TX_MAXB_PKTS, "TxMaxBytePkts"),
++	MIB_DESC(1, GSWIP_RMON_TX_SINGLE_COLL, "TxSingleCollCount"),
++	MIB_DESC(1, GSWIP_RMON_TX_MULT_COLL, "TxMultCollCount"),
++	MIB_DESC(1, GSWIP_RMON_TX_LATE_COLL, "TxLateCollCount"),
++	MIB_DESC(1, GSWIP_RMON_TX_EXCESS_COLL, "TxExcessCollCount"),
++	MIB_DESC(1, GSWIP_RMON_TX_PAUSE, "TxPauseCount"),
++	MIB_DESC(1, GSWIP_RMON_TX_DROPPED_PKTS, "TxDroppedPkts"),
++	MIB_DESC(2, GSWIP_RMON_TX_GOOD_BYTES, "TxGoodBytes"),
+ };
+ 
+ static u32 gswip_switch_r_timeout(struct gswip_priv *priv, u32 offset,

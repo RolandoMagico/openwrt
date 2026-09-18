@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 18 Aug 2026 19:34:58 +0200
+Subject: phy: intel: grx500-usb: pass the chip-top offset as a syscon argument
+
+The driver takes two properties to reach one register: intel,syscon for
+the chip-top regmap and intel,syscon-offset for the byte offset of this
+controller's AXI configuration word inside it. The offset is meaningless
+without the phandle and the phandle is useless without the offset, so
+splitting them lets a DT express half of the pair and get a probe
+failure for it.
+
+syscon_regmap_lookup_by_phandle_args() exists for exactly this shape and
+has been in tree since 6.11. It parses the phandle and a caller-fixed
+number of arguments in one call, so the pair collapses into
+
+	intel,syscon = <&chiptop 0x34>;
+
+The argument count belongs to the caller, not to the provider: the
+helper uses of_parse_phandle_with_fixed_args(), so &chiptop needs
+no #syscon-cells, and other references to it are unaffected by this
+change. The PCIe PHY's zero-argument intel,syscon on the same node keeps
+working and is deliberately left alone here -- it carries two shift
+values that are not offsets into the syscon and would not collapse the
+same way, and converting it is a separate change on a path this series
+cannot retest.
+
+The property has never been documented and nothing outside this tree
+uses it, so there is no legacy form to keep parsing.
+
+The DT half has to move in the same commit: the blob is built into the
+kernel image on this platform, so a driver that reads one form and a
+dtsi that spells the other never coexist in a bootable image.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 27011ed47f43..3c4d9d9673ad 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -401,8 +401,7 @@ usb1_phy: phy@1a600000 {
+ 		clocks = <&cgu GCLK_USB1>;
+ 		resets = <&rcu_reset1 5 5>;
+ 		reset-names = "phy";
+-		intel,syscon = <&chiptop>;
+-		intel,syscon-offset = <0x34>;
++		intel,syscon = <&chiptop 0x34>;
+ 		status = "disabled";
+ 	};
+ 
+diff --git a/drivers/phy/intel/phy-intel-grx500-usb.c b/drivers/phy/intel/phy-intel-grx500-usb.c
+index 2a845f28b7d5..75be8dd0128f 100644
+--- a/drivers/phy/intel/phy-intel-grx500-usb.c
++++ b/drivers/phy/intel/phy-intel-grx500-usb.c
+@@ -200,16 +200,13 @@ static int intel_usbphy_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(priv->base),
+ 				     "failed to map the PHY registers\n");
+ 
+-	priv->chiptop = syscon_regmap_lookup_by_phandle(np, "intel,syscon");
++	priv->chiptop = syscon_regmap_lookup_by_phandle_args(np, "intel,syscon",
++							     1,
++							     &priv->cfg_offset);
+ 	if (IS_ERR(priv->chiptop))
+ 		return dev_err_probe(dev, PTR_ERR(priv->chiptop),
+ 				     "failed to get the CHIPTOP syscon\n");
+ 
+-	ret = device_property_read_u32(dev, "intel,syscon-offset",
+-				       &priv->cfg_offset);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "missing intel,syscon-offset\n");
+-
+ 	priv->clk = devm_clk_get(dev, NULL);
+ 	if (IS_ERR(priv->clk))
+ 		return dev_err_probe(dev, PTR_ERR(priv->clk),

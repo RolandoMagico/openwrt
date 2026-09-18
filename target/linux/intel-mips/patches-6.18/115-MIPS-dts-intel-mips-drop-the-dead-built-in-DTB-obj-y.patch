@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 17 Aug 2026 10:47:04 +0200
+Subject: MIPS: dts: intel-mips: drop the dead built-in DTB obj-y rule
+
+The intel-mips dts Makefile carried
+
+  obj-$(CONFIG_BUILTIN_DTB) += $(addsuffix .o, $(dtb-y))
+
+which has never had any effect. arch/mips/boot/dts/Makefile pulls its
+subdirectories in with subdir-y, not obj-y, so scripts/Makefile.build
+descends with need-builtin unset and never makes built-in.a a target
+for the directory - the listed objects are neither built nor linked.
+
+Built-in DTBs reach vmlinux through a different path entirely:
+arch/mips/Kconfig selects BUILTIN_DTB_ALL if BUILTIN_DTB, which feeds
+arch/mips/boot/dts/dtbs-list into .builtin-dtbs.S in
+scripts/Makefile.vmlinux.
+
+A full build of this platform confirms it: the directory contains the
+generated .dtb and dtbs-list, and no .o or built-in.a is produced
+anywhere under arch/mips/boot/dts. No other arch/mips/boot/dts/*/Makefile
+carries this pattern.
+
+This matters beyond tidiness. BUILTIN_DTB_ALL embeds every DTB that
+gets built, each behind a generated __dtb_<name>_begin symbol, so "one
+built-in DTB per kernel" holds only because each Kconfig choice entry
+gates one dtb-y line. Anyone reading this Makefile to work out how a
+second board would be delivered needs the real mechanism visible, not a
+dead rule suggesting another one.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+index c7483ffc6c19..3d2176ca6a28 100644
+--- a/arch/mips/boot/dts/intel-mips/Makefile
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -1,5 +1,3 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ dtb-$(CONFIG_DTB_INTEL_MIPS_GRX500)	+= easy350_anywan.dtb
+ dtb-$(CONFIG_DTB_INTEL_MIPS_FRITZ7560)	+= seale_avm_fritz7560.dtb
+-
+-obj-$(CONFIG_BUILTIN_DTB)		+= $(addsuffix .o, $(dtb-y))

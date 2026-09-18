@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Tue, 1 Sep 2026 20:41:14 +0200
+Subject: net: phy: intel-xway: use static features for the integrated xRX PHYs
+
+The PHY11G and PHY22F cores integrated into the xRX SoCs run firmware that
+the SoC loads into them once their reset is released. Their hardwired
+identification registers answer as soon as the MDIO master is alive, so the
+core gets matched and probed while the rest of its register file is still
+coming up, and in that window MII_BMSR reads back 0x0000 as a perfectly
+successful transaction.
+
+Since commit dcdecdcfe1fc ("net: phy: switch drivers to use dynamic feature
+detection") these entries carry no .features, so phy_probe() derives the
+abilities from that BMSR read. A 0x0000 leaves phydev->supported with no
+speed or duplex link mode at all, and nothing re-reads the abilities later,
+so the empty set stands for the rest of the boot. A MAC driver that
+validates the PHY's link modes then refuses to connect to a PHY that is
+perfectly healthy a few milliseconds on.
+
+Dynamic detection buys nothing here: an integrated core's capability set is
+fixed by the firmware variant the SoC loads into it, gigabit for PHY11G and
+10/100 for PHY22F. Declare it statically. The external PEF 707x/PEF 7061
+entries keep detecting, as they have no such boot window.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/phy/intel-xway.c b/drivers/net/phy/intel-xway.c
+index afbcec711744..041a1201cd84 100644
+--- a/drivers/net/phy/intel-xway.c
++++ b/drivers/net/phy/intel-xway.c
+@@ -698,7 +698,7 @@ static struct phy_driver xway_gphy[] = {
+ 		.phy_id		= PHY_ID_PHY11G_VR9_1_1,
+ 		.phy_id_mask	= 0xffffffff,
+ 		.name		= "Intel XWAY PHY11G (xRX v1.1 integrated)",
+-		/* PHY_GBIT_FEATURES */
++		.features	= PHY_GBIT_FEATURES,
+ 		.config_init	= xway_gphy_config_init,
+ 		.probe		= xway_gphy_probe,
+ 		.handle_interrupt = xway_gphy_handle_interrupt,
+@@ -716,7 +716,7 @@ static struct phy_driver xway_gphy[] = {
+ 		.phy_id		= PHY_ID_PHY22F_VR9_1_1,
+ 		.phy_id_mask	= 0xffffffff,
+ 		.name		= "Intel XWAY PHY22F (xRX v1.1 integrated)",
+-		/* PHY_BASIC_FEATURES */
++		.features	= PHY_BASIC_FEATURES,
+ 		.config_init	= xway_gphy_config_init,
+ 		.probe		= xway_gphy_probe,
+ 		.handle_interrupt = xway_gphy_handle_interrupt,
+@@ -734,7 +734,7 @@ static struct phy_driver xway_gphy[] = {
+ 		.phy_id		= PHY_ID_PHY11G_VR9_1_2,
+ 		.phy_id_mask	= 0xffffffff,
+ 		.name		= "Intel XWAY PHY11G (xRX v1.2 integrated)",
+-		/* PHY_GBIT_FEATURES */
++		.features	= PHY_GBIT_FEATURES,
+ 		.config_init	= xway_gphy_config_init,
+ 		.probe		= xway_gphy_probe,
+ 		.handle_interrupt = xway_gphy_handle_interrupt,
+@@ -752,7 +752,7 @@ static struct phy_driver xway_gphy[] = {
+ 		.phy_id		= PHY_ID_PHY22F_VR9_1_2,
+ 		.phy_id_mask	= 0xffffffff,
+ 		.name		= "Intel XWAY PHY22F (xRX v1.2 integrated)",
+-		/* PHY_BASIC_FEATURES */
++		.features	= PHY_BASIC_FEATURES,
+ 		.config_init	= xway_gphy_config_init,
+ 		.probe		= xway_gphy_probe,
+ 		.handle_interrupt = xway_gphy_handle_interrupt,

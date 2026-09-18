@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 12:15:28 +0200
+Subject: net: dsa: lantiq: describe the MDIO master registers per model
+
+The common core reaches the MDIO master through fixed offsets: GLOB at
+0x00, the transaction registers at 0x08-0x0c, and a per-port PHY register
+numbered downwards as 0x15 - port. That layout is a property of GSWIP-2.x,
+not of the register block: later models keep the same fields at the same
+bit positions but put the block elsewhere and number the per-port registers
+upwards, and they do not give every port one.
+
+Move the offsets into a per-model struct gswip_mdio_layout, resolved once
+in gswip_probe_common(). A model that leaves hw_info->mdio_layout NULL gets
+the GSWIP-2.x table, so xRX200, xRX300 and GSW1xx keep exactly the register
+offsets they use today. The per-port array uses the s16 -1 sentinel that
+mii_cfg[] and mii_pcdu[] already use for "this port has no such register",
+and gswip_mdio_mask_phy() applies it in the same shape as
+gswip_mii_mask_cfg().
+
+No functional change: the default table is built from the existing macros,
+and none of the touched functions changes control flow for a model whose
+ports all have a PHY register.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.h b/drivers/net/dsa/lantiq/lantiq_gswip.h
+index 0b75be14dc10..8c9e16b38656 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.h
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.h
+@@ -245,6 +245,31 @@
+ 
+ #define GSWIP_MAX_PORTS		7
+ 
++/**
++ * struct gswip_mdio_layout - placement of the MDIO master registers
++ * @glob: global control register, carrying the switch macro enable
++ * @ctrl: MDIO transaction control register
++ * @read: MDIO read data register
++ * @write: MDIO write data register
++ * @mdc_cfg0: MDC clock configuration 0, holding the auto-polling enables
++ * @mdc_cfg1: MDC clock configuration 1, holding the clock divider
++ * @phy: per-port PHY address and link force register, -1 if the port has none
++ *
++ * GSWIP-2.x keeps these registers in an address region of their own and
++ * numbers the per-port ones downwards from port 0. Later models place the
++ * same functions elsewhere and number them upwards, so the offsets are a
++ * property of the model rather than of the register block.
++ */
++struct gswip_mdio_layout {
++	u16 glob;
++	u16 ctrl;
++	u16 read;
++	u16 write;
++	u16 mdc_cfg0;
++	u16 mdc_cfg1;
++	s16 phy[GSWIP_MAX_PORTS];
++};
++
+ struct gswip_pce_microcode {
+ 	u16 val_3;
+ 	u16 val_2;
+@@ -257,6 +282,8 @@ struct gswip_hw_info {
+ 	unsigned int allowed_cpu_ports;
+ 	s16 mii_cfg[GSWIP_MAX_PORTS];
+ 	s16 mii_pcdu[GSWIP_MAX_PORTS];
++	/* NULL selects the GSWIP-2.x layout */
++	const struct gswip_mdio_layout *mdio_layout;
+ 	bool supports_2500m;
+ 	const struct gswip_pce_microcode (*pce_microcode)[];
+ 	size_t pce_microcode_size;
+@@ -286,6 +313,7 @@ struct gswip_priv {
+ 	struct regmap *mdio;
+ 	struct regmap *mii;
+ 	const struct gswip_hw_info *hw_info;
++	const struct gswip_mdio_layout *mdio_layout;
+ 	const struct xway_gphy_match_data *gphy_fw_name_cfg;
+ 	struct dsa_switch *ds;
+ 	struct device *dev;
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index 0e8eedf64d3a..a8883285c72e 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -126,12 +126,37 @@ static void gswip_mii_mask_cfg(struct gswip_priv *priv, u32 mask, u32 set,
+ 			  set);
+ }
+ 
++static const struct gswip_mdio_layout gswip_mdio_layout_2x = {
++	.glob		= GSWIP_MDIO_GLOB,
++	.ctrl		= GSWIP_MDIO_CTRL,
++	.read		= GSWIP_MDIO_READ,
++	.write		= GSWIP_MDIO_WRITE,
++	.mdc_cfg0	= GSWIP_MDIO_MDC_CFG0,
++	.mdc_cfg1	= GSWIP_MDIO_MDC_CFG1,
++	.phy		= {
++		GSWIP_MDIO_PHYp(0), GSWIP_MDIO_PHYp(1), GSWIP_MDIO_PHYp(2),
++		GSWIP_MDIO_PHYp(3), GSWIP_MDIO_PHYp(4), GSWIP_MDIO_PHYp(5),
++		GSWIP_MDIO_PHYp(6),
++	},
++};
++
++static void gswip_mdio_mask_phy(struct gswip_priv *priv, int port, u32 mask,
++				u32 set)
++{
++	/* PHY register only exists for ports the MDIO master can poll */
++	if (priv->mdio_layout->phy[port] == -1)
++		return;
++
++	regmap_write_bits(priv->mdio, priv->mdio_layout->phy[port], mask, set);
++}
++
+ static int gswip_mdio_poll(struct gswip_priv *priv)
+ {
+ 	u32 ctrl;
+ 
+-	return regmap_read_poll_timeout(priv->mdio, GSWIP_MDIO_CTRL, ctrl,
+-					!(ctrl & GSWIP_MDIO_CTRL_BUSY), 40, 4000);
++	return regmap_read_poll_timeout(priv->mdio, priv->mdio_layout->ctrl,
++					ctrl, !(ctrl & GSWIP_MDIO_CTRL_BUSY),
++					40, 4000);
+ }
+ 
+ static int gswip_mdio_wr(struct mii_bus *bus, int addr, int reg, u16 val)
+@@ -145,8 +170,8 @@ static int gswip_mdio_wr(struct mii_bus *bus, int addr, int reg, u16 val)
+ 		return err;
+ 	}
+ 
+-	regmap_write(priv->mdio, GSWIP_MDIO_WRITE, val);
+-	regmap_write(priv->mdio, GSWIP_MDIO_CTRL,
++	regmap_write(priv->mdio, priv->mdio_layout->write, val);
++	regmap_write(priv->mdio, priv->mdio_layout->ctrl,
+ 		     GSWIP_MDIO_CTRL_BUSY | GSWIP_MDIO_CTRL_WR |
+ 		     ((addr & GSWIP_MDIO_CTRL_PHYAD_MASK) << GSWIP_MDIO_CTRL_PHYAD_SHIFT) |
+ 		     (reg & GSWIP_MDIO_CTRL_REGAD_MASK));
+@@ -166,7 +191,7 @@ static int gswip_mdio_rd(struct mii_bus *bus, int addr, int reg)
+ 		return err;
+ 	}
+ 
+-	regmap_write(priv->mdio, GSWIP_MDIO_CTRL,
++	regmap_write(priv->mdio, priv->mdio_layout->ctrl,
+ 		     GSWIP_MDIO_CTRL_BUSY | GSWIP_MDIO_CTRL_RD |
+ 		     ((addr & GSWIP_MDIO_CTRL_PHYAD_MASK) << GSWIP_MDIO_CTRL_PHYAD_SHIFT) |
+ 		     (reg & GSWIP_MDIO_CTRL_REGAD_MASK));
+@@ -177,7 +202,7 @@ static int gswip_mdio_rd(struct mii_bus *bus, int addr, int reg)
+ 		return err;
+ 	}
+ 
+-	err = regmap_read(priv->mdio, GSWIP_MDIO_READ, &val);
++	err = regmap_read(priv->mdio, priv->mdio_layout->read, &val);
+ 	if (err)
+ 		return err;
+ 
+@@ -447,9 +472,8 @@ static int gswip_port_enable(struct dsa_switch *ds, int port,
+ 		if (phydev)
+ 			mdio_phy = phydev->mdio.addr & GSWIP_MDIO_PHY_ADDR_MASK;
+ 
+-		regmap_write_bits(priv->mdio, GSWIP_MDIO_PHYp(port),
+-				  GSWIP_MDIO_PHY_ADDR_MASK,
+-				  mdio_phy);
++		gswip_mdio_mask_phy(priv, port, GSWIP_MDIO_PHY_ADDR_MASK,
++				    mdio_phy);
+ 	}
+ 
+ 	/* RMON Counter Enable for port */
+@@ -658,7 +682,8 @@ static int gswip_setup(struct dsa_switch *ds)
+ 	}
+ 
+ 	/* enable Switch */
+-	regmap_set_bits(priv->mdio, GSWIP_MDIO_GLOB, GSWIP_MDIO_GLOB_ENABLE);
++	regmap_set_bits(priv->mdio, priv->mdio_layout->glob,
++			GSWIP_MDIO_GLOB_ENABLE);
+ 
+ 	err = gswip_pce_load_microcode(priv);
+ 	if (err) {
+@@ -687,10 +712,10 @@ static int gswip_setup(struct dsa_switch *ds)
+ 	 * Testing shows that when PHY auto polling is disabled these problems
+ 	 * go away.
+ 	 */
+-	regmap_write(priv->mdio, GSWIP_MDIO_MDC_CFG0, 0x0);
++	regmap_write(priv->mdio, priv->mdio_layout->mdc_cfg0, 0x0);
+ 
+ 	/* Configure the MDIO Clock 2.5 MHz */
+-	regmap_write_bits(priv->mdio, GSWIP_MDIO_MDC_CFG1, 0xff, 0x09);
++	regmap_write_bits(priv->mdio, priv->mdio_layout->mdc_cfg1, 0xff, 0x09);
+ 
+ 	/* bring up the mdio bus */
+ 	err = gswip_mdio(priv);
+@@ -743,7 +768,8 @@ static void gswip_teardown(struct dsa_switch *ds)
+ {
+ 	struct gswip_priv *priv = ds->priv;
+ 
+-	regmap_clear_bits(priv->mdio, GSWIP_MDIO_GLOB, GSWIP_MDIO_GLOB_ENABLE);
++	regmap_clear_bits(priv->mdio, priv->mdio_layout->glob,
++			  GSWIP_MDIO_GLOB_ENABLE);
+ }
+ 
+ static enum dsa_tag_protocol gswip_get_tag_protocol(struct dsa_switch *ds,
+@@ -1306,8 +1332,7 @@ static void gswip_port_set_link(struct gswip_priv *priv, int port, bool link)
+ 	else
+ 		mdio_phy = GSWIP_MDIO_PHY_LINK_DOWN;
+ 
+-	regmap_write_bits(priv->mdio, GSWIP_MDIO_PHYp(port),
+-			  GSWIP_MDIO_PHY_LINK_MASK, mdio_phy);
++	gswip_mdio_mask_phy(priv, port, GSWIP_MDIO_PHY_LINK_MASK, mdio_phy);
+ }
+ 
+ static void gswip_port_set_speed(struct gswip_priv *priv, int port, int speed,
+@@ -1347,8 +1372,7 @@ static void gswip_port_set_speed(struct gswip_priv *priv, int port, int speed,
+ 		break;
+ 	}
+ 
+-	regmap_write_bits(priv->mdio, GSWIP_MDIO_PHYp(port),
+-			  GSWIP_MDIO_PHY_SPEED_MASK, mdio_phy);
++	gswip_mdio_mask_phy(priv, port, GSWIP_MDIO_PHY_SPEED_MASK, mdio_phy);
+ 	gswip_mii_mask_cfg(priv, GSWIP_MII_CFG_RATE_MASK, mii_cfg, port);
+ 	regmap_write_bits(priv->gswip, GSWIP_MAC_CTRL_0p(port),
+ 			  GSWIP_MAC_CTRL_0_GMII_MASK, mac_ctrl_0);
+@@ -1368,8 +1392,7 @@ static void gswip_port_set_duplex(struct gswip_priv *priv, int port, int duplex)
+ 
+ 	regmap_write_bits(priv->gswip, GSWIP_MAC_CTRL_0p(port),
+ 			  GSWIP_MAC_CTRL_0_FDUP_MASK, mac_ctrl_0);
+-	regmap_write_bits(priv->mdio, GSWIP_MDIO_PHYp(port),
+-			  GSWIP_MDIO_PHY_FDUP_MASK, mdio_phy);
++	gswip_mdio_mask_phy(priv, port, GSWIP_MDIO_PHY_FDUP_MASK, mdio_phy);
+ }
+ 
+ static void gswip_port_set_pause(struct gswip_priv *priv, int port,
+@@ -1397,9 +1420,9 @@ static void gswip_port_set_pause(struct gswip_priv *priv, int port,
+ 
+ 	regmap_write_bits(priv->gswip, GSWIP_MAC_CTRL_0p(port),
+ 			  GSWIP_MAC_CTRL_0_FCON_MASK, mac_ctrl_0);
+-	regmap_write_bits(priv->mdio, GSWIP_MDIO_PHYp(port),
+-			  GSWIP_MDIO_PHY_FCONTX_MASK | GSWIP_MDIO_PHY_FCONRX_MASK,
+-			  mdio_phy);
++	gswip_mdio_mask_phy(priv, port,
++			    GSWIP_MDIO_PHY_FCONTX_MASK |
++			    GSWIP_MDIO_PHY_FCONRX_MASK, mdio_phy);
+ }
+ 
+ static void gswip_phylink_mac_config(struct phylink_config *config,
+@@ -1681,6 +1704,11 @@ int gswip_probe_common(struct gswip_priv *priv, u32 version)
+ 
+ 	mutex_init(&priv->pce_table_lock);
+ 
++	if (priv->hw_info->mdio_layout)
++		priv->mdio_layout = priv->hw_info->mdio_layout;
++	else
++		priv->mdio_layout = &gswip_mdio_layout_2x;
++
+ 	priv->ds = devm_kzalloc(priv->dev, sizeof(*priv->ds), GFP_KERNEL);
+ 	if (!priv->ds)
+ 		return -ENOMEM;

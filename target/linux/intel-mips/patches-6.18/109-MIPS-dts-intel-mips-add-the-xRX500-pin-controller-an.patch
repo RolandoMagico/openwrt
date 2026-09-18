@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Thu, 13 Aug 2026 16:22:59 +0000
+Subject: MIPS: dts: intel-mips: add the xRX500 pin controller and GPIO banks
+
+Describe the Equilibrium pinmux/pad block and its two GPIO banks so the
+pinctrl-equilibrium driver can bind on xRX500.
+
+Addresses are the AVM 4.9 hardware truth, translated out of the vendor
+tree's ssx4@16000000 wrapper (ranges <0x0 0x16000000 0x02000000>) into
+the flat, absolute-address layout this dtsi already uses for gic, cgu,
+rcu, asc0 and friends:
+
+  vendor pinctrl@c80000  -> pinctrl@16c80000, 0x80000
+  vendor gpio@c00000     -> gpio@16c00000,    0x80   (pins 0..31)
+  vendor gpio@c00100     -> gpio@16c00100,    0x80   (pins 32..63)
+
+with GIC_SHARED 172 / 173 as the per-bank interrupt lines, likewise
+verbatim from the vendor tree. Both lines are unused elsewhere in this
+tree.
+
+Three details are load-bearing and are spelled out in the source as
+well:
+
+ - Bank order. Unlike the vendor driver, the mainline one does not
+   consume the pinctrl "pad" subnodes; it walks the whole tree with
+   for_each_node_by_name(np, "gpio") and takes the bank id from the
+   traversal order, then addresses the pad registers at
+   membase + id * 0x100. gpio@16c00000 therefore has to be emitted
+   first, and nothing else in the tree may be named "gpio".
+
+ - 32 pins on both banks. The vendor tree declares ngpios/gpio-ranges
+   of 30 on bank 1 because only 62 pads are bonded out. Mainline passes
+   nr_pins / 8 as the MMIO accessor width to gpio_generic_chip_init(),
+   and 30 / 8 == 3 trips the is_power_of_2() check in bgpio_init()
+   (drivers/gpio/gpio-mmio.c), which would fail the probe outright.
+   The pad controller's REG_AVAIL bitmap at +0x98 already masks the
+   pins that do not exist.
+
+ - No "interrupt-controller". The banks carry "interrupts" because
+   gpiolib_reg() calls irq_of_parse_and_map() unconditionally and
+   returns -ENXIO if it finds none, but they intentionally do not
+   publish an irq domain: gpiochip_setup() keys the chained-handler
+   setup off the "interrupt-controller" property, and neither the
+   mainline nor the vendor driver ever masks GPIO_IRNEN (+0x28) or
+   clears GPIO_IRNCR (+0x20) at probe time. Arming the chained handler
+   would therefore hand the GIC line to a handler running on top of
+   whatever the bootloader left enabled, with handle_bad_irq() and no
+   ack path for an unmapped hwirq -- a level-triggered livelock risk
+   for zero present benefit, since the board's buttons are polled.
+   Adding the property later is a one-line change once a consumer
+   actually needs GPIO interrupts.
+
+No pin function groups are declared. Every consumer claims its pads as
+plain GPIOs, which takes the driver's gpio_request_enable() path and
+programs mux value 0, matching what the vendor BSP effectively does for
+these pins.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index d5e8f7115e8b..c311c2ed7595 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -86,6 +86,54 @@ asc0: serial@16600000 {
+ 		clock-names = "freq", "asc";
+ 	};
+ 
++	/*
++	 * Equilibrium pinmux / pad controller. eqbr_build_groups() walks
++	 * every child, enabled or not, and returns -EINVAL for the first one
++	 * that has "groups" but neither "pins" nor "pinmux" — which fails the
++	 * whole pinctrl probe, not just that group. Pin groups therefore live
++	 * in the narrowest file that needs them.
++	 */
++	pinctrl: pinctrl@16c80000 {
++		compatible = "intel,pinctrl-xrx500";
++		reg = <0x16c80000 0x80000>;
++	};
++
++	/*
++	 * GPIO banks. Three constraints that are invisible in the code:
++	 *
++	 * - The node order matters: the driver walks them with a global
++	 * for_each_node_by_name().
++	 * - gpio-ranges spans 32 pins, not the 30 that are wired:
++	 *   bgpio_init() needs
++	 * a power-of-two register width.
++	 * - interrupts is mandatory even where nothing uses it, because
++	 *   gpiolib_reg()
++	 * always parses it.
++	 */
++	gpio0: gpio@16c00000 {
++		reg = <0x16c00000 0x80>;
++
++		gpio-controller;
++		#gpio-cells = <2>;
++		ngpios = <32>;
++		gpio-ranges = <&pinctrl 0 0 32>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 172 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
++	gpio1: gpio@16c00100 {
++		reg = <0x16c00100 0x80>;
++
++		gpio-controller;
++		#gpio-cells = <2>;
++		ngpios = <32>;
++		gpio-ranges = <&pinctrl 0 32 32>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 173 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
+ 	ebu_nand: nand-controller@16f00000 {
+ 		compatible = "lantiq,nand-xrx500";
+ 		/*

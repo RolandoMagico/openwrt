@@ -1,0 +1,508 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 29 Aug 2026 00:20:56 +0200
+Subject: MIPS: dts: intel-mips: split the GRX550 facts out of the FRITZ!Box
+ 7590
+
+The FRITZ!Box 7590 board file carries a set of statements that are not
+about the board at all. Both USB controllers with the single VBUS line
+that powers them, and the SSO shift register the front panel hangs off,
+are how AVM wires every GRX550 box rather than how it wires this one.
+Each of them was written into this file because this was the only GRX550
+board here.
+
+It is not any more. Put them in seale_avm_grx550.dtsi, between the
+board-family layer and the board, and have the FRITZ!Box 7590 include that
+instead. AVM's own tree splits at exactly this line -- its
+grx550_common.dtsi holds the same set -- which is the best evidence
+available that the boundary is a real one and not a convenience.
+
+seale_avm.dtsi's own note anticipated the move and named the trigger: a
+second GRX550 board. There is deliberately no seale_avm_grx350.dtsi,
+because the FRITZ!Box 7560 remains the only board on that die and such a
+file would be a second name for its board file.
+
+The comment on the SSO controller anticipated it too. It explained that
+the block and its pin group sat in a board file so a malformed pin group
+could not reach the FRITZ!Box 7560's pinctrl probe, which fails whole
+rather than per group, and said to promote both the day a second board
+wired the function. A file the FRITZ!Box 7560 does not include keeps
+that guarantee just as well.
+
+What stays behind is board data: identity, memory, crash persistence, the
+flash map, which of the eight SSO pins are populated and what each lamp is
+called, the three buttons, and the DSL companion behind RC2.
+
+Pure refactor. seale_avm_fritz7590.dtb is semantically unchanged. Its 67
+nodes and 19 phandles compare equal property by property, and only the
+order dtc emits nodes in moves, so the blob keeps its size and changes
+its bytes. seale_avm_fritz7560.dtb and easy350_anywan.dtb are
+byte-identical.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+index 8600e26d1548..0125c91f084f 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_fritz7590.dts
+@@ -7,12 +7,11 @@
+  */
+ /dts-v1/;
+ 
+-#include <dt-bindings/clock/intel,grx500-clk.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/input/input.h>
+ #include <dt-bindings/leds/common.h>
+ 
+-#include "seale_avm.dtsi"
++#include "seale_avm_grx550.dtsi"
+ 
+ / {
+ 	model = "AVM FRITZ!Box 7590";
+@@ -125,36 +124,6 @@ shm-rng-seed@3dfb0000 {
+ 			no-map;
+ 		};
+ 	};
+-
+-	/*
+-	 * Port power, for both USB host controllers at once. The FRITZ!Box 7560 has
+-	 * one port and one enable line; this board has two ports and still
+-	 * one enable line. AVM declares a single gpio_avm_usb_power_enable
+-	 * on gpio1 2, active high, with no per-controller variant (AVM 4.9
+-	 * arch/mips/boot/dts/lantiq/avm/grx550_common.dtsi). That is gpio
+-	 * bank 1 line 2, i.e. pad 34, and nothing else on this board claims
+-	 * it.
+-	 *
+-	 * Both PHYs take it as their vbus-supply, which is legal and
+-	 * refcounted: the PHY driver asks with regulator_get_optional(), and
+-	 * only an exclusive get would turn a second consumer away. Whichever
+-	 * PHY powers on first raises the line and it drops again when the
+-	 * last one powers off.
+-	 *
+-	 * The vendor mechanism, and the reason for not reproducing it, are
+-	 * the FRITZ!Box 7560's: see the comment on that board's usb_vbus.
+-	 *
+-	 * No pinmux, for the same reason as there: the pad comes up as a
+-	 * GPIO, which is what the regulator needs.
+-	 */
+-	usb_vbus: regulator-usb-vbus {
+-		compatible = "regulator-fixed";
+-		regulator-name = "usb_vbus";
+-		regulator-min-microvolt = <5000000>;
+-		regulator-max-microvolt = <5000000>;
+-		gpio = <&gpio1 2 GPIO_ACTIVE_HIGH>;
+-		enable-active-high;
+-	};
+ };
+ 
+ /*
+@@ -229,192 +198,92 @@ &pcie2 {
+ };
+ 
+ /*
+- * Both USB host controllers. The vendor's HW226 chain carries no status
+- * override on either of them, where the FRITZ!Box 7560's grx350_common.dtsi disables
+- * usb0. How many jacks that reaches, and which controller sits behind each
+- * one, is a board-layout fact the vendor sources do not state.
+- */
+-&usb0_phy {
+-	status = "okay";
+-	vbus-supply = <&usb_vbus>;
+-};
+-
+-&usb0 {
+-	status = "okay";
+-};
+-
+-&usb1_phy {
+-	status = "okay";
+-	vbus-supply = <&usb_vbus>;
+-};
+-
+-&usb1 {
+-	status = "okay";
+-};
+-
+-/*
+- * Front-panel LEDs and buttons.
++ * Front-panel lamps.
+  *
+- * The lamps are not GPIOs. They hang off the SoC's Serial Shift Output
+- * controller, which clocks a 32-bit output word out to an external shift
+- * register on three pads -- shift clock, store and data -- and holds an
+- * eight-bit duty cycle per pin. Six of the seven pins declared below are
+- * visible lamps; the seventh is a brightness carrier that is not.
++ * The shift-register controller they hang off is a GRX550 fact and lives in
++ * seale_avm_grx550.dtsi. What is board data is which of its eight pins are
++ * populated and what each one drives: six of the seven declared here are
++ * visible lamps, and the seventh is a brightness carrier that is not.
+  *
+- * Everything here is board-local, and the pin group is why. The pinmux
+- * driver's eqbr_build_groups() walks every child of the pinmux node, enabled
+- * or not, and returns -EINVAL for the first one missing "pins" or "pinmux" --
+- * which fails the whole pinctrl probe, not just that group. On this platform
+- * that would take every GPIO consumer with it, and the other board on it has
+- * no remote power. The SSO node follows it here for the same reason and
+- * because putting either in xrx500.dtsi renumbers phandles through the
+- * FRITZ!Box 7560's blob for no gain. Promote both the day a second board wires this
+- * function.
++ * No shift clock rate is stated, which leaves the driver's 25 MHz default --
++ * the rate AVM's GRX550 layer asks for and does not override on this board.
++ * (The FRITZ!Box 7580 does override it, to 3.125 MHz.)
+  */
+-/ {
++&ssogpio {
+ 	/*
+-	 * The blink generator's slow clock source. AVM models it as a
+-	 * fixed-clock at 8 kHz (AVM 4.9 arch/mips/boot/dts/lantiq/
+-	 * xrx500.dtsi, afeclk), and the number is self-checking: the driver
+-	 * divides it by {4000, 2000, 1000, 800} for its first four blink
+-	 * rates, giving the 2/4/8/10 Hz that both its own freq_tbl[] and the
+-	 * vendor's carry as a literal.
+-	 *
+-	 * It is a real input rather than a placeholder, but not one this
+-	 * board uses: hardware blink is only wired up for pins 24 and above,
+-	 * and every pin here is below that.
++	 * The child must be named "ssoled": the driver matches on the node
++	 * name. No label property — colour and function compose the
++	 * ABI-visible LED name.
+ 	 */
+-	sso_fpid: clock-8000 {
+-		compatible = "fixed-clock";
+-		#clock-cells = <0>;
+-		clock-frequency = <8000>;
+-	};
++	ssoled {
++		#address-cells = <1>;
++		#size-cells = <0>;
+ 
+-	/*
+-	 * Address and window are the vendor's -- ssogpio@d00000 under the
+-	 * ssx4 wrapper whose ranges add 0x16000000 (AVM 4.9
+-	 * arch/mips/boot/dts/lantiq/xrx500.dtsi). The 0x2cc size ends one
+-	 * word past the last register, SSO_CON3 at +0x2c8, so the whole
+-	 * block is reachable.
+-	 *
+-	 * "syscon" in the compatible is load-bearing. The driver takes its
+-	 * regmap from syscon_node_to_regmap(), which hands back -EINVAL for
+-	 * a node whose compatible does not carry that exact string, so
+-	 * without it the driver does not probe at all. The same call
+-	 * attaches of_clk_get(np, 0) to the regmap as the gate on register
+-	 * access, which is why clock-names is ordered sso first: the order
+-	 * is a requirement, not a convention.
+-	 *
+-	 * intel,grx500-ssoled rather than the intel,lgm-ssoled the driver
+-	 * shipped with, and the whole difference is one bit. Mainline
+-	 * hardcodes SSO_CON0.RZFL to 0, clocking the shift register on the
+-	 * rising edge. The driver now carries the edge as per-compatible
+-	 * match data and this compatible selects it.
+-	 *
+-	 * ngpios and the update rate have no useful defaults and both are
+-	 * checkable. ngpios narrows the SoC's 16 pins to the 8 this board
+-	 * populates, which is what leaves a single group-enable bit in
+-	 * CON1[3:0] instead of four; the update rate selects the top entry of
+-	 * the driver's freq_tbl[], i.e. Together they give CON1 =
+-	 * 0x46000001.
+-	 */
+-	ssogpio: ssogpio@16d00000 {
+-		compatible = "intel,grx500-ssoled", "syscon";
+-		reg = <0x16d00000 0x2cc>;
++		/*
++		 * Not a lamp: a brightness carrier driven at a fixed duty
++		 * cycle. A child with neither colour nor function degrades to
++		 * the name "lgm-sso::".
++		 */
++		led@0 {
++			reg = <0>;
++			color = <LED_COLOR_ID_WHITE>;
++			function = "ambient";
++			gpios = <&ssogpio 0 GPIO_ACTIVE_HIGH>;
++		};
+ 
+-		gpio-controller;
+-		#gpio-cells = <2>;
+-		ngpios = <8>;
++		/* The two halves of the bicolour info lamp. */
++		led_info: led@2 {
++			reg = <2>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "info";
++			gpios = <&ssogpio 2 GPIO_ACTIVE_HIGH>;
++		};
+ 
+-		clocks = <&cgu GCLK_SSO>, <&sso_fpid>;
+-		clock-names = "sso", "fpid";
++		led_info_red: led@3 {
++			reg = <3>;
++			color = <LED_COLOR_ID_RED>;
++			function = "info";
++			gpios = <&ssogpio 3 GPIO_ACTIVE_HIGH>;
++		};
+ 
+-		intel,sso-update-rate-hz = <250000>;
++		led_wlan: led@4 {
++			reg = <4>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = LED_FUNCTION_WLAN;
++			gpios = <&ssogpio 4 GPIO_ACTIVE_HIGH>;
++		};
+ 
+-		pinctrl-names = "default";
+-		pinctrl-0 = <&pinctrl_ledc>;
++		led@5 {
++			reg = <5>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "fon";
++			gpios = <&ssogpio 5 GPIO_ACTIVE_HIGH>;
++		};
++
++		led@6 {
++			reg = <6>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = "connect";
++			gpios = <&ssogpio 6 GPIO_ACTIVE_HIGH>;
++		};
+ 
+ 		/*
+-		 * The child must be named "ssoled": the driver matches on the
+-		 * node name. No label property — colour and function compose
+-		 * the ABI-visible LED name.
++		 * Lit as soon as the driver probes. The lamp is already on
++		 * when the kernel starts, and blinking it off mid-boot would
++		 * read as a failed boot. Active low.
+ 		 */
+-		ssoled {
+-			#address-cells = <1>;
+-			#size-cells = <0>;
+-
+-			/*
+-			 * Not a lamp: a brightness carrier driven at a fixed
+-			 * duty cycle. A child with neither colour nor
+-			 * function degrades to the name "lgm-sso::".
+-			 */
+-			led@0 {
+-				reg = <0>;
+-				color = <LED_COLOR_ID_WHITE>;
+-				function = "ambient";
+-				gpios = <&ssogpio 0 GPIO_ACTIVE_HIGH>;
+-			};
+-
+-			/* The two halves of the bicolour info lamp. */
+-			led_info: led@2 {
+-				reg = <2>;
+-				color = <LED_COLOR_ID_GREEN>;
+-				function = "info";
+-				gpios = <&ssogpio 2 GPIO_ACTIVE_HIGH>;
+-			};
+-
+-			led_info_red: led@3 {
+-				reg = <3>;
+-				color = <LED_COLOR_ID_RED>;
+-				function = "info";
+-				gpios = <&ssogpio 3 GPIO_ACTIVE_HIGH>;
+-			};
+-
+-			led_wlan: led@4 {
+-				reg = <4>;
+-				color = <LED_COLOR_ID_GREEN>;
+-				function = LED_FUNCTION_WLAN;
+-				gpios = <&ssogpio 4 GPIO_ACTIVE_HIGH>;
+-			};
+-
+-			led@5 {
+-				reg = <5>;
+-				color = <LED_COLOR_ID_GREEN>;
+-				function = "fon";
+-				gpios = <&ssogpio 5 GPIO_ACTIVE_HIGH>;
+-			};
+-
+-			led@6 {
+-				reg = <6>;
+-				color = <LED_COLOR_ID_GREEN>;
+-				function = "connect";
+-				gpios = <&ssogpio 6 GPIO_ACTIVE_HIGH>;
+-			};
+-
+-			/*
+-			 * Lit as soon as the driver probes. The lamp is already
+-			 * on when the kernel starts, and blinking it off
+-			 * mid-boot would read as a failed boot. Active low.
+-			 */
+-			led_power: led@7 {
+-				reg = <7>;
+-				color = <LED_COLOR_ID_GREEN>;
+-				function = LED_FUNCTION_POWER;
+-				gpios = <&ssogpio 7 GPIO_ACTIVE_LOW>;
+-				default-state = "on";
+-			};
++		led_power: led@7 {
++			reg = <7>;
++			color = <LED_COLOR_ID_GREEN>;
++			function = LED_FUNCTION_POWER;
++			gpios = <&ssogpio 7 GPIO_ACTIVE_LOW>;
++			default-state = "on";
+ 		};
+ 	};
++};
+ 
+-	/*
+-	 * Polled rather than interrupt-driven, as on the FRITZ!Box 7560 and for the
+-	 * same reason: the GPIO banks publish no irq domain.
+-	 *
+-	 * The dect and wlan codes are the FRITZ!Box 7560's exactly, because that
+-	 * pair is what its failsafe entry is proven against. connect has no
+-	 * counterpart there; KEY_WPS_BUTTON is what OpenWrt uses for a
+-	 * button labelled connect or WPS.
+-	 */
++/* Polled: the GPIO banks publish no irq domain. */
++/ {
+ 	keys {
+ 		compatible = "gpio-keys-polled";
+ 		poll-interval = <100>;
+@@ -439,35 +308,6 @@ button-connect {
+ 	};
+ };
+ 
+-/*
+- * The three pads the shift register hangs off: pad 4 is the shift clock,
+- * pad 5 the store strobe and pad 6 the data line, all at mux value 1.
+- *
+- * This is the first pin group on the platform, so it is also the first
+- * departure from the rule stated in xrx500.dtsi -- that every consumer
+- * claims its pads as plain GPIOs and takes the driver's
+- * gpio_request_enable() path, which writes mux 0. These three pads are not
+- * GPIOs in this role and none of them is one of the pads that rule exists
+- * to protect.
+- *
+- * Both spellings are needed and neither is optional. "groups" and
+- * "function" are what the generic mapping layer reads to build the mux
+- * map, and "pins" with "pinmux" are what eqbr_build_groups() reads to
+- * learn which pads and which mux value; leave "pinmux" out and the group
+- * is not merely ignored, the whole pinmux probe fails. The literal 1 is
+- * spelled out because the vendor's EQBR_MUX_1 header is not in this tree.
+- * Note also that the group's name is the *value* of "groups" and not the
+- * node name.
+- */
+-&pinctrl {
+-	pinctrl_ledc: led-pins {
+-		pins = <4>, <5>, <6>;
+-		function = "led";
+-		pinmux = <1>, <1>, <1>;
+-		groups = "led";
+-	};
+-};
+-
+ /*
+  * The master LED enable is a plain GPIO, not an SSO pin, and nothing in this
+  * tree consumes it — hence the hog. The whole panel is dark while it is low.
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+new file mode 100644
+index 000000000000..49b238903c02
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Copyright (C) 2026 Grische <github@grische.xyz>
++/*
++ * AVM FRITZ!Box boards on the GRX550 die. Die-variant layer between
++ * seale_avm.dtsi and the board files: the fifth GPHY and its WAN port, the
++ * second MDIO bus, the front-panel LED controller and both USB host
++ * controllers.
++ */
++
++#include <dt-bindings/clock/intel,grx500-clk.h>
++#include <dt-bindings/gpio/gpio.h>
++
++#include "seale_avm.dtsi"
++
++/ {
++	/*
++	 * One enable line feeds both USB PHYs. Both take it as their
++	 * vbus-supply, which is legal and refcounted:
++	 * regulator_get_optional() is not an exclusive get, so a second
++	 * consumer is not turned away.
++	 */
++	usb_vbus: regulator-usb-vbus {
++		compatible = "regulator-fixed";
++		regulator-name = "usb_vbus";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		gpio = <&gpio1 2 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	/*
++	 * The blink generator's slow clock source: a fixed 8 kHz input the
++	 * driver divides for its blink table.
++	 */
++	sso_fpid: clock-8000 {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <8000>;
++	};
++
++	/*
++	 * The front-panel LED controller. Four constraints:
++	 *
++	 * - "syscon" must stay in the compatible or syscon_node_to_regmap()
++	 *   fails.
++	 * - The clock-names order matters: clock 0 gates register access.
++	 * - The compatible selects the falling shift-clock edge. The vendor
++	 *   driver
++	 * defaults this SoC to the falling edge and treats rising as an
++	 * opt-in
++	 * device-tree property that no board sets; mainline's lgm-sso
++	 * hardcodes
++	 * rising instead.
++	 * - ngpios narrows the controller to the populated pins.
++	 */
++	ssogpio: ssogpio@16d00000 {
++		compatible = "intel,grx500-ssoled", "syscon";
++		reg = <0x16d00000 0x2cc>;
++
++		gpio-controller;
++		#gpio-cells = <2>;
++		ngpios = <8>;
++
++		clocks = <&cgu GCLK_SSO>, <&sso_fpid>;
++		clock-names = "sso", "fpid";
++
++		intel,sso-update-rate-hz = <250000>;
++
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_ledc>;
++	};
++};
++
++&usb0_phy {
++	status = "okay";
++	vbus-supply = <&usb_vbus>;
++};
++
++&usb0 {
++	status = "okay";
++};
++
++&usb1_phy {
++	status = "okay";
++	vbus-supply = <&usb_vbus>;
++};
++
++&usb1 {
++	status = "okay";
++};
++
++/*
++ * The three pads the shift register hangs off. Both spellings are required:
++ * the pinctrl driver rejects a child that has "groups" without "pins" or
++ * "pinmux", and it fails the whole pinctrl probe when it does.
++ */
++&pinctrl {
++	pinctrl_ledc: led-pins {
++		pins = <4>, <5>, <6>;
++		function = "led";
++		pinmux = <1>, <1>, <1>;
++		groups = "led";
++	};
++};

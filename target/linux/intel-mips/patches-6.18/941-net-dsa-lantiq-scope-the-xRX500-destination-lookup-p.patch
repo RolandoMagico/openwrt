@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 14:33:05 +0200
+Subject: net: dsa: lantiq: scope the xRX500 destination lookup per bridge
+
+The switch forwards a frame by looking its destination address up in a
+forwarding domain, and on this generation the domain that lookup runs in
+is the one an ingress classification rule puts the frame in. A domain
+reached through the port's default VLAN or through the VLAN tables takes
+no part in it, which is why the common VLAN-table model cannot express a
+forwarding domain here on its own: every port shares one, so a bridge
+over some of the ports forwards between all of them and a standalone port
+is not separated from a bridged one.
+
+Give every user port a rule of its own instead. The rule matches the port
+a frame arrived on and names its domain, so a station learned in one
+domain is a lookup miss for a frame classified into another and the
+unknown-destination map sends that frame to the processor rather than
+across the fabric - the port ends up separated and still reachable, and
+learning follows the domain because it is the same identifier.
+
+A port outside every bridge takes a domain of its own so that it is
+separated from every bridge and from every other standalone port; a port
+in a bridge takes the bridge's. The identifiers come from the DSA core's
+bridge numbering, which needs max_num_bridges to be set for the core to
+hand out one number per bridge. Static address-table entries move with
+it, since the domain the entry is planted in has to be the one the lookup
+runs in.
+
+A rule has to be written whole for either half of it to take effect. Its
+key is a set of range pairs over the fields the parser extracts, and only
+the first of them holds the ingress port; the range words the vendor's
+encoder leaves in a rule that selects on the ingress port alone go in as
+one set, because a key with the rest left at zero is stored and read back
+exactly as written and matches nothing at all. Its action words are not
+independent of one another either, so the action the vendor's encoder
+builds is written whole: the port map its three gates hold inert, the
+do-not-remark selectors that stop the VLAN action rewriting the frame's
+priority fields, the alternative VLAN and domain select, and the tag
+remark disables. Only the domain varies per port, so only the domain is
+filled in by the writer. The learning-action enable goes in beside the
+VLAN one, so the domain the rule assigns is the domain the port learns
+in.
+
+The per-model hook this hangs on is the one that applies a port's domain,
+reached from port setup, from a join, from a leave, and from anywhere a
+later re-initialisation needs it.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip.h b/drivers/net/dsa/lantiq/lantiq_gswip.h
+index 5010ecb8150d..b507bc8f73d7 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip.h
++++ b/drivers/net/dsa/lantiq/lantiq_gswip.h
+@@ -3,6 +3,7 @@
+ #define __LANTIQ_GSWIP_H
+ 
+ #include <linux/bitfield.h>
++#include <linux/build_bug.h>
+ #include <linux/clk.h>
+ #include <linux/mutex.h>
+ #include <linux/phylink.h>
+@@ -257,6 +258,24 @@
+  */
+ #define GSWIP_2X_MAX_PORTS	7
+ 
++/* Forwarding-domain numbering for a model that implements port_set_fid().
++ * A bridge takes the number the DSA core hands out for it, which starts at
++ * one, and a port outside every bridge takes one of its own from the block
++ * above the port numbers, so that a standalone port is separated from every
++ * bridge and from every other standalone port rather than sharing a domain
++ * with them.
++ *
++ * Domain 0 is deliberately left unused. A port the driver has not given a
++ * domain to falls into it, and since nothing is ever learned there, a frame
++ * from such a port misses the lookup and reaches the processor instead of
++ * crossing the fabric.
++ */
++#define GSWIP_FID_STANDALONE_BASE	0x20
++#define GSWIP_FID_MAX			64
++
++static_assert(GSWIP_MAX_PORTS <= GSWIP_FID_STANDALONE_BASE);
++static_assert(GSWIP_FID_STANDALONE_BASE + GSWIP_MAX_PORTS <= GSWIP_FID_MAX);
++
+ /**
+  * struct gswip_mdio_layout - placement of the MDIO master registers
+  * @glob: global control register, carrying the switch macro enable
+@@ -325,6 +344,13 @@ struct gswip_hw_info {
+ 	 * setup() returns to their defaults.
+ 	 */
+ 	int (*setup)(struct dsa_switch *ds);
++	/* Confine the port's destination lookup to the forwarding domain
++	 * named by @fid. A model whose lookup can be scoped this way
++	 * implements it and gets one domain per bridge plus one per
++	 * standalone port; NULL leaves the switch forwarding between all of
++	 * its ports, and the common VLAN-table model is all there is.
++	 */
++	int (*port_set_fid)(struct dsa_switch *ds, int port, u16 fid);
+ };
+ 
+ struct gswip_gphy_fw {
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_common.c b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+index 5aea1e0cc2db..196a1326220a 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_common.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_common.c
+@@ -491,6 +491,31 @@ static int gswip_port_set_learning(struct gswip_priv *priv, int port,
+ 				  enable ? 0 : GSWIP_PCE_PCTRL_3_LNDIS);
+ }
+ 
++/* The forwarding domain a port belongs to follows its bridge membership, and
++ * the DSA core has already updated that by the time a join or a leave reaches
++ * this driver. Deriving the domain here rather than taking it from the caller
++ * gives port setup, a join, a leave and any later path that re-initialises the
++ * switch one entry point that always writes the state the port should have.
++ */
++static u16 gswip_port_fid(struct gswip_priv *priv, int port)
++{
++	struct dsa_bridge *bridge = dsa_to_port(priv->ds, port)->bridge;
++
++	if (bridge)
++		return bridge->num;
++
++	return GSWIP_FID_STANDALONE_BASE + port;
++}
++
++static int gswip_port_apply_fid(struct gswip_priv *priv, int port)
++{
++	if (!priv->hw_info->port_set_fid)
++		return 0;
++
++	return priv->hw_info->port_set_fid(priv->ds, port,
++					   gswip_port_fid(priv, port));
++}
++
+ static int gswip_port_pre_bridge_flags(struct dsa_switch *ds, int port,
+ 				       struct switchdev_brport_flags flags,
+ 				       struct netlink_ext_ack *extack)
+@@ -535,6 +560,15 @@ static int gswip_port_setup(struct dsa_switch *ds, int port)
+ 		err = gswip_add_single_port_br(priv, port, true);
+ 		if (err)
+ 			return err;
++
++		/* A port the device tree does not describe gets no domain of
++		 * its own here, which leaves it in domain 0 where nothing is
++		 * ever learned, so its frames reach the processor rather than
++		 * the fabric.
++		 */
++		err = gswip_port_apply_fid(priv, port);
++		if (err)
++			return err;
+ 	}
+ 
+ 	return 0;
+@@ -665,6 +699,19 @@ static void gswip_port_commit_pvid(struct gswip_priv *priv, int port)
+ 	regmap_write(priv->gswip, GSWIP_PCE_DEFPVID(port), idx);
+ }
+ 
++/* A model that confines the destination lookup to a forwarding domain gets one
++ * domain per bridge, not one per VLAN: the identifier the VLAN tables carry
++ * takes no part in that lookup. So a VLAN-aware bridge is fenced off from every
++ * other bridge and from every standalone port, but two of its own VLANs share a
++ * domain and a unicast between them is forwarded in hardware where the bridge
++ * would not have forwarded it.
++ *
++ * Refusing the attribute would not close that: the core turns the refusal into
++ * a no-op when a port joins an already-filtering bridge, and the port would
++ * then keep port-based VLAN mode while the bridge tagged its frames, which
++ * breaks more than it fences. The tagging behaviour below is therefore kept and
++ * the limit is documented instead; separating VLANs needs a domain per VLAN.
++ */
+ static int gswip_port_vlan_filtering(struct dsa_switch *ds, int port,
+ 				     bool vlan_filtering,
+ 				     struct netlink_ext_ack *extack)
+@@ -1061,6 +1108,11 @@ static int gswip_vlan_remove(struct gswip_priv *priv,
+ 	return 0;
+ }
+ 
++/* Defined below, and called from both sides of a bridge membership change to
++ * drop the addresses the port learned in the domain it is leaving.
++ */
++static void gswip_port_fast_age(struct dsa_switch *ds, int port);
++
+ static int gswip_port_bridge_join(struct dsa_switch *ds, int port,
+ 				  struct dsa_bridge bridge,
+ 				  bool *tx_fwd_offload,
+@@ -1079,7 +1131,28 @@ static int gswip_port_bridge_join(struct dsa_switch *ds, int port,
+ 	if (err)
+ 		return err;
+ 
+-	return gswip_add_single_port_br(priv, port, false);
++	err = gswip_add_single_port_br(priv, port, false);
++	if (err)
++		goto err_vlan;
++
++	/* Move the port into the bridge's forwarding domain. Addresses it
++	 * learned in the domain it just left name a domain it is no longer
++	 * part of, so they are dropped and the port learns again.
++	 */
++	err = gswip_port_apply_fid(priv, port);
++	if (err)
++		goto err_single;
++
++	gswip_port_fast_age(ds, port);
++
++	return 0;
++
++err_single:
++	gswip_add_single_port_br(priv, port, true);
++err_vlan:
++	gswip_vlan_remove(priv, br, port, GSWIP_VLAN_UNAWARE_PVID);
++
++	return err;
+ }
+ 
+ static void gswip_port_bridge_leave(struct dsa_switch *ds, int port,
+@@ -1087,12 +1160,26 @@ static void gswip_port_bridge_leave(struct dsa_switch *ds, int port,
+ {
+ 	struct net_device *br = bridge.dev;
+ 	struct gswip_priv *priv = ds->priv;
++	int err;
+ 
+ 	/* Add the port back to the "single-port bridge", and remove it from
+ 	 * the VLAN-unaware PVID created for this bridge.
+ 	 */
+ 	gswip_add_single_port_br(priv, port, true);
+ 	gswip_vlan_remove(priv, br, port, GSWIP_VLAN_UNAWARE_PVID);
++
++	/* Back to a domain of the port's own, and rid of the addresses it
++	 * learned in the bridge's. There is no way to refuse a leave, so a
++	 * failure here leaves the port in the domain of a bridge it is no
++	 * longer in and has to be said out loud.
++	 */
++	err = gswip_port_apply_fid(priv, port);
++	if (err)
++		dev_err(priv->dev,
++			"port %d failed to leave its forwarding domain: %d\n",
++			port, err);
++
++	gswip_port_fast_age(ds, port);
+ }
+ 
+ static int gswip_port_vlan_prepare(struct dsa_switch *ds, int port,
+@@ -1271,10 +1358,20 @@ static int gswip_port_fdb(struct dsa_switch *ds, int port,
+ 	int i;
+ 	int err;
+ 
+-	for (i = max_ports; i < ARRAY_SIZE(priv->vlans); i++) {
+-		if (priv->vlans[i].bridge == bridge) {
+-			fid = priv->vlans[i].fid;
+-			break;
++	/* Where the model confines the destination lookup to a forwarding
++	 * domain, the entry has to be planted in the domain that lookup runs
++	 * in - the port's own - rather than in the one the VLAN tables carry,
++	 * or it is never found. The port is in @bridge here, so the two ways
++	 * of naming the domain agree.
++	 */
++	if (priv->hw_info->port_set_fid) {
++		fid = gswip_port_fid(priv, port);
++	} else {
++		for (i = max_ports; i < ARRAY_SIZE(priv->vlans); i++) {
++			if (priv->vlans[i].bridge == bridge) {
++				fid = priv->vlans[i].fid;
++				break;
++			}
+ 		}
+ 	}
+ 
+@@ -1997,6 +2094,14 @@ int gswip_probe_common(struct gswip_priv *priv, u32 version)
+ 	priv->ds->phylink_mac_ops = &gswip_phylink_mac_ops;
+ 	priv->ds->priv = priv;
+ 
++	/* One forwarding domain per bridge needs one number per bridge, which
++	 * the core only hands out once it knows how many the switch can hold.
++	 * The bound is the port count: every domain is anchored on a port, so
++	 * there can be no more bridges than there are ports to put in them.
++	 */
++	if (priv->hw_info->port_set_fid)
++		priv->ds->max_num_bridges = priv->hw_info->max_ports;
++
+ 	/* The hardware has the 'major/minor' version bytes in the wrong order
+ 	 * preventing numerical comparisons. Construct a 16-bit unsigned integer
+ 	 * having the REV field as most significant byte and the MOD field as
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index d2aff6505cd2..6b9893221e97 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -95,6 +95,83 @@
+ #define GSWIP_XRX500_R_MAX_PORTS		16
+ #define GSWIP_XRX500_R_EXT_PORT			15
+ 
++/* Flow table. The rule geometry of this generation is wider than the one the
++ * common function library's table helper knows: sixteen key words and ten
++ * value words, of which the first five sit where the older layout puts its
++ * five and the remaining five continue downwards from the last key word. The
++ * helper writes the older geometry, so the rule below is written here.
++ */
++#define GSWIP_XRX500_PCE_TBL_FLOW		0x0f
++#define GSWIP_XRX500_PCE_FLOW_KEYS		16
++#define GSWIP_XRX500_PCE_FLOW_VALS		10
++#define GSWIP_XRX500_PCE_FLOW_VAL_HI(x)		(0x43c - (x))
++
++/* The field of a rule that names the frame's forwarding domain: the domain
++ * sits in the high byte of the action's VLAN word, over a low byte that
++ * indexes the active-VLAN table and is left at zero, which needs no row there.
++ *
++ * The field is declared eight bits wide and implemented as six, so the
++ * numbering in the common header has to stay inside six bits whatever the mask
++ * says.
++ */
++#define GSWIP_XRX500_PCE_FLOW_VAL2_FID		GENMASK(15, 8)
++
++/* Key words above the ingress port, for a rule that selects on the ingress
++ * port alone: every field they can express, switched off, and the
++ * sub-interface word above as the last of them.
++ *
++ * Which of these fields a macro implements is not the same across this
++ * family, and a field a macro leaves out reads back zero whatever is written
++ * to it. So every word carries its marker whether or not the macro at hand
++ * needs it: writing the marker into a field that does not exist costs
++ * nothing, and leaving it out of a field that does exist turns a disabled
++ * compare into a live one against entry zero of that field's sub-table.
++ *
++ * The last word of the table is different in kind. Its sixteen bits are not
++ * key data but one invert-this-compare flag per match field, so its neutral
++ * value is zero and the marker would turn every compare in the rule inside
++ * out. It is the one entry that stays zero.
++ *
++ * A rule whose markers are incomplete is stored, reads back intact and
++ * matches nothing, and no register read can tell it apart from a rule that
++ * matches and assigns a domain.
++ */
++static const u16 gswip_xrx500_pce_flow_key[GSWIP_XRX500_PCE_FLOW_KEYS - 1] = {
++	0x3f3f, 0x7f7f, 0x7f7f, 0x7f7f, 0x7f7f, 0x7f0f, 0x1f1f, 0x7f1f,
++	0x7f3f, 0x7f7f, 0x7f7f, 0x3f3f, 0x0000, 0x0100, 0x0000,
++};
++
++/* Action words, likewise, for a rule that assigns a forwarding domain. Only
++ * the domain itself varies per port, so it is the one word this table leaves
++ * at zero and the writer fills in.
++ *
++ * The rest are written rather than trimmed. Two of them are what enables the
++ * domain at all - the VLAN action at word 0 bit 1, and word 5 bit 3, which
++ * selects the alternative VLAN and domain the rule carries over the frame's
++ * own tag. Word 0 bit 9 enables the learning action, so the domain the rule
++ * assigns is the domain the port learns in. The others shape what that action
++ * is allowed to touch:
++ *
++ *   word 1  a forwarding port map, inert here because all three of its gates
++ *           stay clear - word 0 bit 0, word 4 bit 4 and word 6 bit 0.
++ *   word 3  bits 12 to 14 are the active-low "do not remark" selectors, which
++ *           stop the VLAN action rewriting the frame's priority fields; the
++ *           low nibble is a meter id, inert because word 0 bit 11 is clear.
++ *   word 5  bit 2 ignores the frame's inner VLAN tag for this rule.
++ *   word 6  bits 1 and 2 are the tag priority and drop-eligible remark
++ *           disables, over the port-map gate at bit 0, which stays clear.
++ *
++ * Word 9 stays zero. Its upper byte and its four mask-compare bits qualify a
++ * routing-session lookup, and the two bits that arm that lookup are clear, so
++ * there is nothing for it to qualify on a switch driven as a plain bridge.
++ *
++ * The action words are not independent of one another, so the set is written
++ * whole rather than reduced to the words a rule appears to need.
++ */
++static const u16 gswip_xrx500_pce_flow_val[GSWIP_XRX500_PCE_FLOW_VALS] = {
++	[0] = 0x0202, [1] = 0x007f, [3] = 0x700f, [5] = 0x000c, [6] = 0x0006,
++};
++
+ /* Packet MAC. It sits inside the switch's register window rather than being a
+  * device of its own, and the reset the common function library issues in
+  * setup() returns it to its defaults, so this model programs it from the
+@@ -861,6 +938,90 @@ static void gswip_xrx500_r_phylink_get_caps(struct dsa_switch *ds, int port,
+ 		MAC_10 | MAC_100 | MAC_1000;
+ }
+ 
++/* Write one ingress-classification rule: match a frame by the port it arrived
++ * on and put it in forwarding domain @fid.
++ *
++ * On this switch generation the domain a frame is classified into at ingress
++ * is the one its destination lookup runs in, so a station learned in one
++ * domain is a miss for a frame classified into another, and the
++ * unknown-destination map sends that frame to the processor rather than across
++ * the fabric. The domain a port reaches through its default VLAN or through
++ * the VLAN tables does not take part in that lookup here, which is why the
++ * common function library's VLAN-table model cannot express a forwarding
++ * domain on its own on this generation.
++ *
++ * The write follows the vendor's table sequence: wait for the previous access
++ * to retire, address the row, fill key, mask and value words, and start the
++ * access from the control word last.
++ */
++static int gswip_xrx500_flow_rule_write(struct gswip_priv *priv,
++					unsigned int slot, u16 port, u16 fid)
++{
++	u16 key[GSWIP_XRX500_PCE_FLOW_KEYS] = { port };
++	u16 val[GSWIP_XRX500_PCE_FLOW_VALS] = { };
++	unsigned int i;
++	u32 ctrl;
++	int err;
++
++	memcpy(&key[1], gswip_xrx500_pce_flow_key,
++	       sizeof(gswip_xrx500_pce_flow_key));
++	memcpy(val, gswip_xrx500_pce_flow_val,
++	       sizeof(gswip_xrx500_pce_flow_val));
++
++	val[2] = FIELD_PREP(GSWIP_XRX500_PCE_FLOW_VAL2_FID, fid);
++
++	mutex_lock(&priv->pce_table_lock);
++
++	err = regmap_read_poll_timeout(priv->gswip, GSWIP_PCE_TBL_CTRL, ctrl,
++				       !(ctrl & GSWIP_PCE_TBL_CTRL_BAS),
++				       20, 50000);
++	if (err)
++		goto out_unlock;
++
++	regmap_write(priv->gswip, GSWIP_PCE_TBL_ADDR, slot);
++
++	for (i = 0; i < ARRAY_SIZE(key); i++)
++		regmap_write(priv->gswip, GSWIP_PCE_TBL_KEY(i), key[i]);
++
++	regmap_write(priv->gswip, GSWIP_PCE_TBL_MASK, 0);
++
++	for (i = 0; i < ARRAY_SIZE(val); i++) {
++		unsigned int reg = i < 5 ? GSWIP_PCE_TBL_VAL(i) :
++					   GSWIP_XRX500_PCE_FLOW_VAL_HI(i);
++
++		regmap_write(priv->gswip, reg, val[i]);
++	}
++
++	regmap_write(priv->gswip, GSWIP_PCE_TBL_CTRL,
++		     GSWIP_PCE_TBL_CTRL_BAS | GSWIP_PCE_TBL_CTRL_VLD |
++		     GSWIP_PCE_TBL_CTRL_OPMOD_ADWR |
++		     GSWIP_XRX500_PCE_TBL_FLOW);
++
++	err = regmap_read_poll_timeout(priv->gswip, GSWIP_PCE_TBL_CTRL, ctrl,
++				       !(ctrl & GSWIP_PCE_TBL_CTRL_BAS),
++				       20, 50000);
++
++out_unlock:
++	mutex_unlock(&priv->pce_table_lock);
++
++	return err;
++}
++
++/* Each user port owns the rule in the slot of its own number, so a port's
++ * domain can be rewritten on its own without disturbing any other, and the
++ * rules a model does not use stay empty. The processor port gets none: the
++ * frames it sends carry the ports they are for.
++ */
++static int gswip_xrx500_port_set_fid(struct dsa_switch *ds, int port, u16 fid)
++{
++	struct gswip_priv *priv = ds->priv;
++
++	if (dsa_is_cpu_port(ds, port))
++		return 0;
++
++	return gswip_xrx500_flow_rule_write(priv, port, port, fid);
++}
++
+ /* Every one of these PHYs faces a switch port, so it should carry the
+  * master clock of a gigabit link rather than take it from the far end. The
+  * preference survives an autonegotiation restart, which only rewrites the
+@@ -1023,6 +1184,7 @@ static const struct gswip_xrx500_model gswip_xrx500 = {
+ 		.pce_microcode = &gswip_xrx500_pce_microcode,
+ 		.pce_microcode_size = ARRAY_SIZE(gswip_xrx500_pce_microcode),
+ 		.setup = gswip_xrx500_setup,
++		.port_set_fid = gswip_xrx500_port_set_fid,
+ 		.phylink_get_caps = gswip_xrx500_phylink_get_caps,
+ 		.tag_protocol = DSA_TAG_PROTO_GSWIP3,
+ 	},
+@@ -1048,6 +1210,7 @@ static const struct gswip_xrx500_model gswip_xrx500_r = {
+ 		.pce_microcode = &gswip_xrx500_pce_microcode,
+ 		.pce_microcode_size = ARRAY_SIZE(gswip_xrx500_pce_microcode),
+ 		.setup = gswip_xrx500_setup,
++		.port_set_fid = gswip_xrx500_port_set_fid,
+ 		.phylink_get_caps = gswip_xrx500_r_phylink_get_caps,
+ 		.tag_protocol = DSA_TAG_PROTO_GSWIP3,
+ 	},

@@ -1,0 +1,2074 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Fri, 4 Sep 2026 11:59:48 +0200
+Subject: net: lantiq: add a conduit netdev over the xRX500 buffer manager
+
+The transmit path on this SoC is a CPU enqueue into the central buffer
+manager, not a private descriptor ring. A transmit DMA channel is bound to
+one buffer-manager dequeue port and must point at that port's descriptor
+window inside the manager, so it cannot be given a ring in DRAM; length and
+the transfer request travel out of band over the manager-to-DMA handshake,
+and no completion interrupt exists on such a channel.
+
+Add a network device that transmits accordingly: take a segment out of the
+free-segment queue manager, copy the frame in at the fixed data offset,
+write one enqueue descriptor with its commit word last, and release the
+socket buffer immediately, because the hardware owns the segment from the
+commit onwards and recycles it after egress. There is no byte-queue
+accounting and no completion poll.
+
+The driver brings up what that path needs and nothing else: the segment
+pools out of reserved memory, the CPU enqueue and egress ports, the
+dequeue port that drains its datapath port, a flat one-block one-queue
+egress path in the traffic manager, the queue-index entry that steers
+the endpoint, and the transmit DMA channel. The full buffer-manager
+bring-up and the channel programming are present but off by default so
+the driver can run beside the buffer manager and DMA drivers, which own
+both.
+
+Back pressure is a segment request that answers with the exhausted-pool
+marker. Since the channel signals nothing per frame, the stopped queue is
+released by a poll of the free-segment count rather than from a receive
+context, which would never run for a transmit-only flow. Bringing the
+interface down marks the device as going down and lets the poll decline to
+rearm, rather than shutting the timer down, which is permanent and would
+leave a conduit that came back up with a release poll that could never run.
+
+A writable parameter synthesises exhausted-pool answers so the stop, the
+poll and the wake can be exercised without filling the pool. An answer is
+spent in the release poll as well as in the segment request, because the
+segment request only runs from the transmit path and the transmit path
+cannot run while the queue it stopped is stopped. The count is written from
+three places and is held under the lock the transmit path already takes
+across the segment request.
+
+The transmit header follows the big-endian variant of the layout in
+datapath/datapath_api_gswip30.h, lines 279 to 349, of the AVM GPL release.
+
+The comments state the constraints. Their sources in the AVM GPL release
+are these files:
+
+- cqm/cqm_common.h line 18 and cqm/grx500/cbm.h line 189, the data
+  offset and the alignment and pad on top of it
+- cqm/grx500/cbm.c lines 1095 to 1139, the segment geometry of the pools
+- cqm/grx500/reg/cbm.h lines 2617 to 2660, the control window
+- cqm/grx500/cbm.h line 181, the coherent alias the bus masters use
+- cqm/grx500/reg/cbm_eqm.h lines 25, 2941 and 9541, and the
+  cbm_eqm_cpu_igp_reg overlay in cqm/grx500/cbm.h line 356, the enqueue
+  manager and its CPU ingress-port window
+- cqm/grx500/cbm.c lines 1335 to 1342, the CPU ingress-port arming
+  values and sequence
+- cqm/grx500/reg/cbm_dqm.h lines 25, 155, 199 and 4839, and the
+  cbm_dqm_cpu_egp_reg overlay in cqm/grx500/cbm.h line 398, the dequeue
+  manager and its CPU egress-port window
+- cqm/grx500/cbm.c lines 1378 to 1392, the DMA egress-port configuration
+- cqm/grx500/cbm.c lines 1404 to 1441, the CPU egress-port configuration
+- cqm/grx500/reg/cbm_desc64b.h, the descriptor-staging windows
+- cqm/grx500/reg/fsqm.h, the free-segment queue manager
+- cqm/grx500/cbm.c lines 1086 to 1139, the free-segment manager
+  bring-up, its list sentinel, interrupt enables, highest segment
+  address and write order
+- cbm_buffer_alloc_grx500() in cqm/grx500/cbm.c, the exhausted-pool
+  marker
+- cqm/cqm_common.h line 19, the retry budget of a segment request
+- tmu/drv_tmu_reg.h, the traffic-management register offsets
+- tmu/drv_tmu_ll.c lines 2754 to 2782, the scheduler input without a
+  shaper, token-bucket id 255
+- tmu/drv_tmu_ll.h lines 59 to 99 and tmu/drv_tmu_ll.c lines 526 to 550,
+  the queue threshold defaults and how they are written
+- tmu/drv_tmu_ll.c lines 2819 to 2847, the scheduler-block input
+  numbering and the flat egress path
+- drivers/dma/intel/hdma.c, the DMA register offsets, and its lines 661
+  to 683, the split channel-class field
+- cqm/grx500/cbm_config.c, the dequeue-DMA rows, joined to the
+  endpoint-group table in cqm/grx500/cbm.c lines 566 to 600
+- cqm/grx500/cbm.c lines 1787 to 1789 and 2560 to 2578, the enqueue
+  descriptor word order and its commit word
+- tmu/drv_tmu_ll.c lines 1535 to 1549, the indirect-table command, whose
+  wait the vendor leaves unbounded
+- tmu/drv_tmu_ll.c lines 454 to 470, 490 to 506, 846 to 864 and 866 to
+  884, the queue and egress-port mapping tables
+- tmu/drv_tmu_ll.c lines 2230 to 2252, the scheduler-block output link
+- cqm/grx500/cbm.c lines 1458 to 1476, the queue-index table slot of a
+  CPU enqueue, and the probe-time drop fill of the table
+- cqm/grx500/cbm.c line 1039 and its call sites at lines 2645 and 2695,
+  which return a segment on the running CPU's port
+- cqm/grx500/cbm.c lines 5753 to 5759, whose comment states why every
+  CPU egress port is armed
+- cqm/grx500/cbm.c lines 5605 to 5657, the order in which the managers
+  are enabled, and the controller enable it keeps apart from the
+  hardware init
+
+Assisted-by: Claude:claude-opus-5
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/Kconfig b/drivers/net/ethernet/lantiq/Kconfig
+index 0071cfad7b55..3555745233a7 100644
+--- a/drivers/net/ethernet/lantiq/Kconfig
++++ b/drivers/net/ethernet/lantiq/Kconfig
+@@ -40,4 +40,19 @@ config INTEL_XRX500_BM
+ 
+ 	  Say N unless you are bringing this datapath up.
+ 
++config INTEL_XRX500_CBM_CONDUIT
++	bool "xRX500 buffer-manager conduit network device"
++	depends on INTEL_XRX500_BM
++	default n
++	help
++	  Conduit network device for the xRX500 central buffer manager: one
++	  netdev per switch macro whose transmit path enqueues into the
++	  buffer manager and whose receive path terminates that macro's own
++	  receive DMA ring.
++
++	  This is what a DSA switch driver for the macros binds as its
++	  conduit; without it the switch has no processor port.
++
++	  Say N unless you are bringing this datapath up.
++
+ endif # INTEL_XRX500_NET
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index f0313921e9df..2fd1f944aeb9 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -14,3 +14,9 @@ intel-xrx500-bm-y += cqm/grx500/cbm_intr.o cqm/grx500/fsqm.o cqm/grx500/cbm_dma.
+ intel-xrx500-bm-y += cqm/grx500/cbm_ports.o
+ intel-xrx500-bm-y += dma/hdma.o
+ intel-xrx500-bm-y += tmu/tmu_init.o tmu/drv_tmu_ll.o
++
++#
++# The buffer-manager conduit netdev. Built in, never a module: its transmit
++# path calls MIPS cache maintenance which is not exported to modules.
++#
++obj-$(CONFIG_INTEL_XRX500_CBM_CONDUIT) += xrx500-cbm.o
+diff --git a/drivers/net/ethernet/lantiq/xrx500-cbm.c b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+new file mode 100644
+index 000000000000..25e1d6cb08a2
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+@@ -0,0 +1,1925 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Conduit network device for the xRX500 central buffer manager.
++ *
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c, cqm/grx500/cbm_config.c,
++ * tmu/drv_tmu_ll.c and drivers/dma/intel/hdma.c.
++ *
++ * The transmit path on this silicon is a CPU enqueue into the buffer manager,
++ * not a private descriptor ring. A transmit DMA channel is hard-bound to one
++ * buffer-manager dequeue port and its descriptor base must point at that
++ * port's descriptor window inside the manager, so the channel cannot be given
++ * a ring in DRAM. Frame length and the transfer request travel out of band
++ * over the manager-to-DMA handshake rather than in the descriptor, and no
++ * completion interrupt exists on such a channel. Transmitting therefore means:
++ * take a segment out of the free-segment queue manager, copy the frame into it
++ * at the fixed data offset, write one enqueue descriptor, and let the hardware
++ * recycle the segment after egress.
++ */
++
++#include <linux/bitops.h>
++#include <linux/build_bug.h>
++#include <linux/cleanup.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/errno.h>
++#include <linux/etherdevice.h>
++#include <linux/if_ether.h>
++#include <linux/if_vlan.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/mutex.h>
++#include <linux/netdevice.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/platform_device.h>
++#include <linux/printk.h>
++#include <linux/skbuff.h>
++#include <linux/spinlock.h>
++#include <linux/timer.h>
++#include <linux/types.h>
++
++#include <asm/barrier.h>
++#include <asm/io.h>
++
++#define XRX500_CBM_DRV_NAME "xrx500-cbm"
++
++/*
++ * Data offset inside a buffer-manager segment.
++ *
++ * The offset is 128 bytes of DMA data offset with the network stack's own
++ * alignment and pad on top. NET_SKB_PAD is not an ABI constant, so the
++ * composed offset is asserted at build time rather than assumed.
++ */
++#define XRX500_CBM_DMA_DATA_OFFSET	128
++#define XRX500_CBM_TX_OFFSET \
++	(XRX500_CBM_DMA_DATA_OFFSET + NET_IP_ALIGN + NET_SKB_PAD)
++
++/* Segment geometry of the standard pool. */
++#define XRX500_CBM_STD_SEG_SIZE		2048U
++#define XRX500_CBM_JBO_SEG_SIZE		8192U
++
++/*
++ * The switch enforces a 1500 byte payload ceiling on this core; raising the
++ * MAC frame-length limit does not move it. The conduit advertises the
++ * enforced value rather than what the segment arithmetic would allow.
++ */
++#define XRX500_CBM_MAX_MTU		ETH_DATA_LEN
++
++/* Buffer-manager register windows */
++
++/*
++ * Control window.
++ *   0x200 standard-pool base, physical
++ *   0x204 standard-pool base, coherent alias
++ *   0x208 jumbo-pool base, physical
++ *   0x20C jumbo-pool base, coherent alias
++ *   0x210 control; bit 17 selects the jumbo segment size
++ */
++#define CBM_SBA_0			0x200
++#define CBM_SBA_1			0x204
++#define CBM_JBA_0			0x208
++#define CBM_JBA_1			0x20C
++#define CBM_CTRL			0x210
++#define CBM_CTRL_JSEL			BIT(17)
++
++/* The bus masters address the pools through the coherent alias. */
++#define CBM_COHERENT_ALIAS(addr)	((((u32)(addr)) & 0x1FFFFFFF) | 0xC0000000)
++
++/*
++ * Enqueue manager. Per-port windows are 4 KiB apart.
++ */
++#define CBM_EQM_CTRL			0x0000
++#define CBM_EQM_CTRL_EN			BIT(0)
++#define CBM_EQM_CTRL_QEN		BIT(4)
++#define CBM_EQM_CTRL_SNOOPEN		BIT(6)
++#define CBM_EQM_CTRL_PDEN		BIT(8)
++#define CBM_EQM_CTRL_DLYSEL		(3U << 9)
++
++#define CBM_EQM_CPU_IGP_0		0x10000
++#define CBM_EQM_PORT_STRIDE		0x1000
++
++#define CBM_EQM_IGP_CFG			0x00
++#define CBM_EQM_IGP_POCC		0x08
++#define CBM_EQM_IGP_IRNEN		0x28
++#define CBM_EQM_IGP_DCNTR		0x4C
++#define CBM_EQM_IGP_NEW_SPTR		0x80
++#define CBM_EQM_IGP_DESC0		0x100
++
++/* CPU ingress-port arming values. */
++#define CBM_EQM_CPU_IGP_CFG_VAL		0xFC7
++#define CBM_EQM_CPU_IGP_IRNEN_ALL	0x3F
++#define CBM_EQM_IGP_DCNTR_DLY		0x10
++
++/* Dequeue manager. */
++#define CBM_DQM_CTRL			0x0000
++#define CBM_DQM_CTRL_EN			BIT(0)
++#define CBM_DQM_CTRL_QEN		BIT(4)
++
++#define CBM_DQM_CPU_EGP_0		0x10000
++#define CBM_DQM_DMA_EGP_6		0x16000
++#define CBM_DQM_PORT_STRIDE		0x1000
++
++#define CBM_DQM_EGP_CFG			0x00
++#define CBM_DQM_EGP_PTR_RTN		0x80
++
++#define CBM_DQM_EGP_CFG_EPMAP_SHIFT	16
++#define CBM_DQM_EGP_CFG_EPMAP_MASK	0x7F0000U
++/* Dequeue request plus per-port counting. */
++#define CBM_DQM_DMA_EGP_CFG_DQREQ	BIT(0)
++#define CBM_DQM_DMA_EGP_CFG_DQPCEN	BIT(8)
++/* CPU egress-port config. */
++#define CBM_DQM_CPU_EGP_CFG_VAL		0x10F
++
++/* One descriptor-staging window per port. */
++#define CBM_DESC_EGP_5			0x40000
++#define CBM_DESC_PORT_STRIDE		0x1000
++#define CBM_DESC_PER_DMA_PORT		2
++
++/*
++ * Free-segment queue manager. Two instances, one per pool. RCNT and RAM are
++ * large indexed arrays, one word per segment.
++ */
++#define FSQM_CTRL			0x00000
++#define FSQM_IO_BUF_RD			0x00008
++#define FSQM_IO_BUF_WR			0x0000C
++#define FSQM_IRNEN			0x00018
++#define FSQM_OFSQ			0x00024
++#define FSQM_OFSC			0x0002C
++#define FSQM_FSQT0			0x00030
++#define FSQM_FSQT1			0x00070
++#define FSQM_FSQT2			0x000B0
++#define FSQM_FSQT3			0x000F0
++#define FSQM_FSQT4			0x00130
++#define FSQM_LSARNG			0x00180
++#define FSQM_RCNT			0x80000
++#define FSQM_RAM			0xC0000
++
++#define FSQM_LSARNG_MAX_SHIFT		16
++#define FSQM_OFSQ_TAIL_SHIFT		16
++#define FSQM_OFSC_MASK			0x00007FFFU
++/* The last list slot carries this sentinel. */
++#define FSQM_LIST_END			0x7FFFU
++/* Interrupt-enable composition. */
++#define FSQM_IRNEN_VAL			0x0111101FU
++
++/*
++ * A segment request answers with this value when the pool is exhausted. The
++ * same constant doubles as the segment-aligned address mask on the return
++ * path.
++ */
++#define FSQM_POOL_EMPTY			0xFFFFF800U
++/* Default retry budget for a segment request. */
++#define FSQM_ALLOC_RETRIES		20U
++
++#define CBM_CPU_PORT_NUM		4
++
++/* Traffic-management unit */
++
++/* Register offsets. */
++#define TMU_CTRL			0x000
++#define TMU_CTRL_ACT_EN			BIT(0)
++#define TMU_QEMT			0x200
++#define TMU_QSMT			0x210
++#define TMU_QTHT0			0x220
++#define TMU_QTHT1			0x224
++#define TMU_QTHT2			0x228
++#define TMU_QTHT3			0x22C
++#define TMU_QTHT4			0x230
++#define TMU_QMTC			0x270
++#define TMU_EPMT			0x300
++#define TMU_EPMTC			0x340
++#define TMU_SBITR0			0x400
++#define TMU_SBITR1			0x404
++#define TMU_SBITR2			0x408
++#define TMU_SBITR3			0x40C
++#define TMU_SBITC			0x410
++#define TMU_SBOTR0			0x420
++#define TMU_SBOTC			0x430
++#define TMU_CFGEPN			0x71C
++#define TMU_CFGCMD			0x720
++
++#define TMU_QMTC_QEW			BIT(8)
++#define TMU_QMTC_QSW			BIT(9)
++#define TMU_QMTC_QTW			BIT(10)
++#define TMU_QMTC_QEV			BIT(24)
++#define TMU_QMTC_QSV			BIT(25)
++#define TMU_QMTC_QTV			BIT(26)
++
++#define TMU_EPMT_EPE			BIT(31)
++#define TMU_EPMT_SBID_MASK		0x0000007FU
++#define TMU_EPMTC_EMW			BIT(8)
++#define TMU_EPMTC_EMR			BIT(16)
++#define TMU_EPMTC_EMV			BIT(24)
++#define TMU_EPMTC_EOV			BIT(25)
++#define TMU_EPMTC_ETV			BIT(26)
++#define TMU_EPMTC_EDV			BIT(27)
++#define TMU_EPMTC_VAL \
++	(TMU_EPMTC_EMV | TMU_EPMTC_EOV | TMU_EPMTC_ETV | TMU_EPMTC_EDV)
++#define TMU_EPMTC_EPN_MASK		0x0000007FU
++
++#define TMU_SBOTR0_SOE			BIT(31)
++#define TMU_SBOTR0_LVL_SHIFT		16
++#define TMU_SBOTR0_LVL_MASK		0x00070000U
++#define TMU_SBOTR0_OMID_MASK		0x000003FFU
++#define TMU_SBOTC_VAL			BIT(18)
++#define TMU_SBOTC_WRITE			BIT(16)
++
++#define TMU_SBITR0_SIE			BIT(31)
++#define TMU_SBITR0_QSID_MASK		0x000000FFU
++#define TMU_SBITC_VAL			BIT(18)
++#define TMU_SBITC_SEL			BIT(17)
++#define TMU_SBITC_WRITE			BIT(16)
++/* Token-bucket id 255 means no shaper on this input. */
++#define TMU_SBIT_NO_SHAPER		255
++
++#define TMU_QEMT_EPN_MASK		0x0000007FU
++#define TMU_QSMT_SBIN_MASK		0x000003FFU
++#define TMU_QTHT0_QE			BIT(31)
++
++#define TMU_CFGCMD_VAL			BIT(16)
++#define TMU_CFGCMD_EP_ON		0xB0000000U
++#define TMU_CFGCMD_SB_INPUT_ON		0x00000000U
++#define TMU_CFGSBIN_MASK		0x000003FFU
++
++/*
++ * Queue threshold defaults. The queue this driver creates gets the default
++ * tail-drop and weighted-random-drop configuration of an egress queue.
++ */
++#define TMU_EPTT0_DEFAULT		0x120
++#define TMU_QTHT0_DEFAULT		0x00011320U
++#define TMU_QTHT1_DEFAULT		((TMU_EPTT0_DEFAULT / 8) / 2)
++#define TMU_QTHT2_DEFAULT		(TMU_EPTT0_DEFAULT / 8)
++#define TMU_QTHT3_DEFAULT		0x0FFF
++#define TMU_QTHT4_0_DEFAULT		0x0004
++#define TMU_QTHT4_1_DEFAULT		0x0000
++
++/*
++ * A scheduler-block input id is the block id shifted by three plus the input
++ * index. The first sixteen block ids are reserved, so a queue id maps to its
++ * block by subtracting this base.
++ */
++#define TMU_SBID_BASE			16
++#define TMU_SBIN_SHIFT			3
++
++/* An indirect table command completes within a bounded number of reads. */
++#define TMU_CMD_TIMEOUT_US		1000
++
++/* Transmit DMA controller */
++
++/*
++ * Register offsets. The per-channel registers
++ * are a window selected by writing the channel number to the channel-select
++ * register, so a channel access is select-then-touch and the pair has to be
++ * atomic against every other user of the same controller.
++ *
++ * The selector is shared with the DMA driver under a lock this driver cannot
++ * take, so the channel is touched at probe only. The other users of the
++ * selector on this controller are the per-channel interrupt path, which
++ * cannot run because these channels raise no interrupt, and a port enable
++ * that returns early once a port is armed.
++ *
++ * The register file aliases above 0x100 and offset 0x0C is a decode hole that
++ * raises a bus error, so nothing here reads outside the named offsets.
++ */
++#define DMA_ID				0x0008
++#define DMA_CTRL			0x0010
++#define DMA_CTRL_DS_FOD			BIT(7)
++#define DMA_CS				0x0018
++#define DMA_CCTRL			0x001C
++#define DMA_CCTRL_ON			BIT(0)
++#define DMA_CCTRL_DIR_TX		BIT(8)
++#define DMA_CCTRL_CLASS_SHIFT		9
++#define DMA_CCTRL_CLASS_MASK		0x000E00U
++#define DMA_CCTRL_CLASSH_SHIFT		18
++#define DMA_CCTRL_CLASSH_MASK		0x0C0000U
++#define DMA_CDBA			0x0020
++#define DMA_CDLEN			0x0024
++#define DMA_CIE				0x002C
++
++/* Datapath egress resources */
++
++/**
++ * struct xrx500_cbm_egress - egress resources of one datapath port.
++ * @dp_port:  datapath port id, which is also the switch port number.
++ * @deq_port: buffer-manager dequeue port that drains the port.
++ * @tmu_qid:  traffic-management queue feeding @deq_port.
++ * @dma_chan: channel number within the transmit DMA controller.
++ *
++ * Only the rows for ports served by the internal switch are carried: the
++ * dequeue port is a table lookup, not a closed form, and the six consecutive
++ * rows below make it look like one.
++ *
++ * The traffic-management egress-port number equals the dequeue port number on
++ * this silicon, so no separate column is needed for it.
++ */
++struct xrx500_cbm_egress {
++	u32 dp_port;
++	u32 deq_port;
++	u32 tmu_qid;
++	u32 dma_chan;
++};
++
++static const struct xrx500_cbm_egress xrx500_cbm_egress_tbl[] = {
++	{ .dp_port = 2, .deq_port =  7, .tmu_qid = 17, .dma_chan = 2 },
++	{ .dp_port = 3, .deq_port =  8, .tmu_qid = 18, .dma_chan = 3 },
++	{ .dp_port = 4, .deq_port =  9, .tmu_qid = 19, .dma_chan = 4 },
++	{ .dp_port = 5, .deq_port = 10, .tmu_qid = 20, .dma_chan = 5 },
++};
++
++/* Wire format */
++
++/*
++ * Eight-byte switch header prepended to a transmitted frame.
++ *
++ * Byte 3 carries, from its most significant bit down: the egress-port-map
++ * enable, one reserved bit, the timestamp disable, and the class enable. So
++ * the two bits this driver sets are bit 7 and bit 4. Byte 4 bit 6 redirects to
++ * the second switch instance, which no port served here needs. Bytes 6 and 7
++ * hold the sixteen-bit egress-port map: byte 7 covers ports up to seven and
++ * byte 6 the ports above them.
++ */
++#define PMAC_TX_HDR_LEN			8
++#define PMAC_TX_B3_PORT_MAP_EN		BIT(7)
++#define PMAC_TX_B3_CLASS_EN		BIT(4)
++
++/*
++ * Enqueue descriptor word order in the CPU ingress-port window:
++ *   +0x0 destination sub-interface
++ *   +0x4 endpoint and colour
++ *   +0x8 data pointer, eight-byte aligned
++ *   +0xC ownership, length and the residual byte offset; written last
++ */
++#define CBM_TXD_DW1_EP_SHIFT		8
++#define CBM_TXD_DW1_EP_MASK		0x00000F00U
++#define CBM_TXD_DW1_COLOR_SHIFT		12
++#define CBM_TXD_DW1_COLOR_GREEN		1U
++#define CBM_TXD_DW3_SOP			BIT(29)
++#define CBM_TXD_DW3_EOP			BIT(28)
++#define CBM_TXD_DW3_BYTE_OFF_SHIFT	23
++#define CBM_TXD_DW3_LEN_MASK		0x0000FFFFU
++
++/* Driver state */
++
++/**
++ * struct xrx500_cbm_pool - one hardware-managed segment pool.
++ * @phys:     physical base of the reserved region.
++ * @virt:     write-back mapping of the same region.
++ * @size:     usable size after alignment.
++ * @seg_size: segment size the manager hands out.
++ * @segs:     number of segments in the pool.
++ */
++struct xrx500_cbm_pool {
++	phys_addr_t phys;
++	void *virt;
++	size_t size;
++	u32 seg_size;
++	u32 segs;
++};
++
++/**
++ * struct xrx500_cbm_stats - transmit accounting the hardware cannot provide.
++ * @pops:       segments taken out of the free-segment manager.
++ * @rollbacks:  segments handed back because the enqueue never happened.
++ * @pool_empty: segment requests that found the pool exhausted.
++ * @stops:      times the transmit queue was stopped for back pressure.
++ * @wakes:      times the restart poll released the queue.
++ * @polls:      restart-poll invocations.
++ *
++ * @pops minus @rollbacks is the number of segments handed to the hardware. On
++ * a healthy path that difference grows without bound while the manager's own
++ * free-segment count stays level, because the hardware recycles each segment
++ * after egress. A free-segment count that walks down instead is the signature
++ * of a segment the hardware never took ownership of.
++ */
++struct xrx500_cbm_stats {
++	u64 pops;
++	u64 rollbacks;
++	u64 pool_empty;
++	u64 stops;
++	u64 wakes;
++	u64 polls;
++};
++
++/**
++ * struct xrx500_cbm - conduit driver state.
++ * @dev:         backing platform device.
++ * @ndev:        the conduit network device.
++ * @cbm:         buffer-manager control window.
++ * @eqm:         enqueue-manager window.
++ * @dqm:         dequeue-manager window.
++ * @desc:        descriptor-staging window shared by both managers.
++ * @qidt:        queue-index table window.
++ * @tmu:         traffic-management window.
++ * @fsqm:        the two free-segment manager instances.
++ * @dma:         transmit DMA controller window.
++ * @dma_desc_pa: physical base of @desc, needed as a DMA descriptor base.
++ * @std:         standard segment pool.
++ * @jbo:         jumbo segment pool.
++ * @eg:          egress resources of the datapath port this conduit serves.
++ * @tx_lock:     serialises the enqueue window against itself.
++ * @tmu_lock:    serialises the traffic-management indirect table.
++ * @restart:     back-pressure release poll.
++ * @stats:       transmit accounting.
++ * @force_empty: remaining synthetic pool-empty answers, for exercising the
++ *               back-pressure path on a pool that is never really exhausted.
++ *               Guarded by the transmit lock, which both spenders hold.
++ * @closing:     the device is going down; the release poll must not rearm.
++ */
++struct xrx500_cbm {
++	struct device *dev;
++	struct net_device *ndev;
++
++	void __iomem *cbm;
++	void __iomem *eqm;
++	void __iomem *dqm;
++	void __iomem *desc;
++	void __iomem *qidt;
++	void __iomem *tmu;
++	void __iomem *fsqm[2];
++	void __iomem *dma;
++	phys_addr_t dma_desc_pa;
++
++	struct xrx500_cbm_pool std;
++	struct xrx500_cbm_pool jbo;
++
++	struct xrx500_cbm_egress eg;
++
++	/* serialises the enqueue window against itself */
++	spinlock_t tx_lock;
++	/* serialises the traffic manager's indirect-table staging window */
++	spinlock_t tmu_lock;
++	struct timer_list restart;
++
++	struct xrx500_cbm_stats stats;
++	unsigned int force_empty;
++	bool closing;
++};
++
++/*
++ * Datapath port this conduit transmits on. The value indexes the egress table
++ * above and is also the switch port number the frame egresses from.
++ */
++static unsigned int dp_port = 3;
++module_param(dp_port, uint, 0444);
++MODULE_PARM_DESC(dp_port, "datapath port the conduit transmits on");
++
++/*
++ * Take ownership of the buffer manager: seed both segment pools, program the
++ * pool bases and enable both managers. Off by default, because the shipped
++ * buffer-manager driver performs the same bring-up and a second pass would
++ * discard the live free-segment list.
++ */
++static bool own_cbm;
++module_param(own_cbm, bool, 0444);
++MODULE_PARM_DESC(own_cbm, "run the full buffer-manager bring-up");
++
++/*
++ * Program the transmit DMA channel rather than only verifying it. Off by
++ * default: the channel is already armed for this dequeue port, and once armed
++ * a buffer-manager-managed channel is meant to stay armed.
++ */
++static bool own_dma_chan;
++module_param(own_dma_chan, bool, 0444);
++MODULE_PARM_DESC(own_dma_chan, "program the transmit DMA channel");
++
++/* Writing this reports the transmit counters and the free-segment count. */
++static int tx_report;
++static int xrx500_cbm_set_report(const char *val,
++				 const struct kernel_param *kp);
++static const struct kernel_param_ops xrx500_cbm_report_ops = {
++	.set = xrx500_cbm_set_report,
++	.get = param_get_int,
++};
++module_param_cb(tx_report, &xrx500_cbm_report_ops, &tx_report, 0644);
++MODULE_PARM_DESC(tx_report, "write to log transmit counters");
++
++/*
++ * Writing N makes the next N answers about the pool report it as exhausted.
++ * The transmit path spends one per segment request and the release poll one
++ * per invocation, so N drives the stop, the poll and the wake in turn.
++ */
++static unsigned int tx_force_empty;
++static int xrx500_cbm_set_force_empty(const char *val,
++				      const struct kernel_param *kp);
++static const struct kernel_param_ops xrx500_cbm_force_empty_ops = {
++	.set = xrx500_cbm_set_force_empty,
++	.get = param_get_uint,
++};
++module_param_cb(tx_force_empty, &xrx500_cbm_force_empty_ops,
++		&tx_force_empty, 0644);
++MODULE_PARM_DESC(tx_force_empty,
++		 "synthesise N exhausted-pool segment requests");
++
++/*
++ * The parameter callbacks below reach the driver through this pointer, so it
++ * has to stay valid for as long as one of them is running.
++ */
++static DEFINE_MUTEX(xrx500_cbm_lock);
++static struct xrx500_cbm *xrx500_cbm_singleton;
++
++/* Register access */
++
++/*
++ * The datapath initiators are strapped big-endian and the descriptor windows
++ * are byte-ordered accordingly, so every access is a raw one. Adding a
++ * byte-swapping accessor here would transpose the descriptor words.
++ */
++static inline u32 cbm_r32(void __iomem *base, u32 off)
++{
++	return __raw_readl(base + off);
++}
++
++static inline void cbm_w32(void __iomem *base, u32 off, u32 val)
++{
++	__raw_writel(val, base + off);
++}
++
++static inline u32 eqm_cpu_off(u32 pid, u32 reg)
++{
++	return CBM_EQM_CPU_IGP_0 + pid * CBM_EQM_PORT_STRIDE + reg;
++}
++
++static inline u32 dqm_cpu_off(u32 pid, u32 reg)
++{
++	return CBM_DQM_CPU_EGP_0 + pid * CBM_DQM_PORT_STRIDE + reg;
++}
++
++/* Traffic-management unit */
++
++/*
++ * Each indirect table is written by staging the payload registers, then
++ * writing a command word, then waiting for the command's own valid bit. The
++ * wait is bounded.
++ *
++ * The staging registers are a single global window, so a stage-then-command
++ * pair has to exclude every other writer of the same window. That exclusion
++ * is incomplete, because the traffic-management driver holds a lock of its
++ * own. The exposure is bounded to probe: this driver writes these tables once
++ * and never again.
++ */
++static int tmu_poll_valid(struct xrx500_cbm *priv, u32 cmd_off, u32 val_bit)
++{
++	u32 tmp;
++	int i;
++
++	for (i = 0; i < TMU_CMD_TIMEOUT_US; i++) {
++		tmp = cbm_r32(priv->tmu, cmd_off);
++		if (tmp & val_bit)
++			return 0;
++		udelay(1);
++	}
++	return -ETIMEDOUT;
++}
++
++static int tmu_write_cmd(struct xrx500_cbm *priv, u32 cmd_off, u32 cmd,
++			 u32 val_bit)
++{
++	cbm_w32(priv->tmu, cmd_off, cmd);
++	return tmu_poll_valid(priv, cmd_off, val_bit);
++}
++
++/* Queue-to-egress-port mapping. */
++static int tmu_queue_map_port(struct xrx500_cbm *priv, u32 qid, u32 epn)
++{
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&priv->tmu_lock, flags);
++	cbm_w32(priv->tmu, TMU_QEMT, epn & TMU_QEMT_EPN_MASK);
++	ret = tmu_write_cmd(priv, TMU_QMTC, TMU_QMTC_QEW | qid, TMU_QMTC_QEV);
++	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	return ret;
++}
++
++/* Queue-to-scheduler-input mapping. */
++static int tmu_queue_map_sched(struct xrx500_cbm *priv, u32 qid, u32 sbin)
++{
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&priv->tmu_lock, flags);
++	cbm_w32(priv->tmu, TMU_QSMT, sbin & TMU_QSMT_SBIN_MASK);
++	ret = tmu_write_cmd(priv, TMU_QMTC, TMU_QMTC_QSW | qid, TMU_QMTC_QSV);
++	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	return ret;
++}
++
++/* Queue thresholds with the queue enabled. */
++static int tmu_queue_enable(struct xrx500_cbm *priv, u32 qid)
++{
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&priv->tmu_lock, flags);
++	cbm_w32(priv->tmu, TMU_QTHT0, TMU_QTHT0_DEFAULT | TMU_QTHT0_QE);
++	cbm_w32(priv->tmu, TMU_QTHT1,
++		(TMU_QTHT1_DEFAULT << 16) | TMU_QTHT1_DEFAULT);
++	cbm_w32(priv->tmu, TMU_QTHT2,
++		(TMU_QTHT2_DEFAULT << 16) | TMU_QTHT2_DEFAULT);
++	cbm_w32(priv->tmu, TMU_QTHT3,
++		(TMU_QTHT3_DEFAULT << 16) | TMU_QTHT3_DEFAULT);
++	cbm_w32(priv->tmu, TMU_QTHT4,
++		(TMU_QTHT4_1_DEFAULT << 16) | TMU_QTHT4_0_DEFAULT);
++	ret = tmu_write_cmd(priv, TMU_QMTC, TMU_QMTC_QTW | qid, TMU_QMTC_QTV);
++	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	return ret;
++}
++
++/* Egress-port mapping entry read. */
++static int tmu_port_map_read(struct xrx500_cbm *priv, u32 epn, bool *enabled,
++			     u32 *sbid)
++{
++	unsigned long flags;
++	int ret;
++	u32 tmp;
++
++	spin_lock_irqsave(&priv->tmu_lock, flags);
++	ret = tmu_write_cmd(priv, TMU_EPMTC,
++			    TMU_EPMTC_EMR | (epn & TMU_EPMTC_EPN_MASK),
++			    TMU_EPMTC_VAL);
++	tmp = cbm_r32(priv->tmu, TMU_EPMT);
++	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	if (ret)
++		return ret;
++
++	*sbid = tmp & TMU_EPMT_SBID_MASK;
++	*enabled = !!(tmp & TMU_EPMT_EPE);
++	return 0;
++}
++
++/* Egress-port mapping entry write. */
++static int tmu_port_map_write(struct xrx500_cbm *priv, u32 epn, bool enable,
++			      u32 sbid)
++{
++	unsigned long flags;
++	u32 tmp = sbid & TMU_EPMT_SBID_MASK;
++	int ret;
++
++	if (enable)
++		tmp |= TMU_EPMT_EPE;
++
++	spin_lock_irqsave(&priv->tmu_lock, flags);
++	cbm_w32(priv->tmu, TMU_EPMT, tmp);
++	ret = tmu_write_cmd(priv, TMU_EPMTC,
++			    TMU_EPMTC_EMW | (epn & TMU_EPMTC_EPN_MASK),
++			    TMU_EPMTC_VAL);
++	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	return ret;
++}
++
++/*
++ * Link a scheduler block's output to an egress port. The level and the
++ * output-member id are those of a flat, single-level topology.
++ */
++static int tmu_sched_link_port(struct xrx500_cbm *priv, u32 sbid, u32 epn)
++{
++	unsigned long flags;
++	bool enabled;
++	u32 linked;
++	u32 sbot0;
++	int ret;
++
++	sbot0 = TMU_SBOTR0_SOE;
++	sbot0 |= (0U << TMU_SBOTR0_LVL_SHIFT) & TMU_SBOTR0_LVL_MASK;
++	sbot0 |= epn & TMU_SBOTR0_OMID_MASK;
++
++	spin_lock_irqsave(&priv->tmu_lock, flags);
++	cbm_w32(priv->tmu, TMU_SBOTR0, sbot0);
++	ret = tmu_write_cmd(priv, TMU_SBOTC, TMU_SBOTC_WRITE | sbid,
++			    TMU_SBOTC_VAL);
++	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	if (ret)
++		return ret;
++
++	/* The egress port points back at the block that feeds it. */
++	ret = tmu_port_map_read(priv, epn, &enabled, &linked);
++	if (ret)
++		return ret;
++	return tmu_port_map_write(priv, epn, enabled, sbid);
++}
++
++/* Link a scheduler-block input to a queue with no shaper. */
++static int tmu_sched_link_queue(struct xrx500_cbm *priv, u32 sbin, u32 qid)
++{
++	unsigned long flags;
++	u32 sbit0 = TMU_SBITR0_SIE | (qid & TMU_SBITR0_QSID_MASK);
++	int ret;
++
++	spin_lock_irqsave(&priv->tmu_lock, flags);
++	cbm_w32(priv->tmu, TMU_SBITR0, sbit0);
++	cbm_w32(priv->tmu, TMU_SBITR1, TMU_SBIT_NO_SHAPER);
++	cbm_w32(priv->tmu, TMU_SBITR2, 0);
++	cbm_w32(priv->tmu, TMU_SBITR3, 0);
++	ret = tmu_write_cmd(priv, TMU_SBITC,
++			    TMU_SBITC_WRITE | TMU_SBITC_SEL | sbin,
++			    TMU_SBITC_VAL);
++	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	return ret;
++}
++
++/* Commit an egress-port or scheduler-input state change. */
++static int tmu_config_cmd(struct xrx500_cbm *priv, u32 cmd)
++{
++	unsigned long flags;
++	int ret;
++
++	spin_lock_irqsave(&priv->tmu_lock, flags);
++	ret = tmu_write_cmd(priv, TMU_CFGCMD, cmd, TMU_CFGCMD_VAL);
++	spin_unlock_irqrestore(&priv->tmu_lock, flags);
++	return ret;
++}
++
++/**
++ * xrx500_cbm_tmu_egress_path() - build the egress path of one dequeue port.
++ * @priv: driver state.
++ *
++ * One scheduler block, one queue, no shaper and no weight. That is the only
++ * topology this datapath needs. The egress-port number equals the dequeue
++ * port number and the scheduler block id is the queue id less the reserved
++ * base.
++ */
++static int xrx500_cbm_tmu_egress_path(struct xrx500_cbm *priv)
++{
++	u32 epn = priv->eg.deq_port;
++	u32 qid = priv->eg.tmu_qid;
++	u32 sbid = qid - TMU_SBID_BASE;
++	u32 sbin = sbid << TMU_SBIN_SHIFT;
++	int ret;
++
++	if (!(cbm_r32(priv->tmu, TMU_CTRL) & TMU_CTRL_ACT_EN)) {
++		dev_info(priv->dev, "traffic manager not active yet\n");
++		return -EPROBE_DEFER;
++	}
++
++	/* Scheduler block feeds the egress port, and the port points back. */
++	ret = tmu_sched_link_port(priv, sbid, epn);
++	if (ret)
++		return ret;
++
++	/* Enable the egress port and commit the change. */
++	ret = tmu_port_map_write(priv, epn, true, sbid);
++	if (ret)
++		return ret;
++	ret = tmu_config_cmd(priv, TMU_CFGCMD_EP_ON |
++				   (epn & TMU_EPMTC_EPN_MASK));
++	if (ret)
++		return ret;
++
++	ret = tmu_queue_map_port(priv, qid, epn);
++	if (ret)
++		return ret;
++	ret = tmu_queue_map_sched(priv, qid, sbin);
++	if (ret)
++		return ret;
++	ret = tmu_queue_enable(priv, qid);
++	if (ret)
++		return ret;
++
++	ret = tmu_config_cmd(priv, TMU_CFGCMD_SB_INPUT_ON |
++				   (sbin & TMU_CFGSBIN_MASK));
++	if (ret)
++		return ret;
++
++	ret = tmu_sched_link_queue(priv, sbin, qid);
++	if (ret)
++		return ret;
++
++	dev_info(priv->dev,
++		 "egress path: port %u block %u queue %u input %u\n",
++		 epn, sbid, qid, sbin);
++	return 0;
++}
++
++/* Queue-index table */
++
++/*
++ * The queue-index table maps an enqueue descriptor's endpoint, class and
++ * offload bits onto a traffic-management queue. It is global and keyed on the
++ * endpoint, with no per-ingress-port binding. Each word holds four eight-bit
++ * queue ids.
++ *
++ * A CPU enqueue carries class zero and no offload bits, so exactly one slot
++ * per endpoint is consulted. It is the one at the endpoint shifted left by
++ * four.
++ */
++/*
++ * Every slot the table can address is filled with a queue id that discards
++ * before any endpoint is given a real one, so an endpoint nobody programmed
++ * drops rather than enqueues into whatever the table happened to hold.
++ */
++#define XRX500_CBM_QIDT_WORDS		0x1000
++#define XRX500_CBM_QIDT_DROP		0xFFFFFFFFU
++
++static void xrx500_cbm_qidt_drop_fill(struct xrx500_cbm *priv)
++{
++	u32 i;
++
++	for (i = 0; i < XRX500_CBM_QIDT_WORDS; i++)
++		cbm_w32(priv->qidt, i * 4, XRX500_CBM_QIDT_DROP);
++	wmb(); /* the table must be filled before any endpoint enqueues */
++}
++
++static void xrx500_cbm_qidt_set(struct xrx500_cbm *priv, u32 ep, u8 qid)
++{
++	u32 idx = ((ep << 4) & 0xF0) >> 2;
++	u32 shift = (((ep << 4) & 0xF0) % 4) << 3;
++	u32 mask = 0xFFU << shift;
++	u32 val;
++
++	val = cbm_r32(priv->qidt, idx * 4);
++	val = (val & ~mask) | ((u32)qid << shift);
++	cbm_w32(priv->qidt, idx * 4, val);
++	wmb(); /* the table must be live before the first enqueue */
++}
++
++/* Free-segment queue manager */
++
++/*
++ * Seed one manager instance's linked-list memory and bring it online.
++ *
++ * The seeding walks slots one through the segment count inclusive, and slot
++ * i-1 receives i modulo the count, except that the second-to-last slot
++ * receives the end sentinel. Rewriting the loop to a zero-based form leaves
++ * the last slot uninitialised and the manager stalls on the first segment
++ * return. The reference count of every slot is set in the same pass.
++ */
++static void fsqm_seed_list(void __iomem *base, u32 segs)
++{
++	u32 i;
++
++	for (i = 1; i <= segs; i++) {
++		u32 slot = i - 1;
++		u32 next = (i == segs - 1) ? FSQM_LIST_END : (i % segs);
++
++		cbm_w32(base, FSQM_RAM + (slot << 2), next);
++		cbm_w32(base, FSQM_RCNT + (slot << 2), 1);
++	}
++}
++
++/**
++ * fsqm_arm() - bring one free-segment manager instance online.
++ * @base: instance window.
++ * @segs: segments the instance manages.
++ *
++ * The last list entry is not usable, so the highest segment address is two
++ * below the count. The command buffers are drained before the control
++ * register is written, and the control register is written last so the
++ * engine never observes a partial configuration.
++ *
++ * The threshold registers use left-to-right integer division; folding the
++ * multiply in first changes three of the five values.
++ */
++static void fsqm_arm(void __iomem *base, u32 segs)
++{
++	u32 maxlsa = segs - 2;
++
++	fsqm_seed_list(base, segs);
++
++	cbm_w32(base, FSQM_LSARNG, maxlsa << FSQM_LSARNG_MAX_SHIFT);
++	cbm_w32(base, FSQM_OFSQ, maxlsa << FSQM_OFSQ_TAIL_SHIFT);
++	cbm_w32(base, FSQM_OFSC, (maxlsa + 1) & FSQM_OFSC_MASK);
++	cbm_w32(base, FSQM_IRNEN, FSQM_IRNEN_VAL);
++
++	cbm_w32(base, FSQM_FSQT0, segs / 6 * 5);
++	cbm_w32(base, FSQM_FSQT1, segs / 6 * 4);
++	cbm_w32(base, FSQM_FSQT2, segs / 6 * 3);
++	cbm_w32(base, FSQM_FSQT3, segs / 6 * 2);
++	cbm_w32(base, FSQM_FSQT4, segs / 6);
++
++	cbm_w32(base, FSQM_IO_BUF_RD, 0);
++	cbm_w32(base, FSQM_IO_BUF_WR, 0);
++	cbm_w32(base, FSQM_CTRL, 1);
++	wmb(); /* the instance must be live before a segment is requested */
++}
++
++/**
++ * xrx500_cbm_free_segs() - free-segment count of the standard pool.
++ * @priv: driver state.
++ *
++ * The manager keeps no per-segment length, only a linked list and a
++ * reference count, so this cumulative count is the only occupancy figure it
++ * publishes.
++ */
++static u32 xrx500_cbm_free_segs(struct xrx500_cbm *priv)
++{
++	return cbm_r32(priv->fsqm[0], FSQM_OFSC) & FSQM_OFSC_MASK;
++}
++
++/**
++ * xrx500_cbm_seg_to_virt() - map a segment address into the pool mapping.
++ * @priv: driver state.
++ * @phys: segment address as the manager reported it.
++ *
++ * Returns NULL for an address outside both pools, which is how a corrupted
++ * segment answer is caught before it is dereferenced.
++ */
++static void *xrx500_cbm_seg_to_virt(struct xrx500_cbm *priv, u32 phys)
++{
++	const struct xrx500_cbm_pool *pools[] = { &priv->std, &priv->jbo };
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(pools); i++) {
++		const struct xrx500_cbm_pool *p = pools[i];
++		phys_addr_t lo = p->phys;
++		phys_addr_t hi = lo + (phys_addr_t)p->segs * p->seg_size;
++
++		if (!p->virt)
++			continue;
++		if ((phys_addr_t)phys >= lo && (phys_addr_t)phys < hi)
++			return (u8 *)p->virt + ((phys_addr_t)phys - lo);
++	}
++	return NULL;
++}
++
++/**
++ * xrx500_cbm_seg_put() - hand a segment back to the manager.
++ * @priv: driver state.
++ * @pid:  CPU egress port to return through.
++ * @pa:   segment address.
++ *
++ * Only for a segment that was taken but never enqueued. After a successful
++ * enqueue the segment belongs to the hardware, which recycles it once the
++ * frame has egressed; returning it here as well would hand the same segment
++ * out twice.
++ *
++ * The return register is one per port, so @pid must be the caller's own port
++ * and the caller must stay on that CPU across both the port choice and this
++ * write. A return written into a port that was never configured neither
++ * faults nor logs; it drops the segment.
++ */
++static void xrx500_cbm_seg_put(struct xrx500_cbm *priv, u32 pid, u32 pa)
++{
++	cbm_w32(priv->dqm, dqm_cpu_off(pid, CBM_DQM_EGP_PTR_RTN),
++		pa & FSQM_POOL_EMPTY);
++	wmb(); /* the return must land before the segment is reused */
++	priv->stats.rollbacks++;
++}
++
++/**
++ * xrx500_cbm_seg_get() - take a standard segment out of the manager.
++ * @priv: driver state.
++ * @pid:  CPU port to request through and to return through on failure.
++ * @pa:   out, the segment address.
++ *
++ * The request register answers with an exhausted-pool marker while no segment
++ * is available, so the request is re-read a bounded number of times before
++ * giving up. Interrupts are off across the retry loop because the register is
++ * one per port and a nested requester on the same port would consume this
++ * caller's answer.
++ *
++ * A segment whose address falls outside both pools cannot be written to, but
++ * it has still left the manager, so it is returned rather than dropped.
++ *
++ * On failure @pa distinguishes the two cases: zero for an exhausted pool,
++ * the offending address for a segment that could not be translated.
++ */
++static void *xrx500_cbm_seg_get(struct xrx500_cbm *priv, u32 pid, u32 *pa)
++{
++	u32 off = eqm_cpu_off(pid, CBM_EQM_IGP_NEW_SPTR);
++	unsigned long flags;
++	unsigned int i = 0;
++	u32 addr;
++	void *va;
++
++	if (priv->force_empty) {
++		priv->force_empty--;
++		priv->stats.pool_empty++;
++		return NULL;
++	}
++
++	local_irq_save(flags);
++	do {
++		addr = cbm_r32(priv->eqm, off);
++	} while ((addr & FSQM_POOL_EMPTY) == FSQM_POOL_EMPTY &&
++		 i++ < FSQM_ALLOC_RETRIES);
++	local_irq_restore(flags);
++
++	if ((addr & FSQM_POOL_EMPTY) == FSQM_POOL_EMPTY) {
++		priv->stats.pool_empty++;
++		return NULL;
++	}
++
++	priv->stats.pops++;
++	*pa = addr;
++
++	va = xrx500_cbm_seg_to_virt(priv, *pa);
++	if (!va) {
++		net_err_ratelimited("%s: segment 0x%08x outside both pools\n",
++				    netdev_name(priv->ndev), addr);
++		xrx500_cbm_seg_put(priv, pid, addr);
++		return NULL;
++	}
++
++	*pa = addr;
++	return va;
++}
++
++/* Manager port bring-up */
++
++/* Arm one CPU ingress port of the enqueue manager. */
++static void xrx500_cbm_eqm_cpu_port(struct xrx500_cbm *priv, u32 pid)
++{
++	cbm_w32(priv->eqm, eqm_cpu_off(pid, CBM_EQM_IGP_CFG),
++		CBM_EQM_CPU_IGP_CFG_VAL);
++	cbm_w32(priv->eqm, eqm_cpu_off(pid, CBM_EQM_IGP_POCC), 0);
++	cbm_w32(priv->eqm, eqm_cpu_off(pid, CBM_EQM_IGP_IRNEN),
++		CBM_EQM_CPU_IGP_IRNEN_ALL);
++	wmb(); /* the port must be armed before it is requested through */
++}
++
++/*
++ * Arm one CPU egress port of the dequeue manager.
++ *
++ * Every port a CPU can name has to be armed even when no queue or table entry
++ * points at it, because it is a segment-return port. A return written into an
++ * unconfigured port neither faults nor logs, it silently drops the segment.
++ */
++static void xrx500_cbm_dqm_cpu_port(struct xrx500_cbm *priv, u32 pid)
++{
++	u32 off = dqm_cpu_off(pid, CBM_DQM_EGP_CFG);
++	u32 cfg = CBM_DQM_CPU_EGP_CFG_VAL |
++		  ((pid << CBM_DQM_EGP_CFG_EPMAP_SHIFT) &
++		   CBM_DQM_EGP_CFG_EPMAP_MASK);
++	u32 now = cbm_r32(priv->dqm, off);
++
++	/*
++	 * One of these ports carries the receive dequeue while the existing
++	 * datapath is loaded, so the register is only written when it does not
++	 * already hold the value this driver derives. A divergence is worth
++	 * seeing: it means the two derivations disagree.
++	 */
++	if (now == cfg)
++		return;
++
++	dev_info(priv->dev, "return port %u: 0x%08x -> 0x%08x\n",
++		 pid, now, cfg);
++	cbm_w32(priv->dqm, off, cfg);
++	wmb(); /* the port must be armed before a segment is returned */
++}
++
++/**
++ * xrx500_cbm_dqm_dma_port() - bring up the DMA egress port that drains this
++ *                             conduit's datapath port.
++ * @priv:      driver state.
++ * @clear_desc: also clear the port's two staging descriptors.
++ *
++ * The port is configured with the dequeue request and per-port counting
++ * enabled and its egress-port map pointing at itself. Both registers touched
++ * here live in the dequeue-manager window and can be written at any time.
++ *
++ * The staging descriptors do not. They live in the descriptor window that the
++ * transmit channel bound to this port reads from, and a CPU access to that
++ * window while the channel is live wedges the bus. They are therefore cleared
++ * only when this driver owns the channel and has turned it off first.
++ */
++static void xrx500_cbm_dqm_dma_port(struct xrx500_cbm *priv, bool clear_desc)
++{
++	u32 deq = priv->eg.deq_port;
++	u32 cfg;
++	int i;
++
++	if (clear_desc) {
++		u32 base = CBM_DESC_EGP_5 + (deq - 5) * CBM_DESC_PORT_STRIDE;
++
++		for (i = 0; i < CBM_DESC_PER_DMA_PORT; i++) {
++			u32 d = base + i * 16;
++
++			cbm_w32(priv->desc, d + 0x0, 0);
++			cbm_w32(priv->desc, d + 0x4, 0);
++			cbm_w32(priv->desc, d + 0x8, 0);
++			cbm_w32(priv->desc, d + 0xC, 0);
++		}
++		wmb(); /* staging clear before the port dequeues */
++	}
++
++	cfg = CBM_DQM_DMA_EGP_CFG_DQREQ | CBM_DQM_DMA_EGP_CFG_DQPCEN |
++	      ((deq << CBM_DQM_EGP_CFG_EPMAP_SHIFT) &
++	       CBM_DQM_EGP_CFG_EPMAP_MASK);
++	cbm_w32(priv->dqm,
++		CBM_DQM_DMA_EGP_6 + (deq - 6) * CBM_DQM_PORT_STRIDE +
++			CBM_DQM_EGP_CFG,
++		cfg);
++	wmb(); /* the port must be configured before the channel drains it */
++
++	dev_info(priv->dev, "dequeue port %u configured (0x%08x)\n", deq, cfg);
++}
++
++/**
++ * xrx500_cbm_pools_arm() - seed both segment pools and publish their bases.
++ * @priv: driver state.
++ *
++ * The pool bases are written before the segment-size selector so the engine
++ * cannot observe a base that disagrees with the size it is told to use. The
++ * bus masters use the coherent alias of each base, and the physical form is
++ * published alongside it because the descriptor engine reads both.
++ */
++static void xrx500_cbm_pools_arm(struct xrx500_cbm *priv)
++{
++	u32 ctrl;
++
++	fsqm_arm(priv->fsqm[0], priv->std.segs);
++	fsqm_arm(priv->fsqm[1], priv->jbo.segs);
++
++	cbm_w32(priv->cbm, CBM_SBA_0, (u32)priv->std.phys);
++	cbm_w32(priv->cbm, CBM_JBA_0, (u32)priv->jbo.phys);
++	cbm_w32(priv->cbm, CBM_SBA_1, CBM_COHERENT_ALIAS(priv->std.phys));
++	cbm_w32(priv->cbm, CBM_JBA_1, CBM_COHERENT_ALIAS(priv->jbo.phys));
++
++	ctrl = cbm_r32(priv->cbm, CBM_CTRL);
++	if (priv->jbo.seg_size == 0x2000)
++		ctrl &= ~CBM_CTRL_JSEL;
++	else
++		ctrl |= CBM_CTRL_JSEL;
++	cbm_w32(priv->cbm, CBM_CTRL, ctrl);
++	wmb(); /* pool state must be complete before either manager runs */
++
++	dev_info(priv->dev, "pools armed, %u free standard segments\n",
++		 xrx500_cbm_free_segs(priv));
++}
++
++/**
++ * xrx500_cbm_managers_enable() - enable both managers and the enqueue delay.
++ * @priv: driver state.
++ *
++ * The dequeue manager is enabled before the enqueue manager so nothing can be
++ * admitted before there is anything to drain it. The enqueue delay counters
++ * follow, which is what lets the manager coalesce an enqueue with the
++ * descriptor write that commits it.
++ */
++static void xrx500_cbm_managers_enable(struct xrx500_cbm *priv)
++{
++	u32 ctrl;
++	int i;
++
++	cbm_w32(priv->dqm, CBM_DQM_CTRL, CBM_DQM_CTRL_EN | CBM_DQM_CTRL_QEN);
++	cbm_w32(priv->eqm, CBM_EQM_CTRL, CBM_EQM_CTRL_EN | CBM_EQM_CTRL_QEN);
++	wmb(); /* both managers live before the delay counters are set */
++
++	ctrl = cbm_r32(priv->eqm, CBM_EQM_CTRL);
++	ctrl |= CBM_EQM_CTRL_PDEN | CBM_EQM_CTRL_SNOOPEN | CBM_EQM_CTRL_DLYSEL;
++	cbm_w32(priv->eqm, CBM_EQM_CTRL, ctrl);
++	for (i = 0; i <= 15; i++)
++		cbm_w32(priv->eqm, eqm_cpu_off(i, CBM_EQM_IGP_DCNTR),
++			CBM_EQM_IGP_DCNTR_DLY);
++	wmb(); /* delay configuration complete before the first enqueue */
++}
++
++/* Transmit DMA channel */
++
++/*
++ * Descriptor base of a dequeue port inside the descriptor-staging window.
++ * A transmit channel bound to that port must be given this address and a
++ * length of two; it cannot be given a ring in DRAM.
++ */
++static phys_addr_t xrx500_cbm_deq_desc_pa(struct xrx500_cbm *priv)
++{
++	return priv->dma_desc_pa + CBM_DESC_EGP_5 +
++	       (phys_addr_t)(priv->eg.deq_port - 5) * CBM_DESC_PORT_STRIDE;
++}
++
++/**
++ * xrx500_cbm_dma_chan_check() - compare the channel against this driver's own
++ *                               resource table.
++ * @priv: driver state.
++ *
++ * Reading the controller's own registers is safe at any time. Reading the
++ * descriptor-staging window while the channel is live is not, and nothing
++ * here does it.
++ */
++static void xrx500_cbm_dma_chan_check(struct xrx500_cbm *priv)
++{
++	phys_addr_t want = xrx500_cbm_deq_desc_pa(priv);
++	u32 cctrl, cdba, cdlen;
++
++	cbm_w32(priv->dma, DMA_CS, priv->eg.dma_chan);
++	cctrl = cbm_r32(priv->dma, DMA_CCTRL);
++	cdba = cbm_r32(priv->dma, DMA_CDBA);
++	cdlen = cbm_r32(priv->dma, DMA_CDLEN);
++
++	dev_info(priv->dev,
++		 "channel %u: control 0x%08x base 0x%08x length %u\n",
++		 priv->eg.dma_chan, cctrl, cdba, cdlen);
++
++	if (cdba != (u32)want)
++		dev_warn(priv->dev,
++			 "channel %u descriptor base 0x%08x, expected 0x%08x\n",
++			 priv->eg.dma_chan, cdba, (u32)want);
++	if (cdlen != CBM_DESC_PER_DMA_PORT)
++		dev_warn(priv->dev,
++			 "channel %u descriptor length %u, expected %u\n",
++			 priv->eg.dma_chan, cdlen, CBM_DESC_PER_DMA_PORT);
++	if (!(cctrl & DMA_CCTRL_ON))
++		dev_warn(priv->dev, "channel %u is off\n",
++			 priv->eg.dma_chan);
++	if (!(cctrl & DMA_CCTRL_DIR_TX))
++		dev_warn(priv->dev, "channel %u is not a transmit channel\n",
++			 priv->eg.dma_chan);
++}
++
++/**
++ * xrx500_cbm_dma_chan_setup() - point the channel at its dequeue port and
++ *                               switch it on.
++ * @priv: driver state.
++ *
++ * The channel class equals the channel number for these bindings; the field
++ * is split across two ranges of the control register. Interrupts are left
++ * masked: a channel that fetches its descriptors on demand under manager flow
++ * control signals nothing per frame, so there is no completion to take.
++ *
++ * On-demand descriptor fetch is enabled last, after the channel is otherwise
++ * complete.
++ */
++#define XRX500_CBM_CHAN_OFF_TRIES	10000
++
++static void xrx500_cbm_dma_chan_setup(struct xrx500_cbm *priv)
++{
++	u32 chan = priv->eg.dma_chan;
++	phys_addr_t desc = xrx500_cbm_deq_desc_pa(priv);
++	u32 cctrl;
++	int i;
++
++	cbm_w32(priv->dma, DMA_CS, chan);
++	cctrl = cbm_r32(priv->dma, DMA_CCTRL);
++	cctrl &= ~DMA_CCTRL_ON;
++	cbm_w32(priv->dma, DMA_CCTRL, cctrl);
++
++	/*
++	 * The enable bit clears itself only once a descriptor already in
++	 * flight has finished, so the wait is not optional: touching the
++	 * staging window while the channel is still running wedges the bus.
++	 */
++	for (i = 0; i < XRX500_CBM_CHAN_OFF_TRIES; i++) {
++		if (!(cbm_r32(priv->dma, DMA_CCTRL) & DMA_CCTRL_ON))
++			break;
++		udelay(1);
++	}
++	if (i == XRX500_CBM_CHAN_OFF_TRIES) {
++		dev_err(priv->dev,
++			"channel %u will not stop; leaving it alone\n", chan);
++		return;
++	}
++
++	xrx500_cbm_dqm_dma_port(priv, true);
++
++	cbm_w32(priv->dma, DMA_CS, chan);
++	cbm_w32(priv->dma, DMA_CDBA, (u32)desc);
++	cbm_w32(priv->dma, DMA_CDLEN, CBM_DESC_PER_DMA_PORT);
++	cbm_w32(priv->dma, DMA_CIE, 0);
++
++	cctrl &= ~(DMA_CCTRL_CLASS_MASK | DMA_CCTRL_CLASSH_MASK);
++	cctrl |= ((chan & 0x7) << DMA_CCTRL_CLASS_SHIFT) &
++		 DMA_CCTRL_CLASS_MASK;
++	cctrl |= (((chan >> 3) & 0x3) << DMA_CCTRL_CLASSH_SHIFT) &
++		 DMA_CCTRL_CLASSH_MASK;
++	cbm_w32(priv->dma, DMA_CCTRL, cctrl);
++	wmb(); /* descriptors and class in place before the channel runs */
++
++	cbm_w32(priv->dma, DMA_CCTRL, cctrl | DMA_CCTRL_ON);
++
++	/* On-demand descriptor fetch belongs at the end of controller setup. */
++	cbm_w32(priv->dma, DMA_CTRL,
++		cbm_r32(priv->dma, DMA_CTRL) | DMA_CTRL_DS_FOD);
++	wmb(); /* fetch mode live before the first dequeue */
++
++	dev_info(priv->dev,
++		 "channel %u programmed: base 0x%08x length %u control 0x%08x\n",
++		 chan, (u32)desc, CBM_DESC_PER_DMA_PORT,
++		 cbm_r32(priv->dma, DMA_CCTRL));
++}
++
++/* Transmit */
++
++/*
++ * Back-pressure release.
++ *
++ * The egress channel raises no completion interrupt, so nothing tells the
++ * driver that the buffer manager has recycled a segment. Two mechanisms could
++ * release a queue stopped for an exhausted pool: a poll folded into the
++ * receive softirq, or a poll of its own. This driver uses a poll of its own,
++ * because a transmit-only flow generates no receive work and would then never
++ * be released - a deadlock, not a latency question. The poll is single-shot
++ * and rearms itself, so it costs nothing while the queue is running.
++ */
++#define XRX500_CBM_RESTART_DELAY	1
++
++/*
++ * Free segments the pool must hold before the queue is released. One segment
++ * is enough to transmit one frame; the margin keeps the queue from being
++ * released straight back into an exhausted pool.
++ */
++#define XRX500_CBM_RESTART_WATERMARK	8
++
++static void xrx500_cbm_restart(struct timer_list *t)
++{
++	struct xrx500_cbm *priv = timer_container_of(priv, t, restart);
++	bool forced;
++
++	if (READ_ONCE(priv->closing))
++		return;
++
++	priv->stats.polls++;
++
++	/*
++	 * A synthetic exhausted-pool answer is consumed here as well as in the
++	 * transmit path, under the lock that path holds while it takes one.
++	 * The transmit path cannot run while the queue it stopped is stopped,
++	 * so a count only that path spent would hold the queue closed for
++	 * every answer past the first until it was cleared by hand.
++	 */
++	scoped_guard(spinlock_irqsave, &priv->tx_lock) {
++		forced = priv->force_empty != 0;
++		if (forced)
++			priv->force_empty--;
++	}
++
++	if (forced ||
++	    xrx500_cbm_free_segs(priv) < XRX500_CBM_RESTART_WATERMARK) {
++		mod_timer(&priv->restart, jiffies + XRX500_CBM_RESTART_DELAY);
++		return;
++	}
++
++	priv->stats.wakes++;
++	netif_wake_queue(priv->ndev);
++}
++
++/**
++ * xrx500_cbm_xmit() - enqueue one frame into the buffer manager.
++ * @skb:  frame to transmit.
++ * @ndev: the conduit.
++ *
++ * There is no transmit completion on this path. The frame is copied into a
++ * hardware-owned segment, one descriptor is written, and the socket buffer is
++ * released immediately: the driver never owns the frame past the enqueue and
++ * the hardware recycles the segment after egress. Consequently there is no
++ * byte-queue accounting and no completion poll.
++ *
++ * The descriptor is committed by its last word. Everything else - the two
++ * leading words and the data pointer - must be visible first.
++ */
++static netdev_tx_t xrx500_cbm_xmit(struct sk_buff *skb,
++				   struct net_device *ndev)
++{
++	struct xrx500_cbm *priv = netdev_priv(ndev);
++	u32 hdr_len = PMAC_TX_HDR_LEN;
++	unsigned long flags;
++	u32 seg_pa = 0;
++	u32 data_pa;
++	u32 total;
++	u32 dw1, dw3;
++	u32 desc;
++	u32 pid;
++	u8 *buf;
++
++	/*
++	 * The frame offset is composed from a network-stack pad that is not an
++	 * ABI constant. It has to stay clear of the switch header and leave a
++	 * whole maximum-size frame inside one standard segment.
++	 */
++	BUILD_BUG_ON(XRX500_CBM_TX_OFFSET < XRX500_CBM_DMA_DATA_OFFSET);
++	BUILD_BUG_ON(XRX500_CBM_TX_OFFSET + PMAC_TX_HDR_LEN +
++		     VLAN_ETH_FRAME_LEN > XRX500_CBM_STD_SEG_SIZE);
++
++	if (skb_linearize(skb))
++		goto drop;
++
++	/* The switch discards frames below the minimum Ethernet length. */
++	if (skb->len < ETH_ZLEN && skb_padto(skb, ETH_ZLEN))
++		goto drop_nofree;
++	if (skb->len < ETH_ZLEN)
++		skb_put(skb, ETH_ZLEN - skb->len);
++
++	total = skb->len + hdr_len;
++	if (XRX500_CBM_TX_OFFSET + total > XRX500_CBM_STD_SEG_SIZE)
++		goto drop;
++
++	spin_lock_irqsave(&priv->tx_lock, flags);
++
++	/*
++	 * The segment request and the enqueue both address a per-port window,
++	 * and the rollback return addresses the matching egress port, so all
++	 * three have to name the same CPU. Interrupts are already off here,
++	 * which pins it.
++	 */
++	pid = raw_smp_processor_id();
++	if (pid >= CBM_CPU_PORT_NUM)
++		pid = 0;
++
++	buf = xrx500_cbm_seg_get(priv, pid, &seg_pa);
++	if (!buf) {
++		/*
++		 * An exhausted pool is the only back pressure this path has.
++		 * Stop the queue and let the release poll reopen it. A segment
++		 * that could not be translated is a different failure and the
++		 * frame is simply dropped.
++		 */
++		if (!seg_pa) {
++			priv->stats.stops++;
++			netif_stop_queue(ndev);
++			mod_timer(&priv->restart,
++				  jiffies + XRX500_CBM_RESTART_DELAY);
++			spin_unlock_irqrestore(&priv->tx_lock, flags);
++			return NETDEV_TX_BUSY;
++		}
++		spin_unlock_irqrestore(&priv->tx_lock, flags);
++		goto drop;
++	}
++
++	/*
++	 * Switch header: explicit egress-port map, class field enabled, source
++	 * port zero for the CPU port, and the target port's bit in the map.
++	 * Ports above seven live in the map's high byte.
++	 */
++	memset(buf + XRX500_CBM_TX_OFFSET, 0, hdr_len);
++	buf[XRX500_CBM_TX_OFFSET + 3] = PMAC_TX_B3_PORT_MAP_EN |
++					PMAC_TX_B3_CLASS_EN;
++	if (priv->eg.dp_port <= 7)
++		buf[XRX500_CBM_TX_OFFSET + 7] = 1U << priv->eg.dp_port;
++	else
++		buf[XRX500_CBM_TX_OFFSET + 6] = 1U << (priv->eg.dp_port - 8);
++
++	memcpy(buf + XRX500_CBM_TX_OFFSET + hdr_len, skb->data, skb->len);
++
++	/*
++	 * The segment pool is a reserved region carried with no kernel page
++	 * mapping of its own, so the streaming DMA helpers cannot walk it and
++	 * the write-back is issued against the pool mapping directly.
++	 */
++	dma_cache_wback((unsigned long)(buf + XRX500_CBM_TX_OFFSET), total);
++
++	data_pa = seg_pa + XRX500_CBM_TX_OFFSET;
++
++	dw1 = ((priv->eg.dp_port << CBM_TXD_DW1_EP_SHIFT) &
++	       CBM_TXD_DW1_EP_MASK) |
++	      (CBM_TXD_DW1_COLOR_GREEN << CBM_TXD_DW1_COLOR_SHIFT);
++	dw3 = CBM_TXD_DW3_SOP | CBM_TXD_DW3_EOP |
++	      ((data_pa & 0x7) << CBM_TXD_DW3_BYTE_OFF_SHIFT) |
++	      (total & CBM_TXD_DW3_LEN_MASK);
++
++	desc = eqm_cpu_off(pid, CBM_EQM_IGP_DESC0);
++	cbm_w32(priv->eqm, desc + 0x0, 0);
++	cbm_w32(priv->eqm, desc + 0x4, dw1);
++	cbm_w32(priv->eqm, desc + 0x8, data_pa & ~0x7U);
++	wmb();  /* publish the descriptor body before the commit word */
++	cbm_w32(priv->eqm, desc + 0xC, dw3);
++	wmb();  /* make the commit globally visible */
++
++	dev_sw_netstats_tx_add(ndev, 1, skb->len);
++	spin_unlock_irqrestore(&priv->tx_lock, flags);
++
++	dev_consume_skb_any(skb);
++	return NETDEV_TX_OK;
++
++drop:
++	dev_kfree_skb_any(skb);
++drop_nofree:
++	dev_core_stats_tx_dropped_inc(ndev);
++	return NETDEV_TX_OK;
++}
++
++/* Network device */
++
++static int xrx500_cbm_open(struct net_device *ndev)
++{
++	struct xrx500_cbm *priv = netdev_priv(ndev);
++
++	WRITE_ONCE(priv->closing, false);
++	netif_start_queue(ndev);
++	/*
++	 * The conduit's link is the switch's CPU port, which has no
++	 * negotiation and is up whenever the datapath is.
++	 */
++	netif_carrier_on(ndev);
++	return 0;
++}
++
++static int xrx500_cbm_stop(struct net_device *ndev)
++{
++	struct xrx500_cbm *priv = netdev_priv(ndev);
++
++	netif_carrier_off(ndev);
++	netif_stop_queue(ndev);
++
++	/*
++	 * The release poll rearms itself, and it cannot be shut down here:
++	 * shutting a timer down is permanent, so a device that came up again
++	 * would have a release poll that never runs and a transmit queue that
++	 * stays stopped the first time the segment pool empties. Marking the
++	 * device as going down instead stops the poll rearming, and the wait
++	 * then drains it.
++	 */
++	WRITE_ONCE(priv->closing, true);
++	timer_delete_sync(&priv->restart);
++	return 0;
++}
++
++static const struct net_device_ops xrx500_cbm_netdev_ops = {
++	.ndo_open = xrx500_cbm_open,
++	.ndo_stop = xrx500_cbm_stop,
++	.ndo_start_xmit = xrx500_cbm_xmit,
++	.ndo_set_mac_address = eth_mac_addr,
++	.ndo_validate_addr = eth_validate_addr,
++};
++
++/* Reporting */
++
++static int xrx500_cbm_set_report(const char *val,
++				 const struct kernel_param *kp)
++{
++	struct xrx500_cbm *priv;
++	int ret = param_set_int(val, kp);
++
++	if (ret)
++		return ret;
++
++	guard(mutex)(&xrx500_cbm_lock);
++	priv = xrx500_cbm_singleton;
++	if (!priv)
++		return 0;
++
++	pr_info("%s: free=%u pops=%llu rollbacks=%llu outstanding=%llu empty=%llu stops=%llu wakes=%llu polls=%llu\n",
++		XRX500_CBM_DRV_NAME, xrx500_cbm_free_segs(priv),
++		priv->stats.pops, priv->stats.rollbacks,
++		priv->stats.pops - priv->stats.rollbacks,
++		priv->stats.pool_empty, priv->stats.stops,
++		priv->stats.wakes, priv->stats.polls);
++	return 0;
++}
++
++static int xrx500_cbm_set_force_empty(const char *val,
++				      const struct kernel_param *kp)
++{
++	struct xrx500_cbm *priv;
++	int ret = param_set_uint(val, kp);
++
++	if (ret)
++		return ret;
++
++	guard(mutex)(&xrx500_cbm_lock);
++	priv = xrx500_cbm_singleton;
++	if (!priv)
++		return 0;
++
++	scoped_guard(spinlock_irqsave, &priv->tx_lock)
++		priv->force_empty = tx_force_empty;
++	return 0;
++}
++
++/* Probe */
++
++/**
++ * xrx500_cbm_map() - map one named window of a referenced node.
++ * @priv: driver state.
++ * @np:   node carrying the windows.
++ * @name: reg-names entry to map.
++ * @pa:   optional out, physical base of the window.
++ *
++ * The window is mapped without claiming it.
++ *
++ * Resolution is by name, never by index: the same node's windows are fetched
++ * by index elsewhere, which makes a reorder of the list a silent mismapping.
++ */
++static void __iomem *xrx500_cbm_map(struct xrx500_cbm *priv,
++				    struct device_node *np, const char *name,
++				    phys_addr_t *pa)
++{
++	struct resource res;
++	void __iomem *base;
++	int idx;
++	int ret;
++
++	idx = of_property_match_string(np, "reg-names", name);
++	if (idx < 0) {
++		dev_err(priv->dev, "%pOF has no window named %s\n", np, name);
++		return IOMEM_ERR_PTR(idx);
++	}
++
++	ret = of_address_to_resource(np, idx, &res);
++	if (ret) {
++		dev_err(priv->dev, "%pOF window %s unresolvable: %d\n",
++			np, name, ret);
++		return IOMEM_ERR_PTR(ret);
++	}
++
++	base = devm_ioremap(priv->dev, res.start, resource_size(&res));
++	if (!base) {
++		dev_err(priv->dev, "%pOF window %s not mappable\n", np, name);
++		return IOMEM_ERR_PTR(-ENOMEM);
++	}
++
++	if (pa)
++		*pa = res.start;
++	return base;
++}
++
++/**
++ * xrx500_cbm_pool_get() - resolve and map one segment pool.
++ * @priv:     driver state.
++ * @np:       node carrying the memory-region list.
++ * @name:     memory-region-names entry.
++ * @seg_size: segment size the manager hands out of this pool.
++ * @pool:     out.
++ *
++ * The regions are reserved with no kernel mapping, so the write-back mapping
++ * taken here is the only access path to them.
++ */
++static int xrx500_cbm_pool_get(struct xrx500_cbm *priv, struct device_node *np,
++			       const char *name, u32 seg_size,
++			       struct xrx500_cbm_pool *pool)
++{
++	struct device_node *rnp;
++	struct reserved_mem *rmem;
++	phys_addr_t shift;
++	void *virt;
++	int idx;
++
++	idx = of_property_match_string(np, "memory-region-names", name);
++	if (idx < 0) {
++		dev_err(priv->dev, "no memory region named %s\n", name);
++		return idx;
++	}
++
++	rnp = of_parse_phandle(np, "memory-region", idx);
++	if (!rnp) {
++		dev_err(priv->dev, "memory region %s unresolvable\n", name);
++		return -ENODEV;
++	}
++
++	rmem = of_reserved_mem_lookup(rnp);
++	of_node_put(rnp);
++	if (!rmem) {
++		dev_err(priv->dev, "memory region %s not reserved\n", name);
++		return -ENODEV;
++	}
++
++	if (rmem->size < (phys_addr_t)seg_size * 2) {
++		dev_err(priv->dev, "memory region %s holds under two segments\n",
++			name);
++		return -EINVAL;
++	}
++
++	virt = devm_memremap(priv->dev, rmem->base, rmem->size, MEMREMAP_WB);
++	if (IS_ERR_OR_NULL(virt)) {
++		dev_err(priv->dev, "memory region %s not mappable\n", name);
++		return virt ? PTR_ERR(virt) : -ENOMEM;
++	}
++
++	/*
++	 * The manager addresses the pool in whole segments from its base, so
++	 * the base has to sit on a segment boundary. The shift is applied to
++	 * the mapping and the physical base together, or the two translations
++	 * would disagree by the adjustment.
++	 */
++	shift = ALIGN(rmem->base, seg_size) - rmem->base;
++	if (shift >= rmem->size) {
++		dev_err(priv->dev, "memory region %s cannot be aligned\n",
++			name);
++		return -EINVAL;
++	}
++
++	pool->phys = rmem->base + shift;
++	pool->virt = (u8 *)virt + shift;
++	pool->size = rmem->size - shift;
++	pool->seg_size = seg_size;
++	pool->segs = pool->size / seg_size;
++
++	dev_info(priv->dev, "%s at %pa, %u segments of %u bytes\n",
++		 name, &pool->phys, pool->segs, pool->seg_size);
++	return 0;
++}
++
++static int xrx500_cbm_egress_lookup(struct xrx500_cbm *priv, u32 dp)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(xrx500_cbm_egress_tbl); i++) {
++		if (xrx500_cbm_egress_tbl[i].dp_port != dp)
++			continue;
++		priv->eg = xrx500_cbm_egress_tbl[i];
++		return 0;
++	}
++
++	dev_err(priv->dev, "datapath port %u has no egress resources\n", dp);
++	return -EINVAL;
++}
++
++static int xrx500_cbm_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct device_node *cbm_np;
++	struct device_node *dma_np;
++	struct net_device *ndev;
++	struct xrx500_cbm *priv;
++	struct resource res;
++	int ret;
++	u32 i;
++
++	scoped_guard(mutex, &xrx500_cbm_lock)
++		if (xrx500_cbm_singleton)
++			return -EBUSY;
++
++	ndev = alloc_etherdev(sizeof(*priv));
++	if (!ndev)
++		return -ENOMEM;
++
++	SET_NETDEV_DEV(ndev, dev);
++	priv = netdev_priv(ndev);
++	priv->dev = dev;
++	priv->ndev = ndev;
++	spin_lock_init(&priv->tx_lock);
++	spin_lock_init(&priv->tmu_lock);
++	timer_setup(&priv->restart, xrx500_cbm_restart, 0);
++
++	ret = xrx500_cbm_egress_lookup(priv, dp_port);
++	if (ret)
++		goto err_free;
++
++	cbm_np = of_parse_phandle(np, "lantiq,buffer-manager", 0);
++	if (!cbm_np) {
++		dev_err(dev, "no lantiq,buffer-manager phandle\n");
++		ret = -ENODEV;
++		goto err_free;
++	}
++
++	priv->cbm = xrx500_cbm_map(priv, cbm_np, "cbm", NULL);
++	priv->eqm = xrx500_cbm_map(priv, cbm_np, "eqm", NULL);
++	priv->dqm = xrx500_cbm_map(priv, cbm_np, "dqm", NULL);
++	priv->desc = xrx500_cbm_map(priv, cbm_np, "dma-desc",
++				    &priv->dma_desc_pa);
++	priv->qidt = xrx500_cbm_map(priv, cbm_np, "qidt", NULL);
++	priv->tmu = xrx500_cbm_map(priv, cbm_np, "tmu", NULL);
++	priv->fsqm[0] = xrx500_cbm_map(priv, cbm_np, "fsqm0", NULL);
++	priv->fsqm[1] = xrx500_cbm_map(priv, cbm_np, "fsqm1", NULL);
++
++	if (IS_ERR(priv->cbm) || IS_ERR(priv->eqm) || IS_ERR(priv->dqm) ||
++	    IS_ERR(priv->desc) || IS_ERR(priv->qidt) || IS_ERR(priv->tmu) ||
++	    IS_ERR(priv->fsqm[0]) || IS_ERR(priv->fsqm[1])) {
++		of_node_put(cbm_np);
++		ret = -ENODEV;
++		goto err_free;
++	}
++
++	ret = xrx500_cbm_pool_get(priv, cbm_np, "std-pool",
++				  XRX500_CBM_STD_SEG_SIZE, &priv->std);
++	if (!ret)
++		ret = xrx500_cbm_pool_get(priv, cbm_np, "jumbo-pool",
++					  XRX500_CBM_JBO_SEG_SIZE, &priv->jbo);
++	of_node_put(cbm_np);
++	if (ret)
++		goto err_free;
++
++	dma_np = of_parse_phandle(np, "lantiq,transmit-dma", 0);
++	if (!dma_np) {
++		dev_err(dev, "no lantiq,transmit-dma phandle\n");
++		ret = -ENODEV;
++		goto err_free;
++	}
++	ret = of_address_to_resource(dma_np, 0, &res);
++	of_node_put(dma_np);
++	if (ret) {
++		dev_err(dev, "transmit DMA window unresolvable: %d\n", ret);
++		goto err_free;
++	}
++	priv->dma = devm_ioremap(dev, res.start, resource_size(&res));
++	if (!priv->dma) {
++		dev_err(dev, "transmit DMA window not mappable\n");
++		ret = -ENOMEM;
++		goto err_free;
++	}
++	if (!cbm_r32(priv->dma, DMA_ID) ||
++	    cbm_r32(priv->dma, DMA_ID) == 0xFFFFFFFFU) {
++		dev_err(dev, "transmit DMA controller does not answer\n");
++		ret = -ENODEV;
++		goto err_free;
++	}
++
++	/*
++	 * Without ownership the segment pools have to be live already, or the
++	 * first transmit would find an empty free list.
++	 */
++	if (!own_cbm && !xrx500_cbm_free_segs(priv)) {
++		dev_info(dev, "segment pools not armed yet\n");
++		ret = -EPROBE_DEFER;
++		goto err_free;
++	}
++
++	/*
++	 * Bring-up order, and it is load bearing: the segment pools, then the
++	 * ports, then the queue-index table and the egress path, and only then
++	 * the managers, with the DMA channel last of all. Enabling a manager
++	 * before its endpoint has a queue-index entry and a traffic-management
++	 * queue leaves it admitting into a table nothing has written yet.
++	 *
++	 * Adding one datapath port to managers that are already running keeps
++	 * the tail of the same order and skips the steps that would restart
++	 * what is running.
++	 */
++	if (own_cbm) {
++		xrx500_cbm_pools_arm(priv);
++		xrx500_cbm_qidt_drop_fill(priv);
++	}
++
++	/*
++	 * Rearming the CPU ports makes this driver state its own requirements
++	 * rather than inherit them; the writes are the same values the running
++	 * configuration already holds.
++	 */
++	for (i = 0; i < CBM_CPU_PORT_NUM; i++)
++		xrx500_cbm_dqm_cpu_port(priv, i);
++	for (i = 0; i < CBM_CPU_PORT_NUM; i++)
++		xrx500_cbm_eqm_cpu_port(priv, i);
++
++	xrx500_cbm_dqm_dma_port(priv, false);
++
++	ret = xrx500_cbm_tmu_egress_path(priv);
++	if (ret) {
++		if (ret != -EPROBE_DEFER)
++			dev_err(dev, "egress path not built: %d\n", ret);
++		goto err_free;
++	}
++
++	xrx500_cbm_qidt_set(priv, priv->eg.dp_port, (u8)priv->eg.tmu_qid);
++
++	if (own_cbm)
++		xrx500_cbm_managers_enable(priv);
++
++	if (own_dma_chan)
++		xrx500_cbm_dma_chan_setup(priv);
++	else
++		xrx500_cbm_dma_chan_check(priv);
++
++	ndev->netdev_ops = &xrx500_cbm_netdev_ops;
++	ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
++	ndev->needed_headroom = 0;
++	ndev->min_mtu = ETH_MIN_MTU;
++	ndev->max_mtu = XRX500_CBM_MAX_MTU;
++	ndev->mtu = XRX500_CBM_MAX_MTU;
++	strscpy(ndev->name, "cbm%d", IFNAMSIZ);
++	eth_hw_addr_random(ndev);
++	netif_carrier_off(ndev);
++
++	ret = register_netdev(ndev);
++	if (ret) {
++		dev_err(dev, "register_netdev: %d\n", ret);
++		goto err_qidt;
++	}
++
++	platform_set_drvdata(pdev, priv);
++	scoped_guard(mutex, &xrx500_cbm_lock)
++		xrx500_cbm_singleton = priv;
++
++	dev_info(dev,
++		 "%s serves datapath port %u: dequeue %u queue %u channel %u, %u free segments\n",
++		 netdev_name(ndev), priv->eg.dp_port, priv->eg.deq_port,
++		 priv->eg.tmu_qid, priv->eg.dma_chan,
++		 xrx500_cbm_free_segs(priv));
++	return 0;
++
++err_qidt:
++	xrx500_cbm_qidt_set(priv, priv->eg.dp_port, 0);
++err_free:
++	timer_shutdown_sync(&priv->restart);
++	free_netdev(ndev);
++	return ret;
++}
++
++static void xrx500_cbm_remove(struct platform_device *pdev)
++{
++	struct xrx500_cbm *priv = platform_get_drvdata(pdev);
++
++	mutex_lock(&xrx500_cbm_lock);
++	xrx500_cbm_singleton = NULL;
++	mutex_unlock(&xrx500_cbm_lock);
++
++	unregister_netdev(priv->ndev);
++	timer_shutdown_sync(&priv->restart);
++	xrx500_cbm_qidt_set(priv, priv->eg.dp_port, 0);
++	free_netdev(priv->ndev);
++}
++
++static const struct of_device_id xrx500_cbm_of_match[] = {
++	{ .compatible = "lantiq,xrx500-conduit" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, xrx500_cbm_of_match);
++
++static struct platform_driver xrx500_cbm_driver = {
++	.probe = xrx500_cbm_probe,
++	.remove = xrx500_cbm_remove,
++	.driver = {
++		.name = XRX500_CBM_DRV_NAME,
++		.of_match_table = xrx500_cbm_of_match,
++	},
++};
++module_platform_driver(xrx500_cbm_driver);
++
++MODULE_DESCRIPTION("xRX500 buffer-manager conduit network device");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:08:49 +0000
+Subject: MIPS: dts: intel-mips: add xRX500 SoC dtsi and EASY350 ANYWAN board
+
+Add the xRX500 SoC device tree include and the Intel EASY350 ANYWAN
+(GRX350 reference board) DTS.
+
+The dtsi describes cpuintc + GIC, the CGU clock controller, the RCU
+syscon (reset controller and GPHY reset provider), serial, and the SSX4
+localbus with the EBU NAND controller window at 0x17c00000 (chip-select
+1) - the disabled-at-SoC-scope nodes are enabled per board.
+
+Based on the initial xrx500.dtsi from the 2018 intel-mips submission
+by Songjun Wu <songjun.wu@linux.intel.com>:
+
+  https://lore.kernel.org/all/20180803030237.3366-1-songjun.wu@linux.intel.com/
+
+extended with the nodes listed above.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/Makefile b/arch/mips/boot/dts/Makefile
+index 6d9dbe945541..eba9d9f4dd66 100644
+--- a/arch/mips/boot/dts/Makefile
++++ b/arch/mips/boot/dts/Makefile
+@@ -6,6 +6,7 @@ subdir-$(CONFIG_EYEQ)			+= mobileye
+ subdir-$(CONFIG_FIT_IMAGE_FDT_MARDUK)   += img
+ subdir-$(CONFIG_FIT_IMAGE_FDT_BOSTON)	+= img
+ subdir-$(CONFIG_MACH_INGENIC)		+= ingenic
++subdir-$(CONFIG_INTEL_MIPS)			+= intel-mips
+ subdir-$(CONFIG_LANTIQ)			+= lantiq
+ subdir-$(CONFIG_MACH_LOONGSON64)	+= loongson
+ subdir-$(CONFIG_MACH_LOONGSON32)	+= loongson
+diff --git a/arch/mips/boot/dts/intel-mips/Makefile b/arch/mips/boot/dts/intel-mips/Makefile
+new file mode 100644
+index 000000000000..6ef945b2b722
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/Makefile
+@@ -0,0 +1,4 @@
++# SPDX-License-Identifier: GPL-2.0-only
++dtb-$(CONFIG_DTB_INTEL_MIPS_GRX500)	+= easy350_anywan.dtb
++
++obj-$(CONFIG_BUILTIN_DTB)		+= $(addsuffix .o, $(dtb-y))
+diff --git a/arch/mips/boot/dts/intel-mips/easy350_anywan.dts b/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+new file mode 100644
+index 000000000000..725df1e2d556
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/easy350_anywan.dts
+@@ -0,0 +1,27 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Copyright (C) 2026 Grische <github@grische.xyz>
++/dts-v1/;
++
++#include <dt-bindings/interrupt-controller/mips-gic.h>
++#include <dt-bindings/clock/intel,grx500-clk.h>
++
++#include "xrx500.dtsi"
++
++/ {
++	model = "EASY350 ANYWAN (GRX350) Main model";
++	compatible = "intel,easy350-anywan";
++
++	aliases {
++		serial0 = &asc0;
++	};
++
++	chosen {
++		bootargs = "earlycon=lantiq,0x16600000 clk_ignore_unused";
++		stdout-path = "serial0";
++	};
++
++	memory@20000000 {
++		device_type = "memory";
++		reg = <0x20000000 0x0e000000>;
++	};
++};
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+new file mode 100644
+index 000000000000..d5e8f7115e8b
+--- /dev/null
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Copyright (C) 2026 Grische <github@grische.xyz>
++
++/ {
++	#address-cells = <1>;
++	#size-cells = <1>;
++	compatible = "intel,xrx500";
++
++	cpus {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		cpu0: cpu@0 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			clocks = <&cgu CLK_CPU>;
++			reg = <0>;
++		};
++
++		cpu1: cpu@1 {
++			device_type = "cpu";
++			compatible = "mti,interaptiv";
++			reg = <1>;
++		};
++	};
++
++	cpu_intc: interrupt-controller {
++		compatible = "mti,cpu-interrupt-controller";
++
++		interrupt-controller;
++		#address-cells = <0>;
++		#interrupt-cells = <1>;
++	};
++
++	gic: gic@12320000 {
++		compatible = "mti,gic";
++		reg = <0x12320000 0x20000>;
++
++		interrupt-controller;
++		#interrupt-cells = <3>;
++		/*
++		 * Declare the interrupt-parent even though the mti,gic
++		 * binding doesn't require it, such that the kernel can
++		 * figure out that cpu_intc is the root interrupt
++		 * controller & should be probed first.
++		 */
++		interrupt-parent = <&cpu_intc>;
++		mti,reserved-ipi-vectors = <56 8>;
++	};
++
++	cgu: cgu@16200000 {
++		compatible = "intel,grx500-cgu", "syscon";
++		reg = <0x16200000 0x200>;
++		#clock-cells = <1>;
++	};
++
++	/*
++	 * Reset Control Unit. The mainline lantiq,xrx200-reset driver must be
++	 * a syscon child: its reg is a byte offset into the parent regmap,
++	 * not an absolute address. #reset-cells = <2> is [set_bit,
++	 * status_bit], which on this SoC are not always the same number.
++	 */
++	rcu: rcu@16000000 {
++		compatible = "lantiq,xrx200-rcu", "simple-mfd", "syscon";
++		reg = <0x16000000 0x100>;
++		ranges = <0x0 0x16000000 0x100>;
++		#address-cells = <1>;
++		#size-cells = <1>;
++
++		rcu_reset0: reset-controller@10 {
++			compatible = "lantiq,xrx200-reset";
++			reg = <0x10 0x4>, <0x14 0x4>;
++			#reset-cells = <2>;
++		};
++	};
++
++	asc0: serial@16600000 {
++		compatible = "lantiq,asc";
++		reg = <0x16600000 0x100000>;
++
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 103 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SHARED 105 IRQ_TYPE_LEVEL_HIGH>,
++			<GIC_SHARED 106 IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&cgu CLK_SSX4>, <&cgu GCLK_UART>;
++		clock-names = "freq", "asc";
++	};
++
++	ebu_nand: nand-controller@16f00000 {
++		compatible = "lantiq,nand-xrx500";
++		/*
++		 * Two reg blocks: the EBU register window (256 bytes at
++		 * 0x16f00000) and the chip-select-1 NAND data window
++		 * (1 MiB at 0x17c00000). The CS1 window is fixed by the
++		 * EBU's ADDR_SEL1 region map (ADDR_MASK(5) on xRX500
++		 * selects a 1 MiB aperture starting at 0x17c00000).
++		 */
++		reg = <0x16f00000 0x100>,
++		      <0x17c00000 0x100000>;
++		reg-names = "ebunand", "nand_cs1";
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "disabled";
++	};
++};

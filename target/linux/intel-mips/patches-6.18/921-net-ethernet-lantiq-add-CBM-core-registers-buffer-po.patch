@@ -1,0 +1,1501 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:20:40 +0000
+Subject: net: ethernet: lantiq: add CBM core - registers, buffer pools, FSQM
+
+Start the CBM (Central Buffer Manager, the GRX500 "CQM" complex)
+support with its foundations:
+
+ - cbm.h and cbm_regs.h hold the byte-exact structure layouts and
+   the register topology of the eleven CBM MMIO windows (EQM enqueue
+   manager, DQM dequeue manager, FSQM free-segment queue manager,
+   load spreader, descriptor windows, TMU), and the port vocabulary
+   the manager speaks, meaning the dequeue-resource structures and the
+   port-class flags it fills in.
+
+ - cbm_buf.c serves the packet-buffer pools. The standard (18 MiB) and
+   jumbo (8 MiB) pools are no-map reserved-memory carve-outs the
+   board device tree declares, looked up by their memory-region names
+   std-pool and jumbo-pool and mapped with memremap. Pool physical
+   bases feed both the FSQM seeding and the SBA/JBA base registers.
+
+ - fsqm.c: FSQM initialization - seed the linked-list table
+   (LLT_RAM) with the per-slot reference counts, program the
+   OFSQ/OFSC/LSARNG free-queue geometry and FSQT thresholds,
+   enable interrupts, and only then set CTRL=1. The vendor
+   ordering (drain the IO_BUF, arm CTRL last) is load-bearing:
+   arming the FSQM before the rest of the geometry is programmed
+   corrupts the free-segment accounting.
+
+ - cbm_basic.c holds word-wise MMIO helpers.
+
+The arrays indexed by datapath port are sized for the full 0..15 space,
+because the TX descriptor's endpoint field is 4 bits wide and 15 is the
+largest datapath port the hardware can express.
+
+Nothing builds this code yet. The buffer manager, the traffic manager
+and the DMA driver resolve symbols against each other, so they are wired
+into the build together once the last of them exists.
+
+Structure layouts and register sequences derived from the AVM FRITZ!Box
+7560 GPL release (Linux 4.9.198), cqm/grx500/ (cbm.c, cbm.h, the
+generated reg/*.h). Those vendor sources carry no copyright notice of
+their own, in that release or in any other checked, so there is none to
+preserve and none is invented: each file header names the vendor file it
+came from instead.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+new file mode 100644
+index 000000000000..05f655ffa4af
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.h
+@@ -0,0 +1,513 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/cbm.h.
++ *
++ * CBM register overlays, descriptor layout and the intra-module function
++ * surface shared by the cbm_*.c translation units.
++ */
++
++#ifndef __XRX500_CBM_H
++#define __XRX500_CBM_H
++
++#include <linux/types.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/build_bug.h>
++#include <linux/stddef.h>
++#include <linux/list.h>
++#include <linux/bitops.h>
++
++#include "cbm_regs.h"
++
++struct net_device;
++
++/*
++ * Port-resource vocabulary, from the AVM FRITZ!Box 7560 GPL release (Linux
++ * 4.9.198), include/net/lantiq_cbm_api.h.
++ */
++
++/* Which fields of struct cbm_dp_alloc_data the manager filled in. */
++#define CBM_PORT_DP_SET		BIT(0)
++#define CBM_PORT_DQ_SET		BIT(1)
++#define CBM_PORT_DMA_CHAN_SET	BIT(2)
++
++/*
++ * Dequeue-port class. The first four name a processor port; the rest
++ * describe the kind of endpoint a datapath port serves, and select the row
++ * of the dequeue-resource table that port is allocated from.
++ */
++#define DP_F_DEQ_CPU		0x2
++#define DP_F_DEQ_CPU1		0x3
++#define DP_F_DEQ_MPE		0x4
++#define DP_F_DEQ_DL		0x5
++
++#define DP_F_FAST_ETH_LAN	BIT(1)
++#define DP_F_FAST_ETH_WAN	BIT(2)
++#define DP_F_FAST_WLAN		BIT(3)
++#define DP_F_FAST_DSL		BIT(4)
++#define DP_F_DIRECT		BIT(5)
++#define DP_F_LOOPBACK		BIT(6)
++#define DP_F_DIRECTLINK		BIT(7)
++#define DP_F_MPE_ACCEL		BIT(25)
++#define DP_F_CHECKSUM		BIT(26)
++#define DP_F_DIRECTPATH_RX	BIT(27)
++#define DP_F_DONTCARE		BIT(28)
++#define DP_F_LRO		BIT(29)
++#define DP_F_FAST_DSL_DOWNSTREAM BIT(30)
++#define DP_F_PORT_TUNNEL_DECAP	DP_F_LOOPBACK
++
++/* The dequeue resources a datapath port was allocated. */
++struct cbm_dp_alloc_data {
++	int dp_inst;
++	int cbm_inst;
++	u32 flags;
++	u32 dp_port;
++	u32 deq_port_num;
++	u32 deq_port;
++	u32 dma_chan;
++	u32 tx_pkt_credit;
++	u32 tx_b_credit;
++	u32 tx_ring_addr;
++	u32 tx_ring_size;
++	u32 tx_ring_offset;
++	u32 num_dma_chan;
++};
++
++/* The dequeue resources to arm when a datapath port is enabled. */
++struct cbm_dp_en_data {
++	int dp_inst;
++	int cbm_inst;
++	u32 deq_port;
++	u32 dma_chnl_init;
++	u32 num_dma_chan;
++};
++
++/*
++ * One traffic-manager port: its dequeue port, and the scheduler and queue
++ * hung off it. -1 in a field means nothing is allocated there.
++ */
++struct cbm_tmu_res {
++	u32 tmu_port;
++	u32 cbm_deq_port;
++	s32 tmu_sched;
++	s32 tmu_q;
++};
++
++/*
++ * struct cbm_desc — CBM/TMU 16-byte descriptor.
++ *
++ * Verbatim from AVM include/net/lantiq_cbm_api.h:1460-1465.
++ */
++#ifndef __CBM_DESC_DEFINED
++#define __CBM_DESC_DEFINED
++struct cbm_desc {
++	u32 desc0;
++	u32 desc1;
++	u32 desc2;
++	u32 desc3;
++};
++#endif
++
++/*
++ * struct cbm_int_reg — interrupt-line MMIO overlay.
++ *
++ * Verbatim from AVM cbm.h:442-454. Offsets:
++ *   cbm_irncr  = 0x00   cbm_irnicr = 0x04   cbm_irnen  = 0x08
++ *   resv0[1]   = 0x0C
++ *   igp_irncr  = 0x10   igp_irnicr = 0x14   igp_irnen  = 0x18
++ *   resv1[1]   = 0x1C
++ *   egp_irncr  = 0x20   egp_irnicr = 0x24   egp_irnen  = 0x28
++ */
++struct cbm_int_reg {
++	u32 cbm_irncr;
++	u32 cbm_irnicr;
++	u32 cbm_irnen;
++	u32 resv0[1];
++	u32 igp_irncr;
++	u32 igp_irnicr;
++	u32 igp_irnen;
++	u32 resv1[1];
++	u32 egp_irncr;
++	u32 egp_irnicr;
++	u32 egp_irnen;
++};
++
++/*
++ * struct cbm_eqm_cpu_igp_reg — per-CPU enqueue ingress port window.
++ *
++ * Verbatim from AVM cbm.h:356-381 (resv2[12] and resv4[27] are NOT
++ * truncated — they are the planner's compiler-verified pad sizes that
++ * push new_sptr to 0x80, new_jptr to 0x90, desc0 to 0x100, desc1 to
++ * 0x110, and stride to 0x120). Any deviation from those offsets
++ * indicates a struct miscopy.
++ */
++struct cbm_eqm_cpu_igp_reg {
++	u32 cfg;
++	u32 wm;
++	u32 pocc;
++	u32 eqpc;
++	struct cbm_desc disc;
++	u32 irncr;
++	u32 irnicr;
++	u32 irnen;
++	u32 resv0[2];
++	u32 rcnt;
++	u32 dicc;
++	u32 rcntc;
++	u32 nsbpc;
++	u32 njbpc;
++	u32 resv1[1];
++	u32 dcntr;
++	u32 resv2[12];
++	u32 new_sptr;
++	u32 resv3[3];
++	u32 new_jptr;
++	u32 resv4[27];
++
++	struct cbm_desc desc0;
++	struct cbm_desc desc1;
++};
++
++/*
++ * struct cbm_eqm_dma_igp_reg — per-DMA enqueue ingress port window.
++ *
++ * Verbatim from AVM cbm.h:383-396.
++ */
++struct cbm_eqm_dma_igp_reg {
++	u32 cfg;
++	u32 wm;
++	u32 pocc;
++	u32 eqpc;
++	struct cbm_desc disc;
++	u32 irncr;
++	u32 irnicr;
++	u32 irnen;
++	u32 resv0;
++	u32 dptr;
++	u32 resv1;
++	u32 dicc;
++};
++
++/*
++ * struct cbm_dqm_cpu_egp_reg — per-CPU dequeue egress port window.
++ *
++ * Verbatim from AVM cbm.h:398-413.
++ */
++struct cbm_dqm_cpu_egp_reg {
++	u32 cfg;
++	u32 dqpc;
++	u32 resv0[6];
++	u32 irncr;
++	u32 irnicr;
++	u32 irnen;
++	u32 resv1;
++	u32 dptr;
++	u32 bprc;
++	u32 resv2[18];
++	u32 ptr_rtn;
++	u32 resv3[31];
++	struct cbm_desc desc0;
++	struct cbm_desc desc1;
++};
++
++/*
++ * Address-calculation macros — verbatim from AVM cbm.h:167-189.
++ *
++ * The (idx)*0x1000 stride matches the 4 KiB per-port window the HW
++ * enforces. CBM_IOCU_ADDR converts a KSEG0/KSEG1 pointer to its KSEG1
++ * uncacheable alias (((addr) & 0x1FFFFFFF) | 0xC0000000).
++ */
++#define CBM_EQM_CPU_PORT(idx, reg) \
++	(CFG_CPU_IGP_0 + (idx) * 0x1000 + offsetof(struct cbm_eqm_cpu_igp_reg, reg))
++#define CBM_EQM_DMA_PORT(idx, reg) \
++	(CFG_DMA_IGP_5 + (idx) * 0x1000 + offsetof(struct cbm_eqm_dma_igp_reg, reg))
++#define CBM_DQM_CPU_PORT(idx, reg) \
++	(CFG_CPU_EGP_0 + (idx) * 0x1000 + offsetof(struct cbm_dqm_cpu_egp_reg, reg))
++#define CBM_INT_LINE(idx, reg) \
++	((idx) * 0x40 + offsetof(struct cbm_int_reg, reg))
++/* AVM cbm.h:181-182 — verbatim. Parens around (addr) inside the mask
++ * defend against macro-expansion bugs when passed a `base + offset`
++ * expression.
++ */
++#define CBM_IOCU_ADDR(addr) \
++	(((addr) & 0x1FFFFFFF) | 0xC0000000)
++/* AVM cbm.h CBM_EQM_DMA_DESC macro. The ((pid)-5) factor reflects that
++ * AVM's DMA-IGP ports are numbered 5..8 but the per-port descriptor
++ * staging window starts at SDESC0_0_IGP_5.
++ */
++#define CBM_EQM_DMA_DESC(pid, des_idx, jbo_flag) \
++	(SDESC0_0_IGP_5 + ((pid) - 5) * 0x1000 + (des_idx) * 16 + (jbo_flag) * 0x800)
++/* FSQM_LLT_RAM / FSQM_RCNT — verbatim from AVM cbm.h:167-170. (idx)<<2
++ * is the per-segment u32 stride.
++ */
++#define FSQM_LLT_RAM(fsqm_base, idx) \
++	((fsqm_base) + RAM + ((idx) << 2))
++#define FSQM_RCNT(fsqm_base, idx) \
++	((fsqm_base) + RCNT + ((idx) << 2))
++
++/*
++ * The plan's 12-base layout matches the AVM cbm_base_addr struct fields
++ * (cqm/grx500/cbm.h:336-348). All bases except g_cbm_fsqm_base[] are
++ * single-entry; FSQM has two physical instances (FSQM0 / FSQM1).
++ */
++extern void __iomem *g_cbm_tmu_base;
++extern void __iomem *g_cbm_base;
++extern void __iomem *g_cbm_qidt_base;
++extern void __iomem *g_cbm_qeqcnt_base;
++extern void __iomem *g_cbm_qdqcnt_base;
++extern void __iomem *g_cbm_eqm_base;
++extern void __iomem *g_cbm_dqm_base;
++extern void __iomem *g_cbm_fsqm_base[2];
++extern void __iomem *g_cbm_dma_desc_base;
++
++/*
++ * Per-window MMIO accessors.
++ *
++ * KISS: one helper per ioremap'd window so the caller cannot accidentally
++ * route an EQM offset through the DQM base. The accessor inlines wrap
++ * __raw_readl/__raw_writel (matching AVM xrx500_cbm_r32/w32 at AVM cbm.c:170-171)
++ * so MIPS strict byte-ordering applies to the descriptor traffic.
++ */
++static inline u32 xrx500_cbm_r32(u32 off)
++{
++	return __raw_readl(g_cbm_base + off);
++}
++static inline u32 cbm_eqm_r32(u32 off)
++{
++	return __raw_readl(g_cbm_eqm_base + off);
++}
++static inline void cbm_eqm_w32(u32 off, u32 val)
++{
++	__raw_writel(val, g_cbm_eqm_base + off);
++}
++
++static inline u32 cbm_dqm_r32(u32 off)
++{
++	return __raw_readl(g_cbm_dqm_base + off);
++}
++static inline void cbm_dqm_w32(u32 off, u32 val)
++{
++	__raw_writel(val, g_cbm_dqm_base + off);
++}
++
++static inline u32 fsqm_r32(int idx, u32 off)
++{
++	return __raw_readl(g_cbm_fsqm_base[idx] + off);
++}
++static inline void fsqm_w32(int idx, u32 off, u32 val)
++{
++	__raw_writel(val, g_cbm_fsqm_base[idx] + off);
++}
++
++struct cbm_buff {
++	void *std_buf_base;
++	void *std_buf_addr;
++	void *jbo_buf_base;
++	void *jbo_buf_addr;
++	u32 std_pool_size;
++	u32 jbo_pool_size;
++	u32 std_frm_size;
++	u32 jbo_frm_size;
++	u32 std_frm_num;
++	u32 jbo_frm_num;
++	bool placeholder;
++};
++
++extern struct cbm_buff g_cbm_buff;
++
++/*
++ * Faithful port of the AVM 4.9 registry surface that conf_dqm_cpu_port /
++ * dp_port_resources_get consume (bodies in cbm_ports.c). Provenance:
++ *   - CBM_PMAC_DYNAMIC..CBM_PORT_NOT_APPL: AVM cqm/cqm_common.h:9-12
++ *   - CBM_MAX_PHY_PORT_PER_EP:             AVM cqm/grx500/cbm.c:23
++ *   - SBID_START / CBM_NOTFOUND / CBM_PORT_MAX: AVM cqm/grx500/cbm.h:207-210
++ *   - CBM_SUCCESS / CBM_FAILURE:           AVM cqm/cqm_common.h:22-23
++ *     (cbm_intr.c:130-131 carries identical-token local mirrors; the
++ *      #ifndef guards + identical replacement lists keep both legal)
++ *   - enum FREE_FLAG:                      AVM cqm/grx500/cbm.h:94-103
++ *   - struct cbm_egp_map:                  AVM cqm/grx500/cbm.h:490-494
++ *   - struct cbm_pmac_port_map:            AVM cqm/grx500/cbm.h:521-538
++ *   - cbm_dq_info_t / struct cbm_dqm_port_info: REDUCED ports, see below
++ *   - get_is_bit_set:                      AVM cqm/cqm_common.h:232-235
++ */
++#define CBM_PMAC_DYNAMIC 1000
++#define CBM_PORT_INVALID 2000
++#define CBM_PMAC_NOT_APPL 3000
++#define CBM_PORT_NOT_APPL 255
++#define CBM_MAX_PHY_PORT_PER_EP 4
++#define SBID_START 16
++#define CBM_NOTFOUND 2
++#define CBM_PORT_MAX 64
++/*
++ * Datapath port-id space on GSWIP-3.0: 0..15. The bound is silicon, not
++ * convention — the TX descriptor's DW1 "ep" field is 4 bits wide, so 15 is
++ * the largest representable dp port and any array indexed by dp_port_id
++ * needs exactly this many slots.
++ */
++#define CBM_MAX_DP_PORTS 16
++#ifndef CBM_SUCCESS
++#define CBM_SUCCESS 0
++#endif
++#ifndef CBM_FAILURE
++#define CBM_FAILURE (-1)
++#endif
++
++/*! PMAC port flag — AVM cbm.h:94-103 verbatim. */
++enum FREE_FLAG {
++	P_FREE = 0, /*! The port is free */
++	/*the port is already allocated to some driver,
++	 *but not registered or no need to register at all.\n
++	 *for example, LRO/CAPWA, only need to allocate,
++	 *but no need to register
++	 */
++	P_ALLOCATED,
++	P_REGISTERED, /*! Registered already. */
++	P_FLAG_NO_VALI /*! Not valid flag */
++};
++
++/* AVM cbm.h:490-494 verbatim — epg_lookup_table row shape. */
++struct cbm_egp_map {
++	u32 epg;
++	u32 pmac;
++	u32 port_type;
++};
++
++/**
++ * struct cbm_dp_egress_res - egress resources of one Ethernet datapath port.
++ *
++ * @deq_port: CBM DQM dequeue port.
++ *
++ * @tmu_queue: TMU queue feeding @deq_port. The scheduler block id is
++ *             @tmu_queue - SBID_START.
++ *
++ * @dma_ctrl:  DMA controller draining @deq_port, in AVM cbm_config.c's
++ *             encoding: 1 = DMA1TX, 2 = DMA2TX. NOT an enum dma_controller
++ *             cid — callers translate.
++ *
++ * @dma_chan:  channel within @dma_ctrl.
++ *
++ * Filled by cbm_dp_egress_res_get() from the ported vendor tables. The four
++ * fields always come from one pair of vendor rows, so they cannot drift
++ * apart the way four independent closed forms could.
++ */
++struct cbm_dp_egress_res {
++	u32 deq_port;
++	u32 tmu_queue;
++	u32 dma_ctrl;
++	u32 dma_chan;
++};
++
++int cbm_dp_egress_res_get(u32 dp_port_id, struct cbm_dp_egress_res *res);
++
++/*
++ * cbm_dq_info_t — REDUCED port of AVM include/net/lantiq_cbm_api.h:486-492.
++ * Member names identical to AVM.
++ */
++typedef struct cbm_dq_info {
++	uint32_t port_no; /*! < CBM Dequeue Port No */
++	int32_t dma_tx_chan; /*! PMAC DMA Tx Channel */
++	uint32_t num_desc; /*!< Number of Descriptors at port base */
++} cbm_dq_info_t;
++
++/*
++ * struct cbm_dqm_port_info — REDUCED port of AVM cbm.h:497-509. Member names
++ * identical to AVM for every field conf_dqm_cpu_port / dp_port_resources_get
++ * touch.
++ */
++struct cbm_dqm_port_info {
++	u32 def_qid;
++	u32 def_schd;
++	u32 num_free_entries; /*!< Number of Free Port entries */
++	cbm_dq_info_t deq_info;
++	u32 egp_type;
++};
++
++/* AVM cbm.h:521-538 verbatim — registry node. */
++struct cbm_pmac_port_map {
++	/*! port flag */
++	enum FREE_FLAG flags;
++	struct module *owner;
++	struct net_device *dev;
++	u32 dev_port;
++	u32 pmac;
++	/*bit map to egp port*/
++	u32 egp_port_map;
++	/*queue numbers allocated to that pmac port*/
++	u32 qid_num;
++	u32 qids[16]; /*qid array*/
++	/*e.g. DP_F_FAST_ETH_LAN/DP_F_FAST_ETH_WAN/
++	 *DP_F_DIRECT/High priority/Low priority
++	 */
++	u32 egp_type;
++	struct list_head list;
++};
++
++int cbm_configure_dqm_cpu_ports(void);
++/*
++ * Descriptor count conf_dqm_cpu_port recorded for a DQM port, 0 if no config
++ * row covers it. init_cbm_dqm_cpu_port (cbm_dma.c) reads it to decide whether
++ * to write dptr at all — AVM cbm.c:1435/1439-1441.
++ */
++u32 cbm_dqm_port_num_desc(int idx);
++void cbm_program_cpu_qidt(u8 qid_val);
++
++void init_fsqm(int idx);
++int init_cbm_basic(void);
++int cbm_intr_mapping_init(void);
++int cbm_interrupt_init(struct platform_device *pdev, int *irqs);
++int cbm_hw_init(struct platform_device *pdev);
++
++void *cbm_buf_phys_to_virt(u32 phys);
++
++void *cbm_fsqm_buf_alloc(int pid, u32 flags, u32 *buf_phys); /* flags = pool select */
++
++int init_cbm_eqm_dma_port(int idx, u32 flags); /* flags = std/jumbo buffer type */
++int init_cbm_eqm_ldma_port(void); /* IGP15 VRX318/LDMA arming */
++int init_cbm_eqm_cpu_port(int idx);
++/*
++ * Per-port IRN enable sweep over the CPU EQM ingress / CPU DQM egress ports —
++ * AVM cbm.c:2970-2984. Probe masks both with 0 at the tail (AVM cbm.c:5791-
++ * 5794) so the per-port sources stop feeding the CBM_INT_LINE aggregates.
++ */
++void eqm_intr_ctrl(u32 val);
++void dqm_intr_ctrl(u32 val);
++int init_cbm_dqm_dma_port(int dqp);
++int init_cbm_dqm_cpu_port(int idx);
++extern bool g_cbm_egress_preconfig[CBM_MAX_DP_PORTS];
++int setup_eqm_dma_desc(int pid, int desc_count, u32 flags, u32 buf_offset);
++
++/* cbm_dw_memset - 32-bit-aligned wordwise memset over MMIO. */
++void cbm_dw_memset(u32 *base, int val, u32 size);
++
++static_assert(offsetof(struct cbm_int_reg, igp_irnen) == 0x18,
++	      "cbm_int_reg.igp_irnen must be at offset 0x18 (AVM cbm.h:442-454)");
++static_assert(offsetof(struct cbm_int_reg, egp_irnen) == 0x28,
++	      "cbm_int_reg.egp_irnen must be at offset 0x28 (AVM cbm.h:442-454)");
++static_assert(offsetof(struct cbm_eqm_cpu_igp_reg, new_sptr) == 0x80,
++	      "cbm_eqm_cpu_igp_reg.new_sptr must be at offset 0x80 (AVM cbm.h:356-381)");
++static_assert(offsetof(struct cbm_eqm_cpu_igp_reg, new_jptr) == 0x90,
++	      "cbm_eqm_cpu_igp_reg.new_jptr must be at offset 0x90 (AVM cbm.h:356-381)");
++static_assert(offsetof(struct cbm_eqm_cpu_igp_reg, desc0) == 0x100,
++	      "cbm_eqm_cpu_igp_reg.desc0 must be at offset 0x100 (AVM cbm.h:356-381)");
++static_assert(offsetof(struct cbm_eqm_cpu_igp_reg, desc1) == 0x110,
++	      "cbm_eqm_cpu_igp_reg.desc1 must be at offset 0x110 (AVM cbm.h:356-381)");
++static_assert(offsetof(struct cbm_dqm_cpu_egp_reg, irncr) == 0x20,
++	      "cbm_dqm_cpu_egp_reg.irncr must be at offset 0x20 (AVM cbm.h:398-413)");
++static_assert(offsetof(struct cbm_dqm_cpu_egp_reg, ptr_rtn) == 0x80,
++	      "cbm_dqm_cpu_egp_reg.ptr_rtn must be at offset 0x80 (AVM cbm.h:398-413)");
++static_assert(offsetof(struct cbm_dqm_cpu_egp_reg, desc0) == 0x100,
++	      "cbm_dqm_cpu_egp_reg.desc0 must be at offset 0x100 (AVM cbm.h:398-413)");
++static_assert(offsetof(struct cbm_eqm_dma_igp_reg, irncr) == 0x20,
++	      "cbm_eqm_dma_igp_reg.irncr must be at offset 0x20 (AVM cbm.h:383-396)");
++static_assert(offsetof(struct cbm_eqm_dma_igp_reg, dptr) == 0x30,
++	      "cbm_eqm_dma_igp_reg.dptr must be at offset 0x30 (AVM cbm.h:383-396)");
++static_assert(offsetof(struct cbm_eqm_dma_igp_reg, dicc) == 0x38,
++	      "cbm_eqm_dma_igp_reg.dicc must be at offset 0x38 (AVM cbm.h:383-396)");
++static_assert(CBM_GRX550_DMA_DATA_OFFSET == 128,
++	      "CBM_GRX550_DMA_DATA_OFFSET must equal 128 (AVM cqm/cqm_common.h:18-19)");
++static_assert(FSQM_IRNEN_DEFAULT == 0x111101F,
++	      "FSQM_IRNEN_DEFAULT must equal 0x111101F (AVM cbm.c:1129)");
++
++#endif /* __XRX500_CBM_H */
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c
+new file mode 100644
+index 000000000000..58176e248520
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_basic.c
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c and cqm/cqm_common.h.
++ *
++ * CBM low-level register helpers: read-modify-write of an MMIO bit-field,
++ * block memset and the EQM/DQM counter-mode selector.
++ */
++
++#include <linux/kernel.h>
++#include <linux/types.h>
++#include <linux/io.h>
++#include <linux/module.h>
++
++#include "cbm.h"
++
++/* Forward declaration matching the extern in cbm.c. */
++void cbm_set_val(void __iomem *addr, u32 val, u32 mask, u32 shift);
++
++/* cbm_dw_memset - 32-bit-aligned wordwise memset over MMIO. */
++void cbm_dw_memset(u32 *base, int val, u32 size)
++{
++	u32 i;
++
++	if (!base)
++		return;
++	for (i = 0; i < size / sizeof(u32); i++)
++		__raw_writel((u32)val, &base[i]);
++}
++EXPORT_SYMBOL_GPL(cbm_dw_memset);
++
++/* cbm_set_val - read-modify-write of an MMIO bit-field. */
++void cbm_set_val(void __iomem *addr, u32 val, u32 mask, u32 shift)
++{
++	u32 reg;
++
++	if (!addr || !mask)
++		return;
++
++	reg  = __raw_readl(addr);
++	reg &= ~mask;
++	reg |= (val << shift) & mask;
++	__raw_writel(reg, addr);
++}
++EXPORT_SYMBOL_GPL(cbm_set_val);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_buf.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_buf.c
+new file mode 100644
+index 000000000000..3c552a969eef
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_buf.c
+@@ -0,0 +1,361 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2026 Grische <github@grische.xyz>
++ *
++ * CBM buffer pools carved out of reserved memory: resolve, map, align and
++ * free-list each pool, and hand chunks to the CPU-TX path.
++ */
++
++#include <linux/kernel.h>
++#include <linux/printk.h>
++#include <linux/types.h>
++#include <linux/errno.h>
++#include <linux/device.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/io.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/sizes.h>
++
++#include "cbm.h"
++
++#define DEFAULT_STD_FRM_SIZE               2048U
++#define DEFAULT_JBO_FRM_SIZE               8192U
++
++/* Number of pool kinds carried by this TU. */
++#define CBM_POOL_STD  0
++#define CBM_POOL_JBO  1
++#define CBM_POOL_NUM  2
++
++/*
++ * Public function prototypes for the cross-TU callers in cbm.c.
++ *
++ * The kernel build's -Werror=missing-prototypes wants the defining TU to also
++ * see a prototype before the definition; placing them at file scope satisfies
++ * the toolchain without widening cbm.h.
++ */
++int cbm_buf_init_pools(struct device *dev);
++phys_addr_t cbm_buf_pool_phys_base(int which);
++
++/*
++ * struct cbm_pool — one CBM reserved-memory carve pool.
++ *
++ * @name:        memory-region-names entry ("std-pool" / "jumbo-pool")
++ *               used in pr_info / pr_err substrings the hardware tester
++ *               greps for. Set from of_reserved_mem_lookup()->name so the
++ *               DT name is reflected verbatim.
++ *
++ * @phys_base:   physical address of the reserved region (aligned UP via
++ *               buf_addr_adjust to @frm_size — defensive; the 5.10
++ *               reference addresses are already 0x1000-aligned).
++ *
++ * @size:        usable region size after @phys_base alignment.
++ *
++ * @virt_base:   memremap() result — kernel virtual base, used for
++ *               free-list traversal. devm_memremap()-managed so unbind
++ *               releases it without explicit munmap.
++ *
++ * @frm_size:    per-chunk size (2048 for std, 8192 for jbo). The carve
++ *               allocator returns chunks of exactly @frm_size.
++ *
++ * @frm_num:     number of chunks the carve allocator manages (floor of
++ *               @size / @frm_size — any tail bytes are unreachable).
++ *
++ * @lock: protects @free_head.
++ *
++ * @free_head:   head of the embedded singly-linked free-list. Each free
++ *               chunk's first sizeof(void *) bytes hold the kernel-virt
++ *               pointer to the next free chunk. NULL means the pool is
++ *               drained.
++ *
++ * Invariants: - @virt_base must remain valid for the lifetime of the bound
++ * device. Every pointer reachable from @free_head lies in [virt_base,
++ * virt_base + frm_num * frm_size). @free_head transitions only under @lock. A
++ * chunk handed out by cbm_buf_alloc must NOT have its first bytes touched
++ * until the consumer overwrites them — the consumer is then free to use the
++ * whole chunk including byte 0; cbm_buf_free re-establishes the embedded next
++ * pointer when the chunk is returned.
++ */
++struct cbm_pool {
++	const char *name;
++	phys_addr_t phys_base;
++	size_t size;
++	void *virt_base;
++	u32 frm_size;
++	u32 frm_num;
++	spinlock_t lock;
++	void *free_head;
++};
++
++static struct cbm_pool g_cbm_pools[CBM_POOL_NUM] = {
++	[CBM_POOL_STD] = { .name = "std-pool" },
++	[CBM_POOL_JBO] = { .name = "jumbo-pool" },
++};
++
++/* Global pool tracker. */
++struct cbm_buff g_cbm_buff = {
++	.std_frm_size = DEFAULT_STD_FRM_SIZE,
++	.jbo_frm_size = DEFAULT_JBO_FRM_SIZE,
++};
++EXPORT_SYMBOL_GPL(g_cbm_buff);
++
++/*
++ * buf_addr_adjust - round a raw allocator return up to the frame-size
++ * alignment.
++ *
++ * The contract is unchanged — only the dead-code marker dropped.
++ */
++static void *buf_addr_adjust(void *raw, u32 frm_size)
++{
++	uintptr_t a = (uintptr_t)raw;
++	uintptr_t fs;
++
++	if (!frm_size)
++		return raw;
++
++	fs = (uintptr_t)frm_size;
++	if ((a % fs) == 0)
++		return raw;
++
++	/* Otherwise align UP to the next frm_size multiple. Generic
++	 * arithmetic (no power-of-two mask shortcut) keeps the carve
++	 * allocator correct even if frm_size is not a power of two.
++	 */
++	a = a + (fs - (a % fs));
++	return (void *)a;
++}
++
++/*
++ * carve_pool_build_freelist — populate @pool->free_head with frm_num
++ * frm_size-aligned chunks reachable via embedded next pointers.
++ *
++ * Walks the pool from the highest chunk to the lowest, pushing each onto
++ * the head. The resulting free-list iterates chunks lowest-to-highest
++ * (pop returns lowest first) — a stable-traversal order that makes early
++ * boot dmesg easier to read; not a functional requirement.
++ *
++ * @pool->virt_base, @pool->frm_size, and @pool->frm_num must all be set
++ * before this is called.
++ */
++static void carve_pool_build_freelist(struct cbm_pool *pool)
++{
++	u32 i;
++	void *chunk;
++
++	pool->free_head = NULL;
++	for (i = pool->frm_num; i-- > 0; ) {
++		chunk = (u8 *)pool->virt_base + (size_t)i * pool->frm_size;
++		*(void **)chunk = pool->free_head;
++		pool->free_head = chunk;
++	}
++}
++
++/*
++ * carve_pool_init_one - resolve, map, align, and freelist-seed a single pool
++ * by name.
++ *
++ * Resolve the phandle by name via of_property_match_string +
++ * of_parse_phandle. 2. of_reserved_mem_lookup() to pull phys_base + size out
++ * of the reservation tracker (set up by
++ * early_init_dt_alloc_reserved_memory_arch at boot from the fdt). 3. Reject
++ * regions smaller than 2 * frm_size — anything smaller can hand out at most
++ * one chunk and is a configuration error. 4. devm_memremap(MEMREMAP_WB) the
++ * region. 5. buf_addr_adjust() the kernel-virt base up to frm_size alignment.
++ * 6. Re-derive phys_base by applying the same alignment shift, so
++ * cbm_buf_pool_phys_base() reflects the carved start (not the raw
++ * reserved-region start). 7. Compute frm_num = floor(size / frm_size). 8.
++ * Build the embedded free-list. 9. Each pool logs its resolved physical base
++ * and size under its own name.
++ */
++static int carve_pool_init_one(struct device *dev,
++			       struct cbm_pool *pool,
++			       u32 frm_size)
++{
++	struct device_node *np = dev->of_node;
++	struct device_node *rmem_np;
++	struct reserved_mem *rmem;
++	void *virt;
++	void *aligned_virt;
++	phys_addr_t aligned_phys;
++	int idx;
++
++	if (!np) {
++		dev_err(dev, "cbm: %s: parent of_node NULL\n", pool->name);
++		return -ENODEV;
++	}
++
++	/* (1) Resolve phandle by name. */
++	idx = of_property_match_string(np, "memory-region-names",
++				       pool->name);
++	if (idx < 0) {
++		dev_err(dev,
++			"cbm: %s: memory-region-names lookup failed: %d\n",
++			pool->name, idx);
++		return -ENODEV;
++	}
++
++	rmem_np = of_parse_phandle(np, "memory-region", idx);
++	if (!rmem_np) {
++		dev_err(dev,
++			"cbm: %s: of_parse_phandle(memory-region[%d]) returned NULL\n",
++			pool->name, idx);
++		return -ENODEV;
++	}
++
++	/* (2) Look up the reserved-memory entry. */
++	rmem = of_reserved_mem_lookup(rmem_np);
++	of_node_put(rmem_np);
++	if (!rmem) {
++		dev_err(dev,
++			"cbm: %s: of_reserved_mem_lookup returned NULL\n",
++			pool->name);
++		return -ENODEV;
++	}
++
++	/* (3) Sanity-check the size — must fit at least 2 chunks. */
++	if (rmem->size < (phys_addr_t)frm_size * 2) {
++		dev_err(dev,
++			"cbm: %s: region size %pa < 2 * frm_size (%u)\n",
++			pool->name, &rmem->size, frm_size);
++		return -EINVAL;
++	}
++
++	/* (4) Establish a kernel-virtual mapping. devm-managed. */
++	virt = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WB);
++	if (!virt) {
++		dev_err(dev,
++			"cbm: %s: devm_memremap(phys=%pa size=%pa) failed\n",
++			pool->name, &rmem->base, &rmem->size);
++		return -ENOMEM;
++	}
++
++	/*
++	 * Compute the same shift on both the kernel-virt pointer and the
++	 * physical address so the two stay in lockstep.
++	 */
++	aligned_virt = buf_addr_adjust(virt, frm_size);
++	aligned_phys = rmem->base +
++		       ((phys_addr_t)((u8 *)aligned_virt - (u8 *)virt));
++
++	/* (7) Frame count after alignment. */
++	pool->phys_base = aligned_phys;
++	pool->size      = rmem->size -
++			  (size_t)((u8 *)aligned_virt - (u8 *)virt);
++	pool->virt_base = aligned_virt;
++	pool->frm_size  = frm_size;
++	pool->frm_num   = pool->size / frm_size;
++
++	if (pool->frm_num < 2) {
++		dev_err(dev,
++			"cbm: %s: after alignment frm_num=%u < 2 (size=%zu frm_size=%u)\n",
++			pool->name, pool->frm_num, pool->size, frm_size);
++		return -EINVAL;
++	}
++
++	spin_lock_init(&pool->lock);
++
++	/* (8) Seed the embedded free-list. */
++	carve_pool_build_freelist(pool);
++
++	pr_info("cbm: reserved-memory %s resolved @ phys 0x%llx size 0x%zx (frm_size=%u frm_num=%u)\n",
++		pool->name,
++		(unsigned long long)pool->phys_base,
++		pool->size,
++		pool->frm_size,
++		pool->frm_num);
++
++	return 0;
++}
++
++/*
++ * cbm_buf_init_pools - public entry point called from cbm_xrx500_probe().
++ *
++ * Partial success is intentionally NOT supported: a single-pool CBM is
++ * meaningless because the SBA_0/JBA_0 hardware registers must both be
++ * programmed before init_cbm_basic completes.
++ *
++ * devm-attached resources are released automatically on driver unbind;
++ * the carve allocator's free-list lives in the memremap'd memory, so
++ * losing the mapping is equivalent to losing the free-list — no separate
++ * teardown is required.
++ */
++int cbm_buf_init_pools(struct device *dev)
++{
++	int ret;
++
++	if (!dev) {
++		pr_err("cbm: cbm_buf_init_pools: NULL dev\n");
++		return -EINVAL;
++	}
++
++	/* std pool — 2048 byte chunks. */
++	ret = carve_pool_init_one(dev, &g_cbm_pools[CBM_POOL_STD],
++				  DEFAULT_STD_FRM_SIZE);
++	if (ret)
++		return ret;
++
++	/* jbo pool — 8192 byte chunks. */
++	ret = carve_pool_init_one(dev, &g_cbm_pools[CBM_POOL_JBO],
++				  DEFAULT_JBO_FRM_SIZE);
++	if (ret)
++		return ret;
++
++	/* Mirror dimensions into g_cbm_buff. */
++	g_cbm_buff.std_frm_size  = g_cbm_pools[CBM_POOL_STD].frm_size;
++	g_cbm_buff.jbo_frm_size  = g_cbm_pools[CBM_POOL_JBO].frm_size;
++	g_cbm_buff.std_pool_size = g_cbm_pools[CBM_POOL_STD].size;
++	g_cbm_buff.jbo_pool_size = g_cbm_pools[CBM_POOL_JBO].size;
++	g_cbm_buff.std_frm_num   = g_cbm_pools[CBM_POOL_STD].frm_num;
++	g_cbm_buff.jbo_frm_num   = g_cbm_pools[CBM_POOL_JBO].frm_num;
++	g_cbm_buff.std_buf_base  = g_cbm_pools[CBM_POOL_STD].virt_base;
++	g_cbm_buff.std_buf_addr  = g_cbm_pools[CBM_POOL_STD].virt_base;
++	g_cbm_buff.jbo_buf_base  = g_cbm_pools[CBM_POOL_JBO].virt_base;
++	g_cbm_buff.jbo_buf_addr  = g_cbm_pools[CBM_POOL_JBO].virt_base;
++	g_cbm_buff.placeholder   = false;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(cbm_buf_init_pools);
++
++/*
++ * cbm_buf_pool_phys_base - accessor used by init_cbm_basic (cbm.c) to program
++ * SBA_0 / JBA_0 / SBA_1 / JBA_1 with the physical-address bases of the carve
++ * pools.
++ *
++ * @which: CBM_POOL_STD (0) or CBM_POOL_JBO (1). Any other value returns
++ *         0, which init_cbm_basic interprets as an error condition via
++ *         the surrounding NULL-pointer checks (SBA_0=0 would surface as
++ *         a fatal silicon error long before frame admit).
++ */
++phys_addr_t cbm_buf_pool_phys_base(int which)
++{
++	if (which < 0 || which >= CBM_POOL_NUM)
++		return 0;
++	return g_cbm_pools[which].phys_base;
++}
++EXPORT_SYMBOL_GPL(cbm_buf_pool_phys_base);
++
++/*
++ * cbm_buf_phys_to_virt - map a CBM pool PHYSICAL address back to its
++ * kernel-virtual address within the memremap'd carve pool.
++ */
++void *cbm_buf_phys_to_virt(u32 phys)
++{
++	int i;
++
++	for (i = 0; i < CBM_POOL_NUM; i++) {
++		struct cbm_pool *pool = &g_cbm_pools[i];
++		phys_addr_t lo, hi;
++
++		if (!pool->virt_base)
++			continue;
++		lo = pool->phys_base;
++		hi = lo + (phys_addr_t)pool->frm_num * pool->frm_size;
++		if ((phys_addr_t)phys >= lo && (phys_addr_t)phys < hi)
++			return (u8 *)pool->virt_base +
++			       ((phys_addr_t)phys - lo);
++	}
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(cbm_buf_phys_to_virt);
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm_regs.h b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_regs.h
+new file mode 100644
+index 000000000000..f4badf8e6c78
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm_regs.h
+@@ -0,0 +1,184 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/reg/ and cqm/falconmx/reg/cbm_ls.h.
++ *
++ * CBM register-window offsets and bit-field definitions.
++ */
++
++#ifndef __XRX500_CBM_REGS_H
++#define __XRX500_CBM_REGS_H
++
++#include <linux/types.h>
++#include <linux/bits.h>
++#include <linux/skbuff.h>
++#include <linux/build_bug.h>
++
++/* TCP-lite/LRO require 128-byte DMA data offset. */
++#define CBM_GRX550_DMA_DATA_OFFSET 128
++
++/*
++ * CBM control window (per CBM_BASE / g_cbm_base):
++ *   CBM_CTRL relative offset = 0x210.
++ *   JSEL bit-field.
++ */
++#define CBM_CTRL              0x210
++#define JSEL_POS              17
++#define JSEL_MASK             BIT(17)
++
++/*
++ * QEQCNT / QDQCNT counter rings live inside their own ioremap'd windows
++ * (g_cbm_qeqcnt_base / g_cbm_qdqcnt_base). The "BASE" suffix in this
++ * file refers to offset-zero within those windows. The 0x400 byte size
++ * corresponds to 256 u32 counters.
++ */
++#define CBM_QEQCNT_BASE       0x0000
++#define CBM_QDQCNT_BASE       0x0000
++#define CBM_QEQCNT_SIZE       0x400
++#define CBM_QDQCNT_SIZE       0x400
++
++/*
++ * EQM / DQM port-window base offsets:
++ *   CFG_CPU_IGP_0 = 0x10000
++ *   CFG_DMA_IGP_5 = 0x15000
++ *   SDESC0_0_IGP_15 = 0x1F100
++ *   CFG_CPU_EGP_0 = 0x10000
++ *   CFG_DMA_EGP_6 = 0x16000
++ *   SDESC0_0_IGP_5 = 0x0
++ *   DESC0_0_EGP_5 = 0x40000
++ *   LS_DESC_DW0_PORT0 = 0x0
++ *
++ * NOTE: CFG_CPU_IGP_0 / CFG_CPU_EGP_0 both live at offset 0x10000 in
++ * their respective windows (EQM / DQM ioremap regions) — they are
++ * not aliasing the same physical address.
++ */
++#define CFG_CPU_IGP_0         0x10000
++#define CFG_DMA_IGP_5         0x15000
++#define SDESC0_0_IGP_15       0x1F100
++#define CFG_DMA_IGP_15        0x1F000
++#define WM_DMA_IGP_15         0x1F004
++#define POCC_DMA_IGP_15       0x1F008
++#define CFG_CPU_EGP_0         0x10000
++#define CFG_DMA_EGP_6         0x16000
++#define SDESC0_0_IGP_5        0x0
++#define DESC0_0_EGP_5         0x40000
++#define LS_DESC_DW0_PORT0     0x0
++
++/*
++ * CPU DQM egress-port EPMAP bit-field. The dequeue engine's egress-port-map
++ * tag; identical in shape to the DMA sibling's CFG_DMA_EGP_6_EPMAP_POS/MASK
++ * (mirrored locally in cbm_dma.c as CBM_DQM_EGP_EPMAP_POS/MASK). Consumed by
++ * init_cbm_dqm_cpu_port.
++ */
++#define CFG_CPU_EGP_0_EPMAP_POS   16
++#define CFG_CPU_EGP_0_EPMAP_MASK  0x7F0000U
++
++/*
++ * CPU_DQM_PORT_NUM — number of CPU DQM (dequeue) egress ports. Bounds the
++ * idx guard in init_cbm_dqm_cpu_port,
++ * mirroring the literal-4 range init_cbm_eqm_cpu_port enforces on the EQM side.
++ */
++#define CPU_DQM_PORT_NUM          4
++
++/*
++ * CPU_EQM_PORT_NUM — number of CPU EQM (enqueue) ingress ports. Bounds the
++ * eqm_intr_ctrl / dqm_intr_ctrl sweeps, which both walk this count.
++ */
++#define CPU_EQM_PORT_NUM          4
++
++/* CBM_EQM_CTRL. */
++#define CBM_EQM_CTRL          0x0
++#define EQM_EN_POS            0
++#define EQM_EN_MASK           BIT(0)
++#define EQM_FRZ_POS           1
++#define EQM_FRZ_MASK          BIT(1)
++#define EQM_QEN_POS           4
++#define EQM_QEN_MASK          BIT(4)
++#define EQM_MSEL_POS          5
++#define EQM_MSEL_MASK         BIT(5)
++
++/*
++ * CBM_DQM_CTRL. Field positions match the EQM block by silicon convention;
++ * DQQCEN replaces EQQCEN as the QEN gate.
++ */
++#define CBM_DQM_CTRL          0x0
++#define DQM_EN_POS            0
++#define DQM_EN_MASK           BIT(0)
++#define DQM_FRZ_POS           1
++#define DQM_FRZ_MASK          BIT(1)
++#define DQM_QEN_POS           4
++#define DQM_QEN_MASK          BIT(4)
++#define DQM_MSEL_POS          5
++#define DQM_MSEL_MASK         BIT(5)
++
++/*
++ * FSQM register window offsets:
++ *   FSQM_CTRL    0x0
++ *   IO_BUF_RD    0x8
++ *   IO_BUF_WR    0xC
++ *   FSQM_IRNEN   0x18
++ *   OFSQ         0x24
++ *   OFSC         0x2C
++ *   FSQT0        0x30
++ *   FSQT1        0x70
++ *   FSQT2        0xB0
++ *   FSQT3        0xF0
++ *   FSQT4        0x130
++ *   LSARNG       0x180
++ *   RCNT         0x80000
++ *   RAM          0xC0000
++ */
++#define FSQM_CTRL             0x0
++#define IO_BUF_RD             0x8
++#define IO_BUF_WR             0xC
++#define FSQM_IRNEN            0x18
++#define OFSQ                  0x24
++#define OFSC                  0x2C
++#define FSQT0                 0x30
++#define FSQT1                 0x70
++#define FSQT2                 0xB0
++#define FSQT3                 0xF0
++#define FSQT4                 0x130
++#define LSARNG                0x180
++#define RCNT                  0x80000
++#define RAM                   0xC0000
++
++/*
++ * FSQM_IRNEN bit-field decomposition. The register's own field names
++ * (T0U..T4U / ACCMEM / FRMEM / FROVLO / ALLNIL) are listed below; the
++ * mnemonic names (EVT0..EVT4 / RAM_VIOL / CMD_RAM_VIOL / CMD_OVERFLOW /
++ * ALLOC_NIL) are aliased so the FSQM_IRNEN_DEFAULT composition reads
++ * naturally.
++ *
++ * Bit positions:
++ *   T0U_POS    =  0   "Threshold 0 Underflow"
++ *   T1U_POS    =  1   "Threshold 1 Underflow"
++ *   T2U_POS    =  2   "Threshold 2 Underflow"
++ *   T3U_POS    =  3   "Threshold 3 Underflow"
++ *   T4U_POS    =  4   "Threshold 4 Underflow"
++ *   ACCMEM_POS = 12   "RAM Access Violation"
++ *   FRMEM_POS  = 16   "Free Command RAM Access Violation"
++ *   FROVLO_POS = 20   "Free Command Overflow on OFSQ"
++ *   ALLNIL_POS = 24   "Alloc Command NIL Response"
++ */
++#define FSQM_IRNEN_EVT0           BIT(0)
++#define FSQM_IRNEN_EVT1           BIT(1)
++#define FSQM_IRNEN_EVT2           BIT(2)
++#define FSQM_IRNEN_EVT3           BIT(3)
++#define FSQM_IRNEN_EVT4           BIT(4)
++#define FSQM_IRNEN_RAM_VIOL       BIT(12)
++#define FSQM_IRNEN_CMD_RAM_VIOL   BIT(16)
++#define FSQM_IRNEN_CMD_OVERFLOW   BIT(20)
++#define FSQM_IRNEN_ALLOC_NIL      BIT(24)
++
++#define FSQM_IRNEN_DEFAULT                                          \
++	(FSQM_IRNEN_EVT0 | FSQM_IRNEN_EVT1 | FSQM_IRNEN_EVT2 |      \
++	 FSQM_IRNEN_EVT3 | FSQM_IRNEN_EVT4 | FSQM_IRNEN_RAM_VIOL |  \
++	 FSQM_IRNEN_CMD_RAM_VIOL | FSQM_IRNEN_CMD_OVERFLOW |        \
++	 FSQM_IRNEN_ALLOC_NIL)
++
++/* Fixed DMA RX skb headroom. */
++#define CBM_FIXED_RX_OFFSET \
++	(CBM_GRX550_DMA_DATA_OFFSET + NET_IP_ALIGN + NET_SKB_PAD)
++
++#endif /* __XRX500_CBM_REGS_H */
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/fsqm.c b/drivers/net/ethernet/lantiq/cqm/grx500/fsqm.c
+new file mode 100644
+index 000000000000..02f887c8eed5
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/fsqm.c
+@@ -0,0 +1,319 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Derived from the AVM FRITZ!Box 7560 GPL release (Linux 4.9.198),
++ * drivers/net/ethernet/lantiq/cqm/grx500/cbm.c.
++ *
++ * Free Segment Queue Manager: brings up one FSQM instance and seeds its
++ * linked-list table so the hardware owns a pool of buffer segments.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <linux/io.h>
++#include <linux/bug.h>
++#include <linux/types.h>
++
++#include "cbm.h"
++
++/*
++ *   AVM fsqm.h:564 OFSQ_HEAD_POS    = 0
++ *   AVM fsqm.h:566 OFSQ_HEAD_MASK   = 0x7FFFu
++ *   AVM fsqm.h:569 OFSQ_TAIL_POS    = 16
++ *   AVM fsqm.h:571 OFSQ_TAIL_MASK   = 0x7FFF0000u
++ *   AVM fsqm.h:587 OFSC_FSC_POS     = 0
++ *   AVM fsqm.h:589 OFSC_FSC_MASK    = 0x7FFFu
++ *   AVM fsqm.h:695 LSARNG_MINLSA_POS  = 0
++ *   AVM fsqm.h:697 LSARNG_MINLSA_MASK = 0x7FFFu
++ *   AVM fsqm.h:700 LSARNG_MAXLSA_POS  = 16
++ *   AVM fsqm.h:702 LSARNG_MAXLSA_MASK = 0x7FFF0000u
++ */
++#define LSARNG_MINLSA_POS  0
++#define LSARNG_MINLSA_MASK 0x00007FFFu
++#define LSARNG_MAXLSA_POS  16
++#define LSARNG_MAXLSA_MASK 0x7FFF0000u
++#define OFSQ_HEAD_POS      0
++#define OFSQ_HEAD_MASK     0x00007FFFu
++#define OFSQ_TAIL_POS      16
++#define OFSQ_TAIL_MASK     0x7FFF0000u
++#define OFSC_FSC_POS       0
++#define OFSC_FSC_MASK      0x00007FFFu
++
++/* FSQM end-of-list sentinel. AVM cqm/grx500/cbm.c:1106 / 1110-1112:
++ *   the last linked-list slot carries the literal 0x7FFF (NOT 0xFFFF
++ *   and NOT 0x7FFFFFFF — the HW only consumes the low 15 bits and a
++ *   wider literal would alias into the reserved bits 15..31).
++ */
++#define FSQM_LLT_END_MARKER 0x7FFFu
++
++/*
++ * init_fsqm_buf_std — seed the FSQM Linked-List Table RAM.
++ *
++ * Per AVM cqm/grx500/cbm.c:1103-1116, the loop bound is INCLUSIVE
++ * (i = 1..frm_num), and the i==frm_num-1 iteration emits the
++ * end-marker 0x7FFF into slot (frm_num-2). All other iterations
++ * write (i % frm_num) — so the i=frm_num iteration writes slot
++ * (frm_num-1) with value 0 (since frm_num % frm_num = 0).
++ *
++ * Worked example (frm_num=8):
++ *   i=1 slot 0 -> 1     i=2 slot 1 -> 2     i=3 slot 2 -> 3
++ *   i=4 slot 3 -> 4     i=5 slot 4 -> 5     i=6 slot 5 -> 6
++ *   i=7 slot 6 -> 0x7FFF (END-MARKER)
++ *   i=8 slot 7 -> 0 (8 % 8 = 0)
++ *
++ * MUST NOT REWRITE the loop to i=0..frm_num-1: doing so writes slot 0
++ * with (0 % frm_num) = 0 instead of 1, and slot frm_num-1 is left
++ * uninitialised — the FSQM deadlocks on first buffer return.
++ *
++ * After seeding, a sampled WARN_ONCE self-check verifies the seed
++ * survived the writes. The check samples at most 8 random slots
++ * (avoids log-spam at frm_num=2048).
++ */
++static void init_fsqm_buf_std(int idx, u32 frm_num)
++{
++	u32 i;
++	u32 samples;
++	u32 sample_step;
++
++	/* AVM cqm/grx500/cbm.c:1103-1116 — i = 1..frm_num INCLUSIVE.
++	 * MUST NOT REWRITE to i=0..frm_num-1 (silent deadlock).
++	 *
++	 * Per-slot RCNT[i-1] = 1 is written ALONGSIDE the LLT seed inside
++	 * this loop — AVM cbm.c:1112-1115 (std, #else branch) and AVM
++	 * cbm.c:1156-1157 (jbo, unconditional). Pulling the RCNT write out
++	 * of the loop (as the attempt-1 plan-step did) leaves slots
++	 * RCNT[1..frm_num-1] at the silicon-reset value (0) and risks
++	 * FSQM deadlock on first descriptor return. MUST NOT MOVE the
++	 * RCNT write back out of this loop.
++	 */
++	for (i = 1; i <= frm_num; i++) {
++		u32 slot = i - 1;
++		u32 val  = (i == frm_num - 1) ? FSQM_LLT_END_MARKER
++					      : (i % frm_num);
++
++		fsqm_w32(idx, RAM  + (slot << 2), val);
++		fsqm_w32(idx, RCNT + (slot << 2), 1);
++	}
++
++	/*
++	 * Sampled readback self-check — at most 8 slots, evenly spaced. Uses
++	 * dynamic expected = ((i+1) == frm_num-1 ? 0x7FFF : (i+1) % frm_num)
++	 * so any future frm_num bump stays correct.
++	 *
++	 * Force-check those two slots after the sweep — they are the slots a
++	 * regression to the loop bound or end-marker conditional would
++	 * silently corrupt. Total readback ≤ 10 slots, well below log-spam
++	 * threshold.
++	 */
++	samples = (frm_num < 8) ? frm_num : 8;
++	sample_step = frm_num / samples;
++	if (!sample_step)
++		sample_step = 1;
++	for (i = 0; i < samples; i++) {
++		u32 slot = i * sample_step;
++		u32 expected;
++		u32 read_val;
++
++		if (slot >= frm_num)
++			break;
++
++		/* Loop wrote slot S with value V where (S = j-1, V depends
++		 * on j) for j=1..frm_num. So expected[S] is:
++		 *   if (S == frm_num - 2)  -> 0x7FFF (end marker; j=frm_num-1)
++		 *   else                   -> (S + 1) % frm_num
++		 */
++		if (slot == frm_num - 2)
++			expected = FSQM_LLT_END_MARKER;
++		else
++			expected = (slot + 1) % frm_num;
++
++		read_val = fsqm_r32(idx, RAM + (slot << 2));
++		WARN_ONCE(read_val != expected,
++			  "cbm: FSQM LLT_RAM seed mismatch idx=%d slot=%u got=0x%08x expected=0x%08x\n",
++			  idx, slot, read_val, expected);
++	}
++
++	/* Boundary slot coverage: end-marker slot (frm_num-2) MUST hold
++	 * 0x7FFF and wrap-terminator slot (frm_num-1) MUST hold 0
++	 * (frm_num % frm_num = 0). These are the two slots whose values
++	 * are non-trivial under the AVM seed contract; any mutation to the
++	 * loop bound or end-marker conditional would corrupt them.
++	 * Guarded by frm_num >= 2 (already enforced at init_fsqm entry).
++	 */
++	if (frm_num >= 2) {
++		u32 em_slot = frm_num - 2;
++		u32 wrap_slot = frm_num - 1;
++		u32 em_val = fsqm_r32(idx, RAM + (em_slot << 2));
++		u32 wrap_val = fsqm_r32(idx, RAM + (wrap_slot << 2));
++
++		WARN_ONCE(em_val != FSQM_LLT_END_MARKER,
++			  "cbm: FSQM LLT_RAM end-marker missing idx=%d slot=%u got=0x%08x expected=0x%08x\n",
++			  idx, em_slot, em_val, FSQM_LLT_END_MARKER);
++		WARN_ONCE(wrap_val != 0,
++			  "cbm: FSQM LLT_RAM wrap-terminator non-zero idx=%d slot=%u got=0x%08x expected=0\n",
++			  idx, wrap_slot, wrap_val);
++	}
++}
++
++/*
++ * init_fsqm_by_idx - register-sequence init for one FSQM instance.
++ *
++ * AVM cqm/grx500/cbm.c:1103-1136 + 1086-1091 source ordering
++ * (preserving the bit-packed LSARNG/OFSQ/OFSC operands computed by the
++ * caller). The write sequence is:
++ *
++ * FSQM_CTRL is written LAST so the engine cannot consume a partial config
++ * snapshot.
++ */
++static void init_fsqm_by_idx(int idx, u32 frm_num, u32 lsarng,
++			     u32 ofsq, u32 ofsc)
++{
++	u32 fsqt0_expected;
++	u32 fsqt1_expected;
++	u32 fsqt2_expected;
++	u32 fsqt3_expected;
++	u32 fsqt4_expected;
++
++
++	/*
++	 * The seed loop in init_fsqm_buf_std also writes RCNT[i-1]=1 per slot
++	 * (AVM cbm.c:1112-1115 std / 1156-1157 jbo), so no separate RCNT
++	 * write is needed here. MUST NOT re-add a single fsqm_w32(idx, RCNT,
++	 * 1) — that would touch only slot 0 and leave the per-slot writes
++	 * untouched (functionally a no-op overwrite, but cosmetically
++	 * misleading).
++	 */
++
++	/* (4) (5) (6) LSARNG / OFSQ / OFSC bit-packed values, computed by
++	 *     init_fsqm() per AVM cbm.c:1121-1128.
++	 */
++	fsqm_w32(idx, LSARNG, lsarng);
++	fsqm_w32(idx, OFSQ,   ofsq);
++	fsqm_w32(idx, OFSC,   ofsc);
++
++	fsqm_w32(idx, FSQM_IRNEN, FSQM_IRNEN_DEFAULT);
++
++	/* (8) FSQT0..FSQT4 watermarks.
++	 *     AVM cbm.c:1130-1134 uses left-to-right integer division:
++	 *     (frm_num / 6) * N  — NOT (frm_num * N) / 6 — which yields a
++	 *     different value at frm_num=2048.
++	 *     MUST NOT REWRITE to (frm_num*N)/6: at frm_num=2048 it gives
++	 *     1706/1365/1024/682/341 instead of 1705/1364/1023/682/341.
++	 */
++	fsqt0_expected = frm_num / 6 * 5;
++	fsqt1_expected = frm_num / 6 * 4;
++	fsqt2_expected = frm_num / 6 * 3;
++	fsqt3_expected = frm_num / 6 * 2;
++	fsqt4_expected = frm_num / 6;
++	fsqm_w32(idx, FSQT0, fsqt0_expected);
++	fsqm_w32(idx, FSQT1, fsqt1_expected);
++	fsqm_w32(idx, FSQT2, fsqt2_expected);
++	fsqm_w32(idx, FSQT3, fsqt3_expected);
++	fsqm_w32(idx, FSQT4, fsqt4_expected);
++
++	/* (9) IO_BUF drain + FSQM_CTRL enable — the AVM init_fsqm_by_idx
++	 *     triplet (cbm.c:1086-1091), byte-exact and LAST so the engine
++	 *     starts on a consistent snapshot of all preceding regs with a
++	 *     freshly cleared HW-master command window.
++	 */
++	fsqm_w32(idx, IO_BUF_RD, 0);
++	fsqm_w32(idx, IO_BUF_WR, 0);
++	fsqm_w32(idx, FSQM_CTRL, 1);
++
++	/*
++	 * Dynamic formula matches the write (NOT hardcoded values) — robust
++	 * to any future frm_num bump.
++	 */
++	WARN_ON(fsqm_r32(idx, FSQT0) != fsqt0_expected);
++	WARN_ON(fsqm_r32(idx, FSQT1) != fsqt1_expected);
++	WARN_ON(fsqm_r32(idx, FSQT2) != fsqt2_expected);
++	WARN_ON(fsqm_r32(idx, FSQT3) != fsqt3_expected);
++	WARN_ON(fsqm_r32(idx, FSQT4) != fsqt4_expected);
++	WARN_ON(fsqm_r32(idx, FSQM_IRNEN) != FSQM_IRNEN_DEFAULT);
++	WARN_ON(fsqm_r32(idx, LSARNG) != lsarng);
++	WARN_ON(fsqm_r32(idx, OFSQ)   != ofsq);
++	WARN_ON(fsqm_r32(idx, OFSC)   != ofsc);
++}
++
++/*
++ * init_fsqm - public entry point.
++ *
++ * @idx: 0 = std pool FSQM, 1 = jbo pool FSQM (per AVM
++ *       std_fsqm_idx/jbo_fsqm_idx convention).
++ *
++ * AVM equivalence map:
++ *   init_fsqm()              (AVM cbm.c:1181-1202) — the no-arg outer
++ *                            init that bound to specific pools.
++ *   init_fsqm_buf_std()      (AVM cbm.c:1095-1139) — the std-pool body.
++ *   init_fsqm_buf_jumbo()    (AVM cbm.c:1141-1179) — the jbo-pool body.
++ */
++void init_fsqm(int idx)
++{
++	u32 frm_num;
++	u32 maxlsa;
++	u32 minlsa;
++	u32 lsarng;
++	u32 ofsq;
++	u32 ofsc;
++	u32 ofsc_readback;
++
++	if (idx < 0 || idx > 1) {
++		pr_err("cbm: init_fsqm: invalid idx %d (must be 0 or 1)\n",
++		       idx);
++		return;
++	}
++	if (!g_cbm_fsqm_base[idx]) {
++		pr_err("cbm: init_fsqm: g_cbm_fsqm_base[%d] not ioremapped\n",
++		       idx);
++		return;
++	}
++
++	frm_num = (idx == 0) ? g_cbm_buff.std_frm_num
++			     : g_cbm_buff.jbo_frm_num;
++
++	if (frm_num < 2) {
++		pr_err("cbm: init_fsqm: idx=%d frm_num=%u too small (need >=2)\n",
++		       idx, frm_num);
++		return;
++	}
++
++	/* (b) LLT_RAM seed first — the linked-list must exist before the
++	 *     register sequence below brings the engine online.
++	 */
++	init_fsqm_buf_std(idx, frm_num);
++
++	/* (c) Compute LSARNG / OFSQ / OFSC pack values.
++	 *     Verbatim from AVM cqm/grx500/cbm.c:1086-1101 / 1121-1128.
++	 *     minlsa = 0; maxlsa = frm_num - 2  (equivalent to AVM's
++	 *     (size / frm_size) - 2 because frm_num = size / frm_size).
++	 *     The "-2" is the AVM-source's "last item is invalid inside
++	 *     the FSQM" rule (cbm.c:1119, cbm.c:1162).
++	 *
++	 *     LSARNG: HEAD(maxlsa) at bit 16, TAIL(minlsa) at bit 0
++	 *     OFSQ:   TAIL(maxlsa) at bit 16, HEAD(minlsa) at bit 0
++	 *     OFSC:   FSC = (maxlsa - minlsa + 1) at bit 0
++	 *
++	 *     For std@frm_num=2048: maxlsa=2046, OFSC=0x000007FF
++	 *     For jbo@frm_num=256:  maxlsa=254,  OFSC=0x000000FF
++	 */
++	minlsa = 0;
++	maxlsa = frm_num - 2;
++	lsarng = ((maxlsa << LSARNG_MAXLSA_POS) & LSARNG_MAXLSA_MASK) |
++		 ((minlsa << LSARNG_MINLSA_POS) & LSARNG_MINLSA_MASK);
++	ofsq   = ((maxlsa << OFSQ_TAIL_POS) & OFSQ_TAIL_MASK) |
++		 ((minlsa << OFSQ_HEAD_POS) & OFSQ_HEAD_MASK);
++	ofsc   = ((maxlsa - minlsa + 1) << OFSC_FSC_POS) & OFSC_FSC_MASK;
++
++	/* (d) Run the 10-step register sequence (IO_BUF, RCNT, LSARNG,
++	 *     OFSQ, OFSC, IRNEN, FSQTn, CTRL).
++	 */
++	init_fsqm_by_idx(idx, frm_num, lsarng, ofsq, ofsc);
++
++	ofsc_readback = fsqm_r32(idx, OFSC);
++	WARN_ON(ofsc_readback != ofsc);
++
++	pr_info("cbm: %sinit_fsqm idx=%d frm_num=%u OFSC=0x%08x (lsarng=0x%08x ofsq=0x%08x)\n",
++		g_cbm_buff.placeholder ? "PLACEHOLDER " : "",
++		idx, frm_num, ofsc_readback, lsarng, ofsq);
++}
++EXPORT_SYMBOL_GPL(init_fsqm);

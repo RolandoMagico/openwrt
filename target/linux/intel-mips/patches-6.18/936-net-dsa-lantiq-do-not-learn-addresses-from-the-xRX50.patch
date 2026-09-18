@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 02:58:41 +0200
+Subject: net: dsa: lantiq: do not learn addresses from the xRX500 processor
+ port
+
+Every frame the software forwarding path sends enters the switch on the
+processor port carrying the sending station's own address. A switch that
+learns from that port therefore records every station against the
+processor, and no entry in the address table ever names the port a
+station is really on - so the fabric can never forward a frame between
+two front ports, and every one of them crosses the processor instead.
+
+Turn learning off on the processor port and leave it on for the ports
+that face a wire, which is what makes an entry name the real port. The
+vendor switch library writes the same field from its per-port
+configuration entry point, and its xRX500 ethernet driver turns learning
+off across a whole switch macro at bring-up.
+
+The two neighbouring fields of the port's other parser control word are
+deliberately left alone. Port locking and aging disable are written by
+that same vendor function, but only ever from values its caller passes
+in, and no in-kernel caller of it sets either one: they belong to the
+address-learning limit and spoofing-detection feature, which is driven
+from user space and carries no datapath requirement. Setting them here
+would cap the table and stop it ageing for reasons this driver does not
+have.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+index 0fd8bab440bf..aefd916f9c38 100644
+--- a/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
++++ b/drivers/net/dsa/lantiq/lantiq_gswip_xrx500.c
+@@ -710,6 +710,7 @@ static int gswip_xrx500_setup(struct dsa_switch *ds)
+ {
+ 	struct gswip_priv *priv = ds->priv;
+ 	const struct gswip_xrx500_model *model = gswip_xrx500_model(priv);
++	struct dsa_port *cpu_dp;
+ 	int err;
+ 
+ 	/* The queue manager's drop-policy selector is two bits wide here, and
+@@ -725,6 +726,24 @@ static int gswip_xrx500_setup(struct dsa_switch *ds)
+ 	 * whenever it forwards for the switch.
+ 	 */
+ 
++	/* Every frame the software forwarding path sends arrives at the switch
++	 * on the processor port carrying the sending station's address, so a
++	 * switch that learns from the processor port ends up with every
++	 * station recorded against it. From then on the fabric has an address
++	 * table entry for each station and it names the processor, so a frame
++	 * between two front ports is delivered to the processor instead of
++	 * being forwarded in hardware - which is worse than having no entry at
++	 * all, because an unknown destination is flooded to every port.
++	 *
++	 * Learning on the processor port therefore has to be off. The ports
++	 * that face a wire keep it, which is what makes an entry name the port
++	 * a station is really on.
++	 */
++	dsa_switch_for_each_cpu_port(cpu_dp, ds)
++		regmap_set_bits(priv->gswip,
++				GSWIP_PCE_PCTRL_3p(cpu_dp->index),
++				GSWIP_PCE_PCTRL_3_LNDIS);
++
+ 	/* Address the egress table by traffic class rather than by the
+ 	 * processing flags of the accelerator paths, which this design does
+ 	 * not build. This has to be settled before the table is written,

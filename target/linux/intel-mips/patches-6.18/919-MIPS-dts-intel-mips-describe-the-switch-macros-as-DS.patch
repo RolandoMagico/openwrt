@@ -1,0 +1,506 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Mon, 10 Aug 2026 09:08:49 +0000
+Subject: MIPS: dts: intel-mips: describe the switch macros as DSA switches
+
+Describe the hardware. Each macro is a DSA switch: a port per
+front-panel socket carrying its label, a CPU port pointing at the conduit
+the die wires it to, the MDIO bus and the firmware loader as children with
+no window of their own, and one child per integrated PHY holding the
+offset of its firmware address register pair and the reset line the loader
+holds it on. The two macros are two trees, because a conduit carries
+exactly one CPU port and nothing forwards between the macros in hardware,
+so a bridge spanning both would blackhole. The manager names its eleven
+windows, its interrupts and its pools, and the two conduits are children
+of it: a conduit owns no register of its own, and there is one per macro.
+The DMA controllers keep a window and an interrupt, and nothing else,
+because nothing else about them is board data.
+
+The window the vendor device tree calls sbim is not carried over. Nothing
+maps it, nothing reads it, and no register description for its address
+exists in the vendor sources, so it cannot be named; the binding says the
+same.
+
+Front-panel LAN-N reaches switch port 6-N. The board wires the sockets in
+the opposite order to the port numbering and these labels are the only
+record of it. The fifth PHY, on the die variant that has one, carries the
+socket on the second macro, whose port is numbered 15 while its PHY
+answers at address 1.
+
+Every PHY node spells out its identifier, 0xd565a409 on every core, so
+the PHY device is created from the device tree alone. These cores answer
+their identification registers before the firmware the SoC loads into
+them has finished booting, and a bus scan could sample a core that is
+only half awake.
+
+The manager's standard and jumbo segment pools are no-map reservations
+at 0x23800000 and 0x24a00000, ending at 0x25200000, and the manager
+names them std-pool and jumbo-pool. Both have to lie inside the
+manager's bus-master window, so every board that includes seale_avm.dtsi
+has to declare memory up to 0x25200000, and each of the three does.
+
+Each PHY child names two reset cells, the request bit and the status bit,
+and on this SoC those are different numbers. RCU_RST_STAT is a remap of
+RCU_RST_REQ rather than a mirror of it, so a second cell that repeats the
+first watches an unrelated bit and can only ever time out. The per-domain
+map is spelled out at the reset controller node, and the five integrated
+PHY lines take their status bits from it: request 29 reports in 28, 28 in
+23, 26 in 22, 25 in 25, and the fifth core's request bit 31 reports in 30
+- bit 31 of the status word being the watchdog reset cause, which has no
+request counterpart at all.
+
+The reset map at the reset controller gains a row for each of the five
+integrated PHY lines, named by the gphy@ child that holds it. Its note
+on the two reset causes now says that neither is the status of the line
+whose request bit sits at the same index.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+index fb7cf5cd43f7..9ca59ba1ff2a 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm.dtsi
+@@ -36,7 +36,144 @@ nand0: nand@0 {
+ 	};
+ };
+ 
++/*
++ * The LAN switch macro. The loader for the integrated PHYs and the MDIO bus
++ * are sub-apertures of the window this node already claims, so both are
++ * children with no window of their own and the switch driver reaches them
++ * through fixed offsets from it.
++ */
++&gswl {
++	status = "okay";
++
++	/*
++	 * One child per integrated PHY. Its reg is the offset of the PHY's
++	 * firmware address register pair inside the switch window, and its
++	 * reset is the line the loader holds the core on while it writes that
++	 * pair. The reset bit list is not contiguous, so every entry is spelled
++	 * out, and the status bit each request bit reports through is a
++	 * different number again -- see the reset controller's own comment in
++	 * xrx500.dtsi for the map.
++	 *
++	 * A core without firmware never answers MDIO, so every core described
++	 * here is reset and pointed at the image this node names.
++	 */
++	gphy_fw: gphy-fw {
++		compatible = "lantiq,xrx500-gphy-fw";
++		firmware-name = "lantiq/xrx500-phy-fw.bin";
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		gphy@f8a {
++			reg = <0xf8a>;
++			resets = <&rcu_reset0 29 28>;
++			reset-names = "gphy";
++		};
++
++		gphy@f8e {
++			reg = <0xf8e>;
++			resets = <&rcu_reset0 28 23>;
++			reset-names = "gphy";
++		};
++
++		gphy@f92 {
++			reg = <0xf92>;
++			resets = <&rcu_reset0 26 22>;
++			reset-names = "gphy";
++		};
++
++		gphy@f96 {
++			reg = <0xf96>;
++			resets = <&rcu_reset0 25 25>;
++			reset-names = "gphy";
++		};
++	};
++
++	/*
++	 * The switch driver registers this bus itself, so it carries no
++	 * compatible and is not a device of its own.
++	 *
++	 * A PHY's address on the bus is the number of the switch port it
++	 * serves. The identifier is spelled out on every node so the PHY
++	 * device is created from the device tree alone: these cores answer
++	 * their identification registers before the firmware the SoC loads has
++	 * finished booting, so a bus scan can sample a half-alive core.
++	 */
++	mdio {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		gphy_lan1: ethernet-phy@5 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
++			reg = <0x05>;
++		};
++
++		gphy_lan2: ethernet-phy@4 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
++			reg = <0x04>;
++		};
++
++		gphy_lan3: ethernet-phy@3 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
++			reg = <0x03>;
++		};
++
++		gphy_lan4: ethernet-phy@2 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
++			reg = <0x02>;
++		};
++	};
++
++	/*
++	 * Front-panel LAN-N reaches switch port 6-N. The board wires the
++	 * sockets in the opposite order to the port numbering, and these
++	 * labels are the only thing that records it: getting them the wrong way
++	 * round gives four working ports with the wrong names on them, which no
++	 * probe-time check can catch.
++	 */
++	ports {
++		port@2 {
++			reg = <2>;
++			label = "lan4";
++			phy-mode = "internal";
++			phy-handle = <&gphy_lan4>;
++		};
++
++		port@3 {
++			reg = <3>;
++			label = "lan3";
++			phy-mode = "internal";
++			phy-handle = <&gphy_lan3>;
++		};
++
++		port@4 {
++			reg = <4>;
++			label = "lan2";
++			phy-mode = "internal";
++			phy-handle = <&gphy_lan2>;
++		};
++
++		port@5 {
++			reg = <5>;
++			label = "lan1";
++			phy-mode = "internal";
++			phy-handle = <&gphy_lan1>;
++		};
++	};
++};
++
+ / {
++	/*
++	 * The buffer manager's standard and jumbo segment pools. The sizes are
++	 * the vendor's: 9216 standard segments of 2 KiB and 1024 jumbo
++	 * segments of 8 KiB. no-map, because the driver takes the only mapping
++	 * of them itself. Both have to fall inside the manager's bus master
++	 * window, and any board including this file must have a memory node
++	 * reaching 0x25200000.
++	 */
+ 	reserved-memory {
+ 		#address-cells = <1>;
+ 		#size-cells = <1>;
+@@ -75,9 +212,29 @@ avm_reserved: avm-reserved@20100000 {
+ 			reg = <0x20100000 0x400000>;
+ 			no-map;
+ 		};
++
++		cbm_std_pool: cbm-std-pool@23800000 {
++			reg = <0x23800000 0x1200000>;
++			no-map;
++		};
++
++		cbm_jbo_pool: cbm-jbo-pool@24a00000 {
++			reg = <0x24a00000 0x800000>;
++			no-map;
++		};
+ 	};
+ };
+ 
++/*
++ * The pools carry no restricted-dma-pool compatible, so the driver has to
++ * look them up explicitly through this phandle list.
++ */
++&cbm {
++	memory-region = <&cbm_std_pool>, <&cbm_jbo_pool>;
++	memory-region-names = "std-pool", "jumbo-pool";
++	status = "okay";
++};
++
+ /*
+  * All three serdes PHYs and the two root complexes that carry radios. PERST#
+  * is active low on every port, spread-spectrum clocking is on, and inbound
+diff --git a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+index 49b238903c02..c554b2cfb6c8 100644
+--- a/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
++++ b/arch/mips/boot/dts/intel-mips/seale_avm_grx550.dtsi
+@@ -71,6 +71,63 @@ ssogpio: ssogpio@16d00000 {
+ 	};
+ };
+ 
++/*
++ * The second switch macro, which is where this die's WAN socket lands. It is
++ * a tree of its own with a conduit of its own: nothing forwards between the
++ * two macros in hardware, so a bridge spanning them would blackhole, and a
++ * conduit carries exactly one CPU port.
++ */
++&gswr {
++	status = "okay";
++
++	/*
++	 * The same sub-aperture of the same block as the LAN macro's bus, so
++	 * the driver reaches it through the identical offset from this node's
++	 * own window.
++	 *
++	 * The address on the bus is 1, which is the number of the register
++	 * slots the external port's PHY address is written into. It has
++	 * nothing to do with the port's own number.
++	 */
++	mdio {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		gphy_wan: ethernet-phy@1 {
++			compatible = "ethernet-phy-idd565.a409",
++				     "ethernet-phy-ieee802.3-c22";
++			reg = <0x01>;
++		};
++	};
++
++	ports {
++		port@f {
++			reg = <15>;
++			label = "wan";
++			phy-mode = "internal";
++			phy-handle = <&gphy_wan>;
++		};
++	};
++};
++
++&conduit_wan {
++	status = "okay";
++};
++
++/*
++ * The fifth integrated PHY, which carries the WAN socket. On this die request
++ * bit 31 is that core's own reset line and not a group master reset, which is
++ * how the vendor device tree names it. Its status is reported in bit 30, and
++ * bit 31 of the status register belongs to the watchdog instead.
++ */
++&gphy_fw {
++	gphy@f9a {
++		reg = <0xf9a>;
++		resets = <&rcu_reset0 31 30>;
++		reset-names = "gphy";
++	};
++};
++
+ &usb0_phy {
+ 	status = "okay";
+ 	vbus-supply = <&usb_vbus>;
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 22e1c4f100c8..34262d6ac90f 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -112,14 +112,20 @@ chiptop: syscon@16080000 {
+ 	 *	pcie_phy0			12	24
+ 	 *	pcie_phy1			13	11
+ 	 *	pcie_phy2			10	10
++	 *	gphy@f8a			29	28
++	 *	gphy@f8e			28	23
++	 *	gphy@f92			26	22
++	 *	gphy@f96			25	25
++	 *	gphy@f9a (GRX550 only)		31	30
+ 	 *
+ 	 * Two positions in RCU_RST_STAT are reset *causes* rather than line
+-	 * statuses, and neither has a request counterpart: bit 31 is the
+-	 * watchdog, which the watchdog node below reads through this same
+-	 * syscon, and bit 29 is the global software reset that the reboot
+-	 * node requests with RCU_RST_REQ bit 30. Bit 31 therefore means one
+-	 * thing in the request register -- the fifth GPHY's line -- and
+-	 * something else entirely in the status register.
++	 * statuses, and neither is the status of the line whose request bit
++	 * sits at the same index: bit 31 is the watchdog, which the watchdog
++	 * node below reads through this same syscon, and bit 29 is the global
++	 * software reset that the reboot node requests with RCU_RST_REQ bit
++	 * 30. Bit 31 therefore means one thing in the request register -- the
++	 * fifth GPHY's line -- and something else entirely in the status
++	 * register.
+ 	 */
+ 	rcu: rcu@16000000 {
+ 		compatible = "lantiq,xrx200-rcu", "simple-mfd", "syscon";
+@@ -255,6 +261,168 @@ ebu_nand: nand-controller@16f00000 {
+ 		status = "disabled";
+ 	};
+ 
++	/*
++	 * The two GSWIP-3.0 switch macros. One window each covers the switch
++	 * core, the macro's top block and the packet MAC, so the MDIO bus and
++	 * the loader for the integrated PHYs are children with no window of
++	 * their own.
++	 *
++	 * Two trees rather than two switches in one tree: a conduit carries
++	 * exactly one CPU port, and nothing forwards between the macros in
++	 * hardware, so a bridge spanning both would blackhole.
++	 *
++	 * dma-noncoherent is not decoration. The PHY cores fetch their
++	 * firmware without taking part in the platform's cache coherence, so
++	 * the staged image has to be written back before they are released.
++	 */
++	gswl: switch@1c000000 {
++		compatible = "lantiq,xrx500-gswip";
++		reg = <0x1c000000 0x4000>;
++		dsa,member = <0 0>;
++		dma-noncoherent;
++		status = "disabled";
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			/*
++			 * The CPU port. Which conduit it reaches is on the die
++			 * and not on the board: this macro's frames leave over
++			 * the second pair of DMA controllers and no other.
++			 */
++			port@0 {
++				reg = <0>;
++				phy-mode = "internal";
++				ethernet = <&conduit_lan>;
++
++				fixed-link {
++					speed = <1000>;
++					full-duplex;
++				};
++			};
++		};
++	};
++
++	gswr: switch@1a000000 {
++		compatible = "lantiq,xrx500-gswip-r";
++		reg = <0x1a000000 0x4000>;
++		dsa,member = <1 0>;
++		dma-noncoherent;
++		status = "disabled";
++
++		ports {
++			#address-cells = <1>;
++			#size-cells = <0>;
++
++			port@0 {
++				reg = <0>;
++				phy-mode = "internal";
++				ethernet = <&conduit_wan>;
++
++				fixed-link {
++					speed = <1000>;
++					full-duplex;
++				};
++			};
++		};
++	};
++
++	/*
++	 * Packet buffer manager. It owns the segment pools every packet on the
++	 * datapath is held in, the enqueue and dequeue managers, the traffic
++	 * manager between them, and the table binding an endpoint to a queue.
++	 * Both switch macros and all four DMA controllers draw from it.
++	 *
++	 * A conduit is a processor's end of one macro's datapath and owns no
++	 * window of its own, so it is a child of this node. There are two of
++	 * them because a conduit carries exactly one CPU port.
++	 */
++	cbm: ethernet@1e700000 {
++		compatible = "lantiq,xrx500-cbm";
++		reg = <0x1e700000 0x1000>,    /* tmu      */
++		      <0x1e710000 0x10000>,   /* cbm      */
++		      <0x1e720000 0x4000>,    /* qidt     */
++		      <0x1e750000 0x400>,     /* qeqcnt   */
++		      <0x1e750800 0x400>,     /* qdqcnt   */
++		      <0x1e760000 0x10000>,   /* ls       */
++		      <0x1e780000 0x20000>,   /* eqm      */
++		      <0x1e7c0000 0x30000>,   /* dqm      */
++		      <0x1e800000 0x100000>,  /* fsqm0    */
++		      <0x1e900000 0x100000>,  /* fsqm1    */
++		      <0x1e500000 0x100000>;  /* dma-desc */
++		reg-names = "tmu", "cbm", "qidt", "qeqcnt", "qdqcnt", "ls",
++			    "eqm", "dqm", "fsqm0", "fsqm1", "dma-desc";
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 174 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SHARED 178 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SHARED 179 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SHARED 180 IRQ_TYPE_LEVEL_HIGH>,
++			     <GIC_SHARED 181 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "cbm", "ls0", "ls1", "ls2", "ls3";
++		clocks = <&cgu CLK_CBM>, <&cgu GCLK_CBM>;
++		clock-names = "freq", "cbm";
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "disabled";
++
++		conduit_lan: ethernet@0 {
++			compatible = "lantiq,xrx500-conduit";
++			reg = <0>;
++			lantiq,transmit-dma = <&dma2tx>;
++			lantiq,receive-dma = <&dma2rx>;
++		};
++
++		/*
++		 * The second macro carries a front-panel socket only on the
++		 * die variant that wires one, so its conduit is left to the
++		 * board files to enable.
++		 */
++		conduit_wan: ethernet@1 {
++			compatible = "lantiq,xrx500-conduit";
++			reg = <1>;
++			lantiq,transmit-dma = <&dma1tx>;
++			lantiq,receive-dma = <&dma1rx>;
++			status = "disabled";
++		};
++	};
++
++	/*
++	 * The four packet DMA controllers, a transmit and a receive one for
++	 * each switch macro. Their channels are hard-bound to a macro and to a
++	 * port of the buffer manager, so they offer nothing to an arbitrary
++	 * consumer and are reached through the phandle of the endpoint that
++	 * uses them. How each instance arbitrates, bursts, polls and places
++	 * its descriptors is fixed by the die and belongs to the driver.
++	 */
++	dma1tx: dma@1a100000 {
++		compatible = "lantiq,xrx500-dma";
++		reg = <0x1a100000 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 65 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
++	dma1rx: dma@1a200000 {
++		compatible = "lantiq,xrx500-dma";
++		reg = <0x1a200000 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 66 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
++	dma2tx: dma@1c100000 {
++		compatible = "lantiq,xrx500-dma";
++		reg = <0x1c100000 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 67 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
++	dma2rx: dma@1c200000 {
++		compatible = "lantiq,xrx500-dma";
++		reg = <0x1c200000 0x10000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 68 IRQ_TYPE_LEVEL_HIGH>;
++	};
++
+ 	/*
+ 	 * Three independent Synopsys DesignWare root complexes, each with its
+ 	 * own serdes PHY and its own chip-top byte-swap configuration.

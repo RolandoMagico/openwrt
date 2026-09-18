@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Wed, 19 Aug 2026 01:44:04 +0200
+Subject: phy: intel: grx500-pcie: pass the chip-top offset as a syscon
+ argument
+
+The USB PHY on this SoC reaches its chip-top register as
+
+	intel,syscon = <&chiptop 0x34>;
+
+while this driver names the same syscon with no argument at all and
+keeps the offset to itself as PCIE_IFMUX_CFG. Two properties on one node
+addressing one block in two different ways is the first thing a reader
+asks about, and only one of the two says where in the syscon the driver
+is going to write.
+
+The PCIe side was left alone when the USB half was converted, on the
+grounds that it carries two shift values that are not offsets into the
+syscon and would not collapse the same way. That is true, but it
+describes the root complex driver rather than this one: the shifts are
+intel,inbound-shift and intel,outbound-shift and they belong to
+pcie-intel-gw.c. This PHY has no shift values. Its entire use of the
+chip-top is one fixed register with one bit position derived from
+intel,phy-id, which is the shape the helper exists for.
+
+The other reason to wait was that the change wants a board with working
+PCIe to retest on, and only one of the two boards here has any. The
+second one gains all three root complexes in the changes that follow
+this one, so both will exercise the new form.
+
+Mixed arity on one provider is fine and is already the situation:
+syscon_regmap_lookup_by_phandle_args() parses with
+of_parse_phandle_with_fixed_args(), so the count is the caller's and
+&chiptop needs no #syscon-cells. The three root complexes go on naming
+it with no argument, untouched.
+
+Conservative form only. intel,phy-id stays as its own property. The
+offset is the same 0x120 for all three instances and the id selects a
+bit inside that one word, so whether the id should ride along as a
+second argument is a different question with a different answer, and it
+is not settled here.
+
+The offset has three consumers rather than one, so all three move
+together: the register dump, the reference-clock gate, and the lookup.
+Converting only the lookup compiles, boots and behaves exactly as
+before while silently ignoring the argument the DT now supplies, which
+is the way this change is easiest to get wrong.
+
+Doing it now is close to free. The property has never been documented,
+nothing outside this tree reads it, and there is no binding to keep in
+step, so there is no compatibility question to answer -- which stops
+being true the moment the zero-argument form is published.
+
+The DT half has to move in the same commit: the blob is built into the
+kernel image on this platform, so a driver that reads one form and a
+dtsi that spells the other never coexist in a bootable image. Board
+files are unaffected; the property is set once per instance at SoC
+level.
+
+Assisted-by: Claude:claude-fable-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 6cda1e5d7b0d..e32f4a73f4c3 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -239,7 +239,7 @@ pcie_phy0: phy@18500000 {
+ 		reg = <0x18500000 0x100000>;
+ 		reg-names = "phy";
+ 		#phy-cells = <0>;
+-		intel,syscon = <&chiptop>;
++		intel,syscon = <&chiptop 0x120>;
+ 		intel,cgu-syscon = <&cgu>;
+ 		intel,phy-id = <0>;
+ 		resets = <&rcu_reset0 12 12>;
+@@ -252,7 +252,7 @@ pcie_phy1: phy@18000000 {
+ 		reg = <0x18000000 0x100000>;
+ 		reg-names = "phy";
+ 		#phy-cells = <0>;
+-		intel,syscon = <&chiptop>;
++		intel,syscon = <&chiptop 0x120>;
+ 		intel,cgu-syscon = <&cgu>;
+ 		intel,phy-id = <1>;
+ 		resets = <&rcu_reset0 13 13>;
+@@ -265,7 +265,7 @@ pcie_phy2: phy@18a00000 {
+ 		reg = <0x18a00000 0x100000>;
+ 		reg-names = "phy";
+ 		#phy-cells = <0>;
+-		intel,syscon = <&chiptop>;
++		intel,syscon = <&chiptop 0x120>;
+ 		intel,cgu-syscon = <&cgu>;
+ 		intel,phy-id = <2>;
+ 		resets = <&rcu_reset0 10 10>;
+diff --git a/drivers/phy/intel/phy-intel-grx500-pcie.c b/drivers/phy/intel/phy-intel-grx500-pcie.c
+index c0f0a4a5fe31..79ccdedd083f 100644
+--- a/drivers/phy/intel/phy-intel-grx500-pcie.c
++++ b/drivers/phy/intel/phy-intel-grx500-pcie.c
+@@ -47,8 +47,13 @@
+ #define PCIE_LCPLL_LOCK_SLEEP_US	100
+ #define PCIE_LCPLL_LOCK_TIMEOUT_US	(100 * USEC_PER_MSEC)
+ 
+-/* CHIPTOP interface mux */
+-#define PCIE_IFMUX_CFG			0x120
++/*
++ * This instance's reference-clock gate bit in the chip-top interface mux
++ * word, reached through intel,syscon at the byte offset that property's
++ * argument gives (0x120). Unlike the USB PHY's per-controller word the
++ * offset is the same for all three instances, and which instance is meant
++ * is a bit position inside it, which is what intel,phy-id supplies.
++ */
+ #define PCIE_RCLK(id)			BIT((id) + 22)
+ 
+ #define PCIE_PHY_ID_MAX			2
+@@ -67,6 +72,7 @@ struct intel_pciephy {
+ 	void __iomem *phy_base;
+ 	struct regmap *cgu;
+ 	struct regmap *chiptop;
++	unsigned int ifmux_off;
+ 	struct phy *phy;
+ 	struct reset_control *rst;
+ 	u32 id;
+@@ -94,7 +100,7 @@ static void intel_pciephy_dbg_dump(struct intel_pciephy *priv)
+ 		dev_dbg(dev, "LCPLL COEF[%d]: 0x%08x\n", i, val);
+ 	}
+ 
+-	regmap_read(priv->chiptop, PCIE_IFMUX_CFG, &val);
++	regmap_read(priv->chiptop, priv->ifmux_off, &val);
+ 	dev_dbg(dev, "PCIE PHY IFMUX[22-24]: 0x%08x\n", val);
+ }
+ 
+@@ -212,7 +218,7 @@ static void intel_pciephy_reset(struct intel_pciephy *priv)
+ static void intel_pciephy_ref_clk(struct intel_pciephy *priv, bool on)
+ {
+ 	/* 0 is enable, 1 is disable */
+-	regmap_update_bits(priv->chiptop, PCIE_IFMUX_CFG, PCIE_RCLK(priv->id),
++	regmap_update_bits(priv->chiptop, priv->ifmux_off, PCIE_RCLK(priv->id),
+ 			   on ? 0 : PCIE_RCLK(priv->id));
+ }
+ 
+@@ -282,7 +288,9 @@ static int intel_pciephy_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(priv->cgu),
+ 				     "failed to get the CGU syscon\n");
+ 
+-	priv->chiptop = syscon_regmap_lookup_by_phandle(np, "intel,syscon");
++	priv->chiptop = syscon_regmap_lookup_by_phandle_args(np, "intel,syscon",
++							     1,
++							     &priv->ifmux_off);
+ 	if (IS_ERR(priv->chiptop))
+ 		return dev_err_probe(dev, PTR_ERR(priv->chiptop),
+ 				     "failed to get the CHIPTOP syscon\n");

@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sat, 5 Sep 2026 02:17:39 +0200
+Subject: net: lantiq: xrx500-cbm: report the driver's own counters through
+ ethtool
+
+The driver keeps the accounting the hardware does not: the transmit path
+has no completion interrupt, so nothing but the driver knows how many
+segments went to the hardware and came back, or how often the queue was
+stopped for an exhausted pool and released again; and the receive path
+sees descriptors the frame counters never hear about, because a
+descriptor rejected as malformed is not a frame.
+
+All of it was reachable only by writing to a module parameter and
+reading the log. Report it as a statistics string set instead, so the
+ordinary tools can sample it, difference it and script against it, and
+drop the two parameters: every counter they printed is now a string set
+entry that any tool can read without a writable parameter and without
+the log, and the configuration the receive report printed beside its
+counters - the ring length, the buffer size and the byte offset - is
+already logged where it is decided, when the ring is built.
+
+The per-source-port block is what makes a misdirected delivery visible
+on a conduit that serves a switch: the switch header names the port a
+frame came in on, and every frame should be counted under the port whose
+user device it ends up on.
+
+Assisted-by: Claude:claude-fable-5-1
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500-cbm.c b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+index 12e7b03e5b94..612de36b6d3b 100644
+--- a/drivers/net/ethernet/lantiq/xrx500-cbm.c
++++ b/drivers/net/ethernet/lantiq/xrx500-cbm.c
+@@ -28,6 +28,7 @@
+ #include <linux/err.h>
+ #include <linux/errno.h>
+ #include <linux/etherdevice.h>
++#include <linux/ethtool.h>
+ #include <linux/if_ether.h>
+ #include <linux/if_vlan.h>
+ #include <linux/io.h>
+@@ -735,28 +736,6 @@ static unsigned int rx_errcap = 32;
+ module_param(rx_errcap, uint, 0644);
+ MODULE_PARM_DESC(rx_errcap, "stop consuming after this many bad descriptors");
+ 
+-/* Writing this reports the receive counters and the state of the ring. */
+-static int rx_report;
+-static int xrx500_cbm_set_rx_report(const char *val,
+-				    const struct kernel_param *kp);
+-static const struct kernel_param_ops xrx500_cbm_rx_report_ops = {
+-	.set = xrx500_cbm_set_rx_report,
+-	.get = param_get_int,
+-};
+-module_param_cb(rx_report, &xrx500_cbm_rx_report_ops, &rx_report, 0644);
+-MODULE_PARM_DESC(rx_report, "write to log receive counters");
+-
+-/* Writing this reports the transmit counters and the free-segment count. */
+-static int tx_report;
+-static int xrx500_cbm_set_report(const char *val,
+-				 const struct kernel_param *kp);
+-static const struct kernel_param_ops xrx500_cbm_report_ops = {
+-	.set = xrx500_cbm_set_report,
+-	.get = param_get_int,
+-};
+-module_param_cb(tx_report, &xrx500_cbm_report_ops, &tx_report, 0644);
+-MODULE_PARM_DESC(tx_report, "write to log transmit counters");
+-
+ /*
+  * Writing N makes the next N answers about the pool report it as exhausted.
+  * The transmit path spends one per segment request and the release poll one
+@@ -2307,92 +2286,135 @@ static int xrx500_cbm_stop(struct net_device *ndev)
+ 	return 0;
+ }
+ 
+-static const struct net_device_ops xrx500_cbm_netdev_ops = {
+-	.ndo_open = xrx500_cbm_open,
+-	.ndo_stop = xrx500_cbm_stop,
+-	.ndo_start_xmit = xrx500_cbm_xmit,
+-	.ndo_select_queue = xrx500_cbm_select_queue,
+-	.ndo_set_mac_address = eth_mac_addr,
+-	.ndo_validate_addr = eth_validate_addr,
++/*
++ * Counters this driver keeps because the hardware keeps none. The transmit
++ * path has no completion at all, so what it accounts for is the segment: how
++ * many left the manager, how many came back unused, and how many are with the
++ * hardware right now. The receive path accounts for the descriptor, because a
++ * descriptor the engine completed and this driver rejected never reaches the
++ * frame counters the stack keeps.
++ *
++ * The last three are the state of the ring rather than a count, and the
++ * per-source-port block is the demultiplexing the switch header drives: on a
++ * conduit serving a switch it says which port each frame came in on, and it is
++ * how a delivery that goes to the wrong user device is caught.
++ */
++static const char xrx500_cbm_stat_strings[][ETH_GSTRING_LEN] = {
++	"tx_segments_taken",
++	"tx_segments_returned",
++	"tx_segments_outstanding",
++	"tx_pool_empty",
++	"tx_queue_stops",
++	"tx_queue_wakes",
++	"tx_restart_polls",
++	"tx_dropped_no_port",
++	"tx_pool_free",
++	"rx_polls",
++	"rx_completions",
++	"rx_completed_bytes",
++	"rx_delivered",
++	"rx_ring_wraps",
++	"rx_malformed",
++	"rx_dropped_no_buffer",
++	"rx_ring_armed",
++	"rx_ring_completed",
++	"rx_ring_aborted",
+ };
+ 
+-/* Reporting */
++#define XRX500_CBM_STAT_NUM	(ARRAY_SIZE(xrx500_cbm_stat_strings) + \
++				 PMAC_RX_SPPID_NUM)
+ 
+-static int xrx500_cbm_set_report(const char *val,
+-				 const struct kernel_param *kp)
++static int xrx500_cbm_get_sset_count(struct net_device *ndev, int sset)
+ {
+-	struct xrx500_cbm *priv;
+-	int ret = param_set_int(val, kp);
++	if (sset != ETH_SS_STATS)
++		return -EOPNOTSUPP;
+ 
+-	if (ret)
+-		return ret;
++	return XRX500_CBM_STAT_NUM;
++}
+ 
+-	guard(mutex)(&xrx500_cbm_lock);
+-	list_for_each_entry(priv, &xrx500_cbm_conduits, node)
+-		netdev_info(priv->ndev,
+-			    "free=%u pops=%llu rollbacks=%llu outstanding=%llu empty=%llu stops=%llu wakes=%llu polls=%llu noport=%llu\n",
+-			    xrx500_cbm_free_segs(priv),
+-			    priv->stats.pops, priv->stats.rollbacks,
+-			    priv->stats.pops - priv->stats.rollbacks,
+-			    priv->stats.pool_empty, priv->stats.stops,
+-			    priv->stats.wakes, priv->stats.polls,
+-			    priv->stats.noport);
+-	return 0;
++static void xrx500_cbm_get_strings(struct net_device *ndev, u32 sset, u8 *data)
++{
++	unsigned int i;
++
++	if (sset != ETH_SS_STATS)
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(xrx500_cbm_stat_strings); i++)
++		ethtool_puts(&data, xrx500_cbm_stat_strings[i]);
++
++	for (i = 0; i < PMAC_RX_SPPID_NUM; i++)
++		ethtool_sprintf(&data, "rx_source_port_%u", i);
+ }
+ 
+-static void xrx500_cbm_rx_report_one(struct xrx500_cbm *priv)
++static void xrx500_cbm_get_ethtool_stats(struct net_device *ndev,
++					 struct ethtool_stats *stats, u64 *data)
+ {
++	struct xrx500_cbm *priv = netdev_priv(ndev);
+ 	struct xrx500_cbm_rx *rx = &priv->rx;
+ 	unsigned int armed = 0;
+ 	unsigned int done = 0;
+ 	unsigned int i;
+ 
+-	if (!rx->ring) {
+-		netdev_info(priv->ndev, "receive ring not built (own_rx=%u)\n",
+-			    own_rx);
+-		return;
+-	}
+-
+-	for (i = 0; i < rx->ring_len; i++) {
+-		u32 ctl = READ_ONCE(rx->ring[i].ctl);
++	/*
++	 * The ring is built when the device comes up and released when it goes
++	 * down, and this runs under the same lock the network stack holds
++	 * across both, so it is either there for the whole of this walk or
++	 * absent for the whole of it. Testing the pointer once says that; a
++	 * test inside the loop would suggest a race this cannot be in, and
++	 * would not close it if it were.
++	 */
++	if (rx->ring) {
++		for (i = 0; i < rx->ring_len; i++) {
++			u32 ctl = READ_ONCE(rx->ring[i].ctl);
+ 
+-		if (ctl & CBM_RXD_CTL_OWN)
+-			armed++;
+-		else if (ctl & CBM_RXD_CTL_C)
+-			done++;
++			if (ctl & CBM_RXD_CTL_OWN)
++				armed++;
++			else if (ctl & CBM_RXD_CTL_C)
++				done++;
++		}
+ 	}
+ 
+-	netdev_info(priv->ndev,
+-		    "ring=%u buf=%u boff=%u next=%u armed=%u completed=%u%s\n",
+-		    rx->ring_len, rx->buf_len, rx->boff, rx->next, armed, done,
+-		    rx->aborted ? " ABORTED" : "");
+-	netdev_info(priv->ndev,
+-		    "polls=%llu completions=%llu bytes=%llu delivered=%llu wraps=%llu\n",
+-		    rx->stats.polls, rx->stats.completions, rx->stats.bytes,
+-		    rx->stats.delivered, rx->stats.wraps);
+-	netdev_info(priv->ndev, "malformed=%llu drop_noskb=%llu\n",
+-		    rx->stats.malformed, rx->stats.drop_noskb);
+-
+-	for (i = 0; i < PMAC_RX_SPPID_NUM; i++)
+-		if (rx->sppid[i])
+-			netdev_info(priv->ndev, "source port %u: %llu frames\n",
+-				    i, rx->sppid[i]);
++	i = 0;
++	data[i++] = priv->stats.pops;
++	data[i++] = priv->stats.rollbacks;
++	data[i++] = priv->stats.pops - priv->stats.rollbacks;
++	data[i++] = priv->stats.pool_empty;
++	data[i++] = priv->stats.stops;
++	data[i++] = priv->stats.wakes;
++	data[i++] = priv->stats.polls;
++	data[i++] = priv->stats.noport;
++	data[i++] = xrx500_cbm_free_segs(priv);
++	data[i++] = rx->stats.polls;
++	data[i++] = rx->stats.completions;
++	data[i++] = rx->stats.bytes;
++	data[i++] = rx->stats.delivered;
++	data[i++] = rx->stats.wraps;
++	data[i++] = rx->stats.malformed;
++	data[i++] = rx->stats.drop_noskb;
++	data[i++] = armed;
++	data[i++] = done;
++	data[i++] = rx->aborted;
++
++	memcpy(&data[i], rx->sppid, sizeof(rx->sppid));
+ }
+ 
+-static int xrx500_cbm_set_rx_report(const char *val,
+-				    const struct kernel_param *kp)
+-{
+-	struct xrx500_cbm *priv;
+-	int ret = param_set_int(val, kp);
++static const struct ethtool_ops xrx500_cbm_ethtool_ops = {
++	.get_link		= ethtool_op_get_link,
++	.get_sset_count		= xrx500_cbm_get_sset_count,
++	.get_strings		= xrx500_cbm_get_strings,
++	.get_ethtool_stats	= xrx500_cbm_get_ethtool_stats,
++};
+ 
+-	if (ret)
+-		return ret;
++static const struct net_device_ops xrx500_cbm_netdev_ops = {
++	.ndo_open = xrx500_cbm_open,
++	.ndo_stop = xrx500_cbm_stop,
++	.ndo_start_xmit = xrx500_cbm_xmit,
++	.ndo_select_queue = xrx500_cbm_select_queue,
++	.ndo_set_mac_address = eth_mac_addr,
++	.ndo_validate_addr = eth_validate_addr,
++};
+ 
+-	guard(mutex)(&xrx500_cbm_lock);
+-	list_for_each_entry(priv, &xrx500_cbm_conduits, node)
+-		xrx500_cbm_rx_report_one(priv);
+-	return 0;
+-}
++/* Parameter callbacks */
+ 
+ static int xrx500_cbm_set_force_empty(const char *val,
+ 				      const struct kernel_param *kp)
+@@ -2767,6 +2789,7 @@ static int xrx500_cbm_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	ndev->netdev_ops = &xrx500_cbm_netdev_ops;
++	ndev->ethtool_ops = &xrx500_cbm_ethtool_ops;
+ 	ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+ 	ndev->needed_headroom = 0;
+ 	ndev->min_mtu = ETH_MIN_MTU;

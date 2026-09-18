@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 6 Sep 2026 11:26:05 +0200
+Subject: MIPS: dts: intel-mips: describe the xRX500 switch macros' interrupt
+
+Each of the two switch macros raises one shared interrupt and neither node
+said so. The line aggregates everything the macro can report: the buffer
+manager, the parser and classification engine, the MAC block, and the store
+and fetch DMA blocks. The two macros use different numbers.
+
+No driver takes it. This switch reaches the same state by polling, so
+nothing changes at run time; what it buys is a device tree that describes
+the block rather than the subset the current driver happens to use.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/arch/mips/boot/dts/intel-mips/xrx500.dtsi b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+index 7a86b6047528..1e074c44e4a5 100644
+--- a/arch/mips/boot/dts/intel-mips/xrx500.dtsi
++++ b/arch/mips/boot/dts/intel-mips/xrx500.dtsi
+@@ -279,10 +279,17 @@ ebu_nand: nand-controller@16f00000 {
+ 	 * own, and neither is shared with anything else on the die. The two
+ 	 * macros sit on different branches of that PLL, which is why the pair
+ 	 * differs between them.
++	 *
++	 * One line each aggregates everything the macro can report: the buffer
++	 * manager, the parser and classification engine, the MAC block and the
++	 * store and fetch DMA blocks. Nothing takes it yet; the driver reaches
++	 * the same state by polling.
+ 	 */
+ 	gswl: switch@1c000000 {
+ 		compatible = "lantiq,xrx500-gswip";
+ 		reg = <0x1c000000 0x4000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 48 IRQ_TYPE_LEVEL_HIGH>;
+ 		clocks = <&cgu CLK_GSWIP>, <&cgu GCLK_GSWIP>;
+ 		clock-names = "freq", "gate";
+ 		dsa,member = <0 0>;
+@@ -314,6 +321,8 @@ fixed-link {
+ 	gswr: switch@1a000000 {
+ 		compatible = "lantiq,xrx500-gswip-r";
+ 		reg = <0x1a000000 0x4000>;
++		interrupt-parent = <&gic>;
++		interrupts = <GIC_SHARED 45 IRQ_TYPE_LEVEL_HIGH>;
+ 		clocks = <&cgu CLK_PAE>, <&cgu GCLK_PAE>;
+ 		clock-names = "freq", "gate";
+ 		dsa,member = <1 0>;

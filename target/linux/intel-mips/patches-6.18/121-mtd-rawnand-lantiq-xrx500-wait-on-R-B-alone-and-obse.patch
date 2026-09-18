@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Grische <github@grische.xyz>
+Date: Sun, 23 Aug 2026 22:23:10 +0200
+Subject: mtd: rawnand: lantiq-xrx500: wait on R/B# alone, and observe tWB
+
+Programs were silently dropping pages. One page in roughly five thousand
+came back pristine-erased with valid ECC, its neighbours intact, and
+every layer reporting success -- no MTD error, no ECC event, nothing in
+dmesg.
+
+The chip-ready wait was concluding on EBU_WAIT_WR_C. The bit belongs to
+the byte handshake, and it is still set from the PAGEPROG opcode strobed
+a moment earlier, so the wait returns immediately, inside tPROG.
+nand_prog_page_end_op() then reads status, which only fails on
+NAND_STATUS_FAIL, and passes. The next page's entire command / address /
+data / PAGEPROG sequence is issued to a die that is still busy, and the
+die discards it. What survives is one erased page and rc = 0.
+
+The reason it is rare rather than constant is that the byte handshake's
+own poll usually consumes WR_C on the way past. Removing WR_C from this
+predicate and instrumenting the one it would have exited on shows the
+shipped form mis-exiting on 149490 of 149504 page programs -- so the
+handshake's incidental consumption was doing all of the work of keeping
+the window shut. Measured with the shipped predicate: 29 dropped pages
+in 149504 page programs, or 1.9e-4 per program. With R/B# alone: none in
+30720, while the same counter shows the mechanism arming eleven times
+and being caught eleven times.
+
+Widening the EBU timing makes it worse rather than better (CMULT 1 -> 2
+took it to 0.6 drops per pass), which is consistent with WR_C being set
+later and escaping consumption more often, and is the most likely reason
+a GRX350 board shows nothing across nineteen thousand programs while a
+GRX550 board reproduces it inside a day.
+
+Observing instr->delay_ns is the other half. The core hangs tWB on the
+PAGEPROG and ERASE2 command instructions and the WAITRDY behind them,
+this driver never waited it, and so R/B# was being sampled before the
+die had had a chance to pull it low. That the read path never showed a
+symptom is not luck -- a read concluding early re-reads through the same
+data path and self-heals -- but the write path has nothing to fall back
+on.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Grische <github@grische.xyz>
+
+diff --git a/drivers/mtd/nand/raw/lantiq-xrx500-nand.c b/drivers/mtd/nand/raw/lantiq-xrx500-nand.c
+index b7f2e1cc4df0..7fef22970f3c 100644
+--- a/drivers/mtd/nand/raw/lantiq-xrx500-nand.c
++++ b/drivers/mtd/nand/raw/lantiq-xrx500-nand.c
+@@ -13,6 +13,7 @@
+  */
+ 
+ #include <linux/bitops.h>
++#include <linux/delay.h>
+ #include <linux/err.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+@@ -144,16 +145,18 @@ static int xrx500_nand_wait_latch(struct nand_chip *chip)
+ 				  20, XRX500_LATCH_TIMEOUT_US);
+ }
+ 
+-/* And this one is the chip-ready wait, for the WAITRDY instruction. */
++/*
++ * And this one is the chip-ready wait, for the WAITRDY instruction. R/B# is
++ * the only flag that answers it: WR_C belongs to the byte handshake above,
++ * and accepting it here means returning while the die is still busy.
++ */
+ static int xrx500_nand_waitrdy(struct nand_chip *chip, u32 timeout_us)
+ {
+ 	struct xrx500_nand_host *host = nand_to_xrx500(chip);
+ 	u32 status;
+ 
+ 	return readl_poll_timeout(host->ebu + EBU_WAIT, status,
+-				  (status & EBU_WAIT_RDBY) ||
+-				  (status & EBU_WAIT_WR_C),
+-				  20, timeout_us);
++				  status & EBU_WAIT_RDBY, 20, timeout_us);
+ }
+ 
+ static int xrx500_nand_writeb(struct nand_chip *chip, u32 offset, u8 value)
+@@ -295,6 +298,17 @@ static int xrx500_nand_exec_op(struct nand_chip *chip,
+ 
+ 		if (ret)
+ 			return ret;
++
++		/*
++		 * Observe the instruction's own delay before moving on. This
++		 * is what makes R/B# meaningful for the wait that follows a
++		 * program or an erase: the core hangs tWB on the PAGEPROG /
++		 * ERASE2 command instruction and the WAITRDY behind it, so
++		 * skipping the delay samples R/B# before the die has had time
++		 * to pull it low.
++		 */
++		if (instr->delay_ns)
++			ndelay(instr->delay_ns);
+ 	}
+ 
+ 	return 0;
