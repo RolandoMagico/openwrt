@@ -1,0 +1,572 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Kernel config for the intel-mips target. There is one subtarget (xrx500) and
+# it carries no fragment of its own: with the DTB delivered appended to each
+# device's image rather than built in, nothing in the kernel config differs
+# between the boards, so everything lives here.
+#
+# Notably absent: CONFIG_LANTIQ. INTEL_MIPS and LANTIQ are mutually
+# exclusive in arch/mips/Kconfig's "System type" choice block — that
+# is the structural reason this target was split out of lantiq/.
+
+CONFIG_INTEL_MIPS=y
+CONFIG_MIPS_CPS=y
+# MIPS_MT_SMP is required even though the SMP scheme is the platform's
+# firmware-mailbox launch (INTEL_MIPS_VMB_SMP), not vsmp: with it off,
+# cpu_vpe_id() compiles to 0 and mips_cm_vp_id() collapses core 0's two
+# VPEs onto VP 0, so every GIC IPI and shared IRQ aimed at CPU1 lands on
+# CPU0. Only one mp_ops ever registers, so the two schemes cannot conflict.
+CONFIG_MIPS_MT=y
+CONFIG_MIPS_MT_SMP=y
+# CONFIG_MIPS_MT_FPAFF is not set
+# CONFIG_MIPS_VPE_LOADER is not set
+CONFIG_INTEL_MIPS_VMB_SMP=y
+# DTB delivery: APPENDED. The kernel carries no built-in blob at all — the
+# Kconfig choice that used to pick one per board is gone, so a kernel binary
+# here is board-agnostic and the board identity travels with the image.
+# get_fdt() (arch/mips/include/asm/bootinfo.h) returns &__appended_dtb, which
+# CONFIG_MIPS_RAW_APPENDED_DTB places at the end of the last PROGBITS section,
+# i.e. exactly where the image pipeline's first `cat` of the board DTB lands.
+#
+# EVA does not leave that blob alone, which is why the pipeline appends the
+# board DTB TWICE. When its SubRevision lookup is not satisfied, EVA writes
+# its own DTB over whatever the avm-preamble table points at; the table points
+# at the LAST DTB found in the binary, so the second copy absorbs that write
+# and the first — the one get_fdt() returns — survives untouched. Both copies
+# sit inside the 1 MiB the linker reserves after __appended_dtb, and EVA's
+# blob grows upwards from the second copy, so it never reaches back down to
+# the first. image/Makefile's Build/append-sacrificial-dtb carries the full
+# derivation; both boards were gated on silicon this way.
+#
+# Consequence worth knowing when reading a boot log: with no built-in blob,
+# __dtb_start == __dtb_end, and get_fdt() returns NULL rather than falling
+# back if the appended blob is missing — prom.c turns that into
+# panic("no dtb found").
+CONFIG_MIPS_RAW_APPENDED_DTB=y
+# CONFIG_MIPS_NO_APPENDED_DTB is not set
+# CONFIG_MIPS_ELF_APPENDED_DTB is not set
+# GRX500/GRX350 CGU clock controller. The DT `cgu: cgu@16200000` node
+# (xrx500.dtsi) is referenced by `clocks = <&cgu CLK_CPU>` from cpu0/1,
+# and the v6.18 timer subsystem requests `cpu_clk` very early. Without
+# this driver, the kernel hangs after `sched_clock` with `Failed to get
+# CPU clock: -517` (-EPROBE_DEFER that never resolves). 5.10 matches.
+CONFIG_INTEL_CGU_CLK=y
+CONFIG_INTEL_GRX500_CGU_CLK=y
+# CONFIG_MIPS_CPS_NS16550_BOOL is not set
+# Batch of v6.18 defaults that surface as NEW prompts in syncconfig
+# because the parent target's config-6.18 doesn't cover them.
+CONFIG_COMPAT_32BIT_TIME=y
+CONFIG_CPU_NEEDS_NO_SMARTMIPS_OR_MICROMIPS=y
+CONFIG_CPU_MIPS32_R2=y
+CONFIG_CPU_MIPS32_3_5_FEATURES=y
+CONFIG_CPU_MIPS32_3_5_EVA=y
+CONFIG_CPU_HAS_SYNC=y
+CONFIG_CPU_R4K_FPU=y
+CONFIG_CPU_R4K_CACHE_TLB=y
+CONFIG_GENERIC_CSUM=y
+CONFIG_MIPS_L1_CACHE_SHIFT=5
+CONFIG_PAGE_SIZE_4KB=y
+CONFIG_HZ_250=y
+CONFIG_PAGE_BLOCK_MAX_ORDER=11
+CONFIG_FUTEX=y
+CONFIG_FUTEX_PI=y
+CONFIG_HARDLOCKUP_DETECTOR_PERF=y
+CONFIG_HARDLOCKUP_CHECK_TIMESTAMP=y
+# CONFIG_KEXEC is not set
+# CONFIG_CRASH_DUMP is not set
+# CONFIG_CPU_HAS_LOAD_STORE_LR is not set
+CONFIG_GENERIC_GETTIMEOFDAY=y
+CONFIG_GENERIC_VDSO_32=y
+CONFIG_HAVE_ARCH_VMAP_STACK=y
+CONFIG_VMAP_STACK=y
+CONFIG_HAVE_ARCH_KASAN_VMALLOC=y
+# CONFIG_KASAN is not set
+# RANDOMIZE_BASE + RELOCATABLE relocate the kernel at boot to a (possibly
+# randomized) runtime address — but MIPS's get_fdt() returns &__dtb_start
+# resolved at compile time (the LINK address). After relocation that pointer
+# is stale: it points at whatever stale RAM now sits at the old link address
+# (LZMA decompression artifacts or pre-relocation kernel data), not at the
+# DTB the kernel actually copied to its new location. Symptom: early_init_dt
+# warns "No '#size-cells' in root node" and panics in
+# early_init_dt_alloc_memory_arch, despite the on-disk DTB being well-formed.
+# Disable both; revisit if intel-mips/prom.c grows a plat_get_fdt()
+# (used by the relocate path in arch/mips/kernel/relocate.c).
+# CONFIG_RANDOMIZE_BASE is not set
+# CONFIG_RELOCATABLE is not set
+# Network NEW prompts surfaced during world build
+CONFIG_RPS=y
+CONFIG_RFS_ACCEL=y
+# NET_FLOW_LIMIT depends on RPS=y; promote to explicit =y so syncconfig
+# doesn't prompt for it.
+CONFIG_NET_FLOW_LIMIT=y
+# CONFIG_ZBOOT_LOAD_ADDRESS leaks in from arch/mips/Kconfig.debug when
+# SYS_SUPPORTS_ZBOOT is selected; 0x0 is the default and we don't use
+# the zboot (compressed-self-extracting) path — the EVA container does its
+# own LZMA at the OpenWrt image layer instead.
+CONFIG_ZBOOT_LOAD_ADDRESS=0x0
+CONFIG_SMP=y
+# Four VPEs: two cores of two, on both GRX350 and GRX550. Board level rather
+# than per-board because it is a property of the interAptiv cluster the
+# System type selects, and both boards run the same launch protocol
+# (INTEL_MIPS_VMB_SMP).
+CONFIG_NR_CPUS=4
+CONFIG_SERIAL_LANTIQ=y
+CONFIG_SERIAL_LANTIQ_CONSOLE=y
+CONFIG_EARLY_PRINTK=y
+CONFIG_CMDLINE_BOOL=y
+# Byte-identical on both boards, which is why it sits here: same UART at the
+# same address, and no nosmp any more now that the secondaries come up through
+# the firmware mailbox.
+CONFIG_CMDLINE="earlycon=lantiq,0x16600000 console=ttyLTQ0,115200n8r"
+CONFIG_MIPS_CMDLINE_BUILTIN_EXTEND=y
+# CONFIG_CMDLINE_OVERRIDE is not set
+# Explicitly unset every other option in the MIPS_CMDLINE choice block
+# so syncconfig doesn't hang prompting which NEW sibling to pick.
+# CONFIG_MIPS_CMDLINE_FROM_DTB is not set
+# CONFIG_MIPS_CMDLINE_DTB_EXTEND is not set
+# CONFIG_MIPS_CMDLINE_FROM_BOOTLOADER is not set
+
+# NAND / UBI / UBIFS stack. NAND chip is Macronix MX30LF1GE8AB
+# (128 MiB SLC, 2 KiB page, 64 page/block) wired to EBU CS0 on the
+# xRX500 SoC. The MTD layer carries the AVM 5-partition map declared
+# in seale_avm_fritz7560.dtsi; UBI sits on the 'ubi' partition.
+CONFIG_MTD=y
+CONFIG_MTD_BLOCK=y
+CONFIG_MTD_RAW_NAND=y
+CONFIG_MTD_NAND_LANTIQ_XRX500=y
+CONFIG_MTD_NAND_CORE=y
+CONFIG_MTD_NAND_ECC=y
+CONFIG_MTD_NAND_ECC_SW_HAMMING=y
+CONFIG_MTD_UBI=y
+CONFIG_MTD_UBI_BLOCK=y
+# UBI sub-options. Resolve every prompt UBI/UBIFS surfaces in syncconfig
+# to avoid kconfig auto-default churn between rebuilds.
+CONFIG_MTD_UBI_WL_THRESHOLD=4096
+CONFIG_MTD_UBI_BEB_LIMIT=20
+# CONFIG_MTD_UBI_FASTMAP is not set
+# CONFIG_MTD_UBI_GLUEBI is not set
+# CONFIG_MTD_UBI_FAULT_INJECTION is not set
+CONFIG_UBIFS_FS=y
+# CONFIG_UBIFS_FS_ADVANCED_COMPR is not set
+CONFIG_UBIFS_FS_LZO=y
+CONFIG_UBIFS_FS_ZLIB=y
+CONFIG_UBIFS_FS_ZSTD=y
+CONFIG_UBIFS_FS_XATTR=y
+CONFIG_UBIFS_FS_SECURITY=y
+# CONFIG_UBIFS_ATIME_SUPPORT is not set
+# CONFIG_UBIFS_FS_AUTHENTICATION is not set
+CONFIG_LZO_COMPRESS=y
+CONFIG_LZO_DECOMPRESS=y
+CONFIG_ZSTD_COMPRESS=y
+CONFIG_ZSTD_DECOMPRESS=y
+CONFIG_CRYPTO=y
+CONFIG_CRYPTO_DEFLATE=y
+CONFIG_CRYPTO_LZO=y
+CONFIG_INTEL_XRX500_NET=y
+# Built in rather than =m, because the buffer manager's transmit path and
+# the conduit's receive path call dma_cache_wback()/dma_cache_inv(), which
+# MIPS does not export to modules.
+CONFIG_INTEL_XRX500_BM=y
+CONFIG_INTEL_XRX500_CBM_CONDUIT=y
+
+# The two switch macros are driven as DSA switches. The core and the tagging
+# driver are built in, so a conduit that comes up before the root filesystem
+# has its protocol available and nothing has to be demand-loaded on the
+# receive path.
+CONFIG_NET_DSA=y
+CONFIG_NET_DSA_TAG_GSWIP3=y
+
+# The switch driver itself is =m, and it has to be. The firmware the
+# integrated PHYs need is proprietary, so nothing links it into the kernel
+# image; xrx500-phy11g-firmware installs it in the rootfs instead. Built in,
+# the driver would probe during do_initcalls() with no rootfs mounted and
+# fail the direct firmware read with no way to retry. As a module loaded
+# from /etc/modules-boot.d the rootfs is already there. The common core
+# follows it, being a library the switch driver links against.
+CONFIG_NET_DSA_LANTIQ_COMMON=m
+CONFIG_NET_DSA_LANTIQ_GSWIP_XRX500=m
+
+# The GSWIP 2.x driver and its tagging driver belong to the xRX200/xRX300
+# switch, which this SoC does not carry; the backport that brought the
+# common core into this tree brings them along. Off, so nothing installs a
+# module for a switch that is not there.
+# CONFIG_NET_DSA_LANTIQ_GSWIP is not set
+# CONFIG_NET_DSA_TAG_GSWIP is not set
+
+# The integrated Gigabit PHYs sit on the switch macros' own management
+# buses, and the device tree gives each of them the ID d565.a409, which
+# intel-xway.c matches. Enable INTEL_XWAY_PHY so they bind to that driver
+# rather than to the Generic PHY fallback.
+CONFIG_INTEL_XWAY_PHY=y
+
+# rcu_reset0 (reset-controller@10 inside rcu@16000000,
+# compatible "lantiq,xrx200-reset") binds via reset-lantiq.c which depends on
+# MFD_SYSCON + REGMAP_MMIO. CONFIG_RESET_LANTIQ defaults to SOC_TYPE_XWAY,
+# which the intel-mips target does NOT set (we are INTEL_MIPS, not LANTIQ).
+# Without it, every per-PHY reset lookup of the switch driver returns
+# -EPROBE_DEFER forever, so the integrated PHYs are never started and the
+# switch never registers its ports.
+#
+# The line below does not by itself decide that, and cannot. The symbol has
+# no prompt outside COMPILE_TEST, so it falls back to its default whatever
+# a fragment says. What settles it is the switch driver's own "select
+# RESET_LANTIQ if INTEL_MIPS". This records the requirement and keeps the
+# merged configuration readable; it is not the mechanism.
+CONFIG_RESET_LANTIQ=y
+CONFIG_MFD_SYSCON=y
+CONFIG_REGMAP_MMIO=y
+
+# Restart handler. The same rcu@16000000 syscon now also carries a
+# "syscon-reboot" child that sets bit 30 of RCU_RST_REQ (+0x10), the SoC's
+# global software reset, which is the bit AVM's 4.9 BSP asserts from
+# reset-intel-syscon.c. Without a restart handler registered, MIPS
+# machine_restart() falls through to machine_hang() and "reboot" wedges the
+# board with interrupts masked -- observed on hardware, and fatal to
+# sysupgrade, which ends by rebooting. POWER_RESET is a menuconfig with no
+# default so it has to be named before POWER_RESET_SYSCON is reachable;
+# POWER_RESET_SYSCON selects MFD_SYSCON, already =y just above.
+CONFIG_POWER_RESET=y
+CONFIG_POWER_RESET_SYSCON=y
+
+# Pin controller and GPIO banks. The xRX500 pad/GPIO block is driven by
+# the mainline pinctrl-equilibrium driver (Lightning Mountain sibling,
+# byte-identical register map) bound through "intel,pinctrl-xrx500";
+# the two gpio child nodes live in xrx500.dtsi. target/linux/generic
+# turns PINCTRL off wholesale, so it has to come back on here.
+# PINCTRL_EQUILIBRIUM selects everything else it needs on its own
+# (PINMUX, PINCONF, GPIOLIB, GPIO_GENERIC, GPIOLIB_IRQCHIP,
+# GENERIC_PINCONF, GENERIC_PINCTRL_GROUPS, GENERIC_PINMUX_FUNCTIONS),
+# so no further symbols belong here.
+CONFIG_PINCTRL=y
+CONFIG_PINCTRL_EQUILIBRIUM=y
+# Deliberately NOT set here, even though grx500_defconfig sets them:
+#  - LEDS_GPIO: shipped as kmod-leds-gpio from the 7560's
+#    DEVICE_PACKAGES, i.e. =m. Forcing =y would leave the kmod package
+#    with no .ko to install.
+#  - INPUT / INPUT_KEYBOARD / KEYBOARD_GPIO_POLLED: the out-of-tree
+#    gpio-button-hotplug driver (also in DEFAULT_PACKAGES) binds
+#    "gpio-keys-polled" itself and emits hotplug events instead of input
+#    events. The in-kernel keyboard drivers would race it for the same
+#    DT nodes, so the generic "is not set" lines must stand.
+# NEW_LEDS, LEDS_CLASS, LEDS_TRIGGERS and LEDS_TRIGGER_NETDEV are
+# already =y in target/linux/generic/config-6.18.
+
+# /dev/mem. This board has no JTAG and no in-band debug channel other
+# than the serial console, so /dev/mem is the only access to SoC
+# registers from a running system. STRICT_DEVMEM is already unset in
+# generic, so the whole physical address space stays reachable. This
+# only takes effect together with CONFIG_KERNEL_DEVMEM=y in the
+# top-level .config, because include/kernel-defaults.mk copies
+# CONFIG_KERNEL_* over this fragment, including the negated
+# "# CONFIG_KERNEL_DEVMEM is not set" form.
+CONFIG_DEVMEM=y
+
+# PCIe host bridges. Mirrors arch/mips/configs/grx500_defconfig; generic
+# has "# CONFIG_PCI is not set" and "# CONFIG_PCI_MSI is not set", both
+# of which this fragment has to override.
+#  - PCI. INTEL_MIPS selects HAVE_PCI and PCI_DRIVERS_GENERIC, but
+#    HAVE_PCI only makes the menu visible; the bus itself is a prompt
+#    with no default. This line is also what makes include/target.mk add
+#    the "pci" FEATURES token (it greps the merged fragments literally
+#    and does not resolve Kconfig selects), which in turn selects
+#    PCI_SUPPORT for the @PCI_SUPPORT wifi packages of the next phase.
+#  - PCI_MSI is required, not optional: PCIE_INTEL_GW "depends on
+#    PCI_MSI", so without it the controller is silently dropped from the
+#    resolved .config with no warning. The bridge itself has no MSI --
+#    INTx only, and the driver's .msi_init hook clears has_msi_ctrl so
+#    the DesignWare iMSI-RX block is never programmed. An endpoint that
+#    asks for MSI falls into the PCI_MSI_ARCH_FALLBACKS path MIPS turns
+#    on, where the __weak arch_setup_msi_irq() returns -EINVAL and the
+#    driver falls back to INTx.
+#  - PCIEPORTBUS stays unset (generic already has it so). The port
+#    services -- AER, PME, hotplug -- are exactly the IRNCR sources the
+#    xrx500 driver leaves masked and never requests, so portdrv would
+#    only risk a level line nobody clears. This also means the "pcie"
+#    FEATURES token stays off, which is correct: nothing we need depends
+#    on PCIE_SUPPORT, only on PCI_SUPPORT.
+#  - PCIE_DW_DEBUGFS is the one symbol the DesignWare menu newly exposes
+#    that has a prompt and no answer anywhere in generic/config-6.18, so
+#    without this line syncconfig goes interactive and the build dies at
+#    "Restart config...". It stays off: what it exposes is the RAS DES
+#    vendor capability's event counters and LTSSM trace, which this core
+#    generation does not implement, and lspci's LnkSta already answers
+#    the only question bring-up has for it.
+CONFIG_PCI=y
+CONFIG_PCI_MSI=y
+CONFIG_PCIE_DW=y
+CONFIG_PCIE_DW_HOST=y
+# CONFIG_PCIE_DW_DEBUGFS is not set
+CONFIG_PCIE_INTEL_GW=y
+
+# Slim PHY feeding the three root complexes. Selects GENERIC_PHY, which
+# generic has as "is not set"; MFD_SYSCON and RESET_CONTROLLER, its other
+# two selects, are already on from the INTEL_MIPS platform selects.
+CONFIG_GENERIC_PHY=y
+CONFIG_PHY_INTEL_GRX500_PCIE=y
+
+# USB host stack. Built in rather than modular, matching every other
+# SoC-integral block on this target (GSWIP suite, PCIe root complex, slim
+# PHY, pinctrl) and matching target/linux/lantiq/xrx200/config-6.18, which
+# turns USB/USB_COMMON/USB_SUPPORT on the same way. There is no glue kmod
+# to reach for either: package/kernel/linux/modules/usb.mk defines dwc3
+# glue packages for octeon and qcom only, both @TARGET-gated, so a modular
+# build here would mean adding an out-of-target KernelPackage or a
+# target-local modules.mk for a driver that is soldered to the SoC.
+# generic/config-6.18 carries an explicit "is not set" for every symbol
+# below, so each line is an override, not an addition.
+#  - USB_SUPPORT is the menuconfig gate for the whole subsystem. Its own
+#    Kconfig default is y and generic negates it anyway, so without this
+#    line the menu never becomes visible and every symbol under it stays
+#    off with no diagnostic. It is also half of the pair include/target.mk
+#    greps to derive the "usb" FEATURES token; USB_ARCH_HAS_HCD is already
+#    =y in generic, so the inner half of that test passes today.
+#  - USB and USB_COMMON. USB_COMMON is a promptless tristate that USB
+#    selects, so the line is redundant to Kconfig; it is here for the same
+#    reason lantiq carries it, because target.mk's FEATURES derivation
+#    greps the merged fragments literally and does not resolve selects.
+#  - USB also selects NLS, which generic has as "# CONFIG_NLS is not set".
+#    A select beats an explicit negative, so NLS comes on by itself; the
+#    fifty NLS_* codepage and charset symbols beneath it are all already
+#    answered in generic, so nothing new is left to prompt for.
+#  - USB_XHCI_HCD is the SuperSpeed controller the dwc3 core hands its host
+#    half to, and USB_XHCI_PLATFORM is the platform-device binding for it.
+#    USB_DWC3 does "select USB_XHCI_PLATFORM if USB_XHCI_HCD", so the
+#    second line is strictly redundant -- but it is a prompt ("Generic xHCI
+#    driver for a platform device") that no fragment answers, and the
+#    PCIE_DW_DEBUGFS episode above is why prompts get answered by hand here
+#    rather than left to a select to reach first.
+#  - USB_PCI stays off. This controller is a platform device; the PCIe bus
+#    on this board carries the two WiFi radios and no xHCI endpoint, so
+#    xhci-pci would be dead code. It matters because USB_XHCI_PCI is a
+#    promptless "default y" whose only gate is "depends on USB_PCI" --
+#    turning USB_PCI on is by itself enough to build it. It is also why
+#    kmod-usb3 is deliberately absent from the 7560 DEVICE_PACKAGES: its
+#    KCONFIG line is "CONFIG_USB_PCI=y CONFIG_USB_XHCI_PCI
+#    CONFIG_USB_XHCI_PLATFORM", so selecting it would undo this line.
+#  - USB_DWC3 is the DesignWare USB3 dual-role core. Its "depends on
+#    (EXTCON || EXTCON=n)" is satisfied by generic's "# CONFIG_EXTCON is
+#    not set" -- EXTCON=n is the second arm -- so no extcon line belongs
+#    here; adding one would pull in a subsystem whose only user would be a
+#    cable detector this board does not have.
+#  - USB_DWC3_HOST answers the "DWC3 Mode Selection" choice. Its Kconfig
+#    default, USB_DWC3_HOST if (USB && !USB_GADGET), already resolves our
+#    way and USB_GADGET is off, but a choice block with no explicit answer
+#    is the classic "Restart config..." build-killer, so it is written out.
+#    Host-only also keeps USB_ROLE_SWITCH off for free: USB_DWC3's
+#    role-switch select is gated on USB_DWC3_DUAL_ROLE.
+#  - USB_DWC3_OF_SIMPLE and USB_DWC3_GENERIC_PLAT are both "default
+#    USB_DWC3" and would follow it on if generic ever dropped its
+#    negatives, and neither can bind: of-simple's match table is
+#    Xilinx/Qualcomm, generic-plat's is { "spacemit,k1-dwc3" }. The dwc3
+#    core attaches directly to a plain "snps,dwc3" node here, with no glue
+#    parent, so both stay off rather than shipping two probe functions that
+#    can never match.
+#  - NOP_USB_XCEIV stays off (generic already has it so). dwc3 looks for a
+#    legacy usb_phy through the "usb-phy" phandle and treats -ENXIO -- which
+#    is exactly what the !USB_PHY stub returns -- as "none fitted"; the real
+#    PHY arrives on the generic-phy side via devm_phy_get(dev, "usb3-phy"),
+#    which is the name our dwc3 node's phy-names carries. That lookup is
+#    conditional in 6.18: drivers/usb/dwc3/core.c walks num_usb3_ports and
+#    only asks for "usb3-phy" when the core reports one SuperSpeed port,
+#    where 4.9 asked for it unconditionally. num_usb3_ports is counted out
+#    of the xHCI extended capability registers for a host-capable core, so
+#    a core that reported no SuperSpeed port would skip the PHY silently.
+#  - PHY_INTEL_GRX500_USB is the USB PHY. GENERIC_PHY is already =y from
+#    the PCIe slim PHY above, and its other three selects -- MFD_SYSCON,
+#    RESET_CONTROLLER, RESET_LANTIQ -- are all already =y further up this
+#    file for the platform's own reset controller.
+#  - Mass storage is deliberately not here. SCSI, BLK_DEV_SD, USB_STORAGE,
+#    USB_UAS, vfat and ext4 arrive as kmods through the 7560's
+#    DEVICE_PACKAGES, so a size-constrained build can drop them without
+#    touching this fragment. Only what is soldered to the SoC is =y.
+CONFIG_USB_SUPPORT=y
+CONFIG_USB=y
+CONFIG_USB_COMMON=y
+CONFIG_USB_XHCI_HCD=y
+CONFIG_USB_XHCI_PLATFORM=y
+# CONFIG_USB_PCI is not set
+CONFIG_USB_DWC3=y
+CONFIG_USB_DWC3_HOST=y
+# CONFIG_USB_DWC3_OF_SIMPLE is not set
+# CONFIG_USB_DWC3_GENERIC_PLAT is not set
+CONFIG_PHY_INTEL_GRX500_USB=y
+
+# Regulator framework, for the USB port's VBUS rail and nothing else. The
+# 7560 gates port power from a GPIO, which the device tree models as a
+# regulator-fixed that the USB PHY takes as its "vbus-supply".
+#
+# Both lines fail silently if omitted, in the PCI_MSI manner: nothing here
+# selects REGULATOR, because a consumer only calls the API, so generic's
+# "# CONFIG_REGULATOR is not set" would simply stand. The PHY driver asks
+# for the rail with devm_regulator_get_optional(), whose !CONFIG_REGULATOR
+# stub returns ERR_PTR(-ENODEV) -- indistinguishable from "this board
+# straps VBUS on and fits no regulator", which is a real configuration the
+# driver supports. It would take that branch, log nothing above dev_dbg,
+# probe successfully, register the PHY, and leave the port permanently
+# unpowered. REGULATOR_FIXED_VOLTAGE is the second half: without the driver
+# for "regulator-fixed" the DT node never binds, the supply never resolves,
+# and the PHY's get_optional() defers forever instead.
+#
+# Turning REGULATOR on also makes include/target.mk derive a "regulator"
+# FEATURES token, which target-metadata.pl turns into "select
+# REGULATOR_SUPPORT". Exactly one package in the tree gates on that symbol
+# -- kmod-pse-regulator, a Power-over-Ethernet PSE driver -- and it only
+# becomes selectable, not selected. So the token is inert here; it is
+# called out only so its appearance in .targetinfo is not mistaken for a
+# second, unexplained change.
+CONFIG_REGULATOR=y
+CONFIG_REGULATOR_FIXED_VOLTAGE=y
+
+# Watchdog. generic/config-6.18 already carries CONFIG_WATCHDOG=y but
+# "# CONFIG_WATCHDOG_CORE is not set", so today the whole /dev/watchdog
+# interface is absent: procd's watchdog_open() fails, watchdog_init()
+# bails before arming its uloop timer, and the box runs with no bite at
+# all. WATCHDOG_CORE is what creates the chardev, so it comes first.
+#  - INTEL_GRX500_WDT is the SoC's own timer. =y rather than =m for a
+#    reason that is specific to the watchdog: procd's initd opens
+#    /dev/watchdog from watchdog_init(1) BEFORE it runs kmodloader over
+#    /etc/modules-boot.d, so a modular driver is not present in time.
+#    procd only retries the open twice more (at STATE_EARLY and
+#    STATE_UBUS) and never again, so a module would leave a window --
+#    and the boot-time window is exactly when a bring-up hang happens.
+#  - WATCHDOG_SYSFS is how the hardware gate gets evidenced without
+#    shipping extra tooling: /sys/class/watchdog/watchdog0/ then exposes
+#    state, timeleft, timeout, bootstatus and identity, all readable
+#    with cat over the serial console, which is this board's only
+#    channel. Costs a handful of sysfs attributes and nothing else.
+# Deliberately left alone, all already answered in generic and all
+# already correct for this board:
+#  - WATCHDOG_NOWAYOUT stays unset. procd owns /dev/watchdog and closes
+#    it without the magic 'V' by default (wdt_magicclose = false), which
+#    is the standard OpenWrt arrangement.
+#  - WATCHDOG_HANDLE_BOOT_ENABLED=y and WATCHDOG_OPEN_TIMEOUT=0 together
+#    mean that if the bootloader left a watchdog running, the core feeds
+#    it indefinitely until userspace first opens the node, rather than
+#    letting it bite mid-boot. open_timeout 0 maps to an open_deadline of
+#    KTIME_MAX. Correct default; do not "tighten" it.
+#  - SOFT_WATCHDOG stays off: a software watchdog cannot fire from the
+#    IRQ-off spins that are the whole reason for having one here.
+# Driver-side contract, recorded because it is invisible from this file:
+# procd hardcodes a 30 s requested timeout and a 5 s feed interval, and
+# it DISCARDS the return value of WDIOC_SETTIMEOUT. It never recomputes
+# the feed interval from what the kernel actually granted. So the driver
+# must express a short hardware ceiling as max_hw_heartbeat_ms and leave
+# max_timeout at 0 -- the watchdog core then accepts the full 30 s and
+# bridges it with its own ping worker. A driver that instead clamps the
+# timeout down would be silently fed too slowly and reset-loop the box.
+CONFIG_WATCHDOG_CORE=y
+CONFIG_WATCHDOG_SYSFS=y
+CONFIG_INTEL_GRX500_WDT=y
+
+# Pretimeout governors. The GRX500 watchdog reports its first countdown
+# expiry as an interrupt and only resets the SoC on the second, and the
+# driver routes that interrupt into watchdog_notify_pretimeout(). Having
+# both governors built lets the hardware gate be proved in both
+# directions at runtime, with no rebuild:
+#   echo panic > /sys/class/watchdog/watchdog0/pretimeout_governor
+#     -- the first countdown panics, exercising the diagnostic and
+#        crash-record path (and, with ramoops below, leaving the evidence
+#        behind for the next boot to read).
+#   echo noop  > /sys/class/watchdog/watchdog0/pretimeout_governor
+#     -- the first countdown only logs, the hardware second countdown is
+#        allowed to run, and the RCU reset is proved to be real rather
+#        than a software panic dressed up as one.
+# generic/config-6.18 has "# CONFIG_WATCHDOG_PRETIMEOUT_GOV is not set"
+# and nothing else, which is the stale-negative trap in its most
+# expensive form: the negative keeps the whole "if
+# WATCHDOG_PRETIMEOUT_GOV" block closed, so the four symbols inside it
+# have no answer in any fragment. Turning the gate on alone opens the
+# block and makes all four NEW, two of them a choice -- the "Restart
+# config..." build-killer that PCIE_DW_DEBUGFS and USB_DWC3_HOST above
+# were each written out to avoid. So every symbol in the block is
+# answered here explicitly, including the choice member we do not want.
+#  - GOV_NOOP and GOV_PANIC are tristate with "default WATCHDOG_CORE",
+#    so they would resolve to =y on their own -- but only by luck of the
+#    default. They are pinned =y because =m would be actively wrong
+#    here: pretimeout_noop.o and pretimeout_panic.o are separate obj-$()
+#    targets (unlike the framework itself, which is folded into
+#    watchdog.o), this target has no modules.mk to ship a .ko from, and
+#    a governor that is built but never installed leaves
+#    watchdog_notify_pretimeout() with nothing registered -- a silent
+#    no-op exactly like a datapath symbol left unset above.
+#  - DEFAULT_GOV_NOOP is the boot default, deliberately overriding
+#    upstream's choice default of _GOV_PANIC (Kconfig:116-118). This
+#    driver's interrupt path has never executed on this silicon, so the
+#    first thing to establish is whether the pretimeout fires at all and
+#    whether it fires when it should. Defaulting to panic would turn a
+#    spurious or mistimed pretimeout into a panic on every boot -- a
+#    boot loop whose own cause is the thing under test, and the worst
+#    possible failure mode on a board reachable only over UART. noop
+#    logs instead, which is diagnostic rather than fatal, and still lets
+#    the hardware second countdown reset the board, so the RCU path is
+#    exercised on the default path too. Panic is what the gate opts into
+#    for one test, by writing the sysfs knob.
+#  - WATCHDOG_PRETIMEOUT_GOV_SEL needs no line: it is promptless, and in
+#    6.18 nothing references it (not the Makefile, not any source file)
+#    beyond its own "select PANIC if NOOP=n", which is moot once both
+#    governors are explicitly on.
+# The runtime switch needs three things at once, only two of which are
+# config: WATCHDOG_SYSFS=y (the whole attribute group lives inside
+# "#ifdef CONFIG_WATCHDOG_SYSFS", watchdog_dev.c:443), this gate, and
+# the driver actually advertising pretimeout support -- wdt_is_visible()
+# hides pretimeout_governor unless watchdog_have_pretimeout(wdd) too.
+CONFIG_WATCHDOG_PRETIMEOUT_GOV=y
+CONFIG_WATCHDOG_PRETIMEOUT_GOV_NOOP=y
+CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y
+CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_NOOP=y
+# CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_PANIC is not set
+
+# Crash persistence (pstore + ramoops). This board has no JTAG, and the
+# serial console is the only post-mortem channel there has ever been --
+# which means that any failure that takes out the console, or that ends
+# in a watchdog bite while nobody is watching the UART, currently leaves
+# nothing behind at all. ramoops keeps the kmsg tail and the console
+# stream in a RAM region that survives the SoC's warm reset, so the next
+# boot can read the previous one's last words out of /sys/fs/pstore.
+# generic/config-6.18 has PSTORE and every sub-option off, so each line
+# here is an override.
+#  - PSTORE_RAM is the ramoops backend. It binds to a reserved-memory
+#    node with compatible = "ramoops" (fs/pstore/ram.c), which lives in
+#    seale_avm_fritz7560.dtsi on the kernel side; without that node the
+#    driver simply does not probe, so this symbol is inert until the DT
+#    half lands. It selects REED_SOLOMON/_ENC8/_DEC8, which generic has
+#    as explicit negatives -- a select beats an explicit negative and
+#    all three are promptless, so no lines for them belong here (same
+#    situation as USB selecting NLS above).
+#  - PSTORE_CONSOLE is required, not optional. Without it ramoops only
+#    captures through kmsg_dump, i.e. only if the kernel got as far as
+#    an oops -- so the exact failure this whole phase exists for, a
+#    silent wedge that the watchdog resolves by biting, would leave an
+#    empty pstore. The console zone is written continuously and does
+#    leave a readable tail. It needs a "console-size" property on the DT
+#    node to have any effect.
+#  - AVM reached the same three answers on this same board: PSTORE=y,
+#    PSTORE_CONSOLE=y, PSTORE_RAM=y, PSTORE_PMSG off
+#    (4.9 arch/mips/configs/avm_fb7560_defconfig:3015-3021).
+#  - =y, not the kmod-pstore/kmod-ramoops route. A module registered by
+#    kmodloader cannot capture a panic that happens during driver probe,
+#    and early probe is where this port's failures have historically
+#    been. Built in, the backend is live from initcall time.
+#  - Nothing in userspace needs adding: package/base-files' init.d/boot
+#    already mounts pstore on /sys/fs/pstore when the filesystem
+#    registers.
+# Deliberately not enabled:
+#  - PSTORE_COMPRESS. This is the one place we knowingly diverge from
+#    AVM, who set PSTORE_ZLIB_COMPRESS (defconfig:3016). Compression's
+#    whole job is to fit more text into a fixed region, at the cost of
+#    running zlib deflate inside the panic path. The region is sized
+#    generously here because RAM is not scarce, so the trade is the
+#    wrong way round: prefer less code between the oops and the write.
+#    Revisit only if the region has to shrink.
+#  - PSTORE_PMSG (no userspace logger wants it), PSTORE_FTRACE (would
+#    drag in FUNCTION_TRACER and DEBUG_FS), PSTORE_BLK (the block path
+#    would have to survive a crash in the storage stack it writes
+#    through, which defeats the purpose).
+# PSTORE_DEFAULT_KMSG_BYTES stays at generic's 10240, which is ample for
+# a MIPS oops (the platform now boots 4 VPEs; a multi-CPU oops with
+# per-CPU backtraces still fits) -- and it is
+# retunable at runtime via /sys/module/pstore/parameters/kmsg_bytes. The
+# DT record-size must stay comfortably above it.
+CONFIG_PSTORE=y
+CONFIG_PSTORE_RAM=y
+CONFIG_PSTORE_CONSOLE=y
