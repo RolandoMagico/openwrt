@@ -1,0 +1,231 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Network-detection hook for intel-mips.
+#
+# The front-panel jacks are DSA user ports. Their names come from the
+# "label" property of each port node in the device tree, so they are stable
+# across probe order and across boards, and the software bridge netifd
+# builds over them is a bridge over switch ports.
+
+. /lib/functions.sh
+. /lib/functions/uci-defaults.sh
+. /lib/functions/system.sh
+
+# fritz_tffs_mac(), used by both arms below to read the per-unit Ethernet
+# addresses. It sits in its own file because the 7580's WiFi hotplug script
+# needs the same reader; the invocation details are documented there.
+. /lib/functions/fritz.sh
+
+board_config_update
+
+case "$(board_name)" in
+avm,fritz7560)
+	#
+	# All four front-panel jacks ship as LAN. This board has no WAN
+	# Ethernet socket — AVM's uplink here was DSL, which is out of
+	# scope for this port — so there is nothing to nominate as WAN in
+	# the hardware description. This matches the lantiq/xrx200
+	# AVM siblings (avm,fritz7360sl, avm,fritz7362sl, avm,fritz7430,
+	# avm,fritz7490, avm,fritz3490, ...), all of which declare every
+	# jack as LAN; it is the upstream-faithful default for AVM boxes
+	# without a WAN jack.
+	#
+	# To use the box as a router, nominate one LAN port as WAN at
+	# runtime. That is plain OpenWrt uci configuration — no image
+	# change needed — and the stock firewall already ships the wan
+	# zone with masquerade, so the port starts routing as soon as it
+	# is moved. LAN1 is the port to recommend, following AVM's own
+	# uplink convention.
+	#
+	# lan1..lan4 are the DSA port labels, not probe-order names. The
+	# board wires front-panel LAN-N to GPHY-(6-N) on switch port (6-N),
+	# and seale_avm.dtsi carries that reversal in the labels, so lan1 is
+	# the socket marked LAN 1 whatever the port numbering says. Nothing
+	# here has to know the mapping.
+	#
+	ucidef_set_interface_lan "lan1 lan2 lan3 lan4"
+
+	#
+	# MAC addresses. This unit's addresses live in the AVM TFFS
+	# partition, and nothing in the kernel reads them, so without the
+	# lines below every port comes up with a fresh random address on each
+	# boot. DSA derives a user port's address from the conduit's, and the
+	# conduit has no source for one either.
+	#
+	# The invocation details (char device for MEMREADOOB, -o plus the
+	# plain-read fallback, no -b, filtered output) live with
+	# fritz_tffs_mac() in /lib/functions/fritz.sh. The partition is looked
+	# up by label rather than by index: mtd numbering shifts with the
+	# partition table, the label does not.
+	tffsdev=$(find_mtd_chardev "nand-tffs")
+	maca=$(fritz_tffs_mac "$tffsdev" maca)
+
+	# Anything unexpected out of the tool — an empty string, an error
+	# message, a partition that could not be found — leaves the random
+	# addresses in place rather than feeding junk into the network
+	# config. A broken board.d is worse than boring MACs.
+	case "$maca" in
+	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+		#
+		# All four ports get maca, which is what the box shipped
+		# with: AVM's own device tree tags every one of the four
+		# LAN nodes with avm,macname = "maca". They are ports of
+		# one switch bridged together here, so sharing one address
+		# across them is also what the hardware looks like.
+		#
+		# Per-device, because board.json's "network_device" table is
+		# netifd's own default-MAC source: config_get_default_macaddr()
+		# consults it for every device it brings up, configured in
+		# /etc/config/network or not, and preinit reads it as well.
+		# It is a *default*, though, and defaults stop at the bridge:
+		# bridge_reset_primary() takes the bridge address from its
+		# first member's original one unless that member carries an
+		# explicitly configured macaddr. So these four calls dress the
+		# ports and failsafe, not br-lan.
+		#
+		ucidef_set_network_device_mac lan1 "$maca"
+		ucidef_set_network_device_mac lan2 "$maca"
+		ucidef_set_network_device_mac lan3 "$maca"
+		ucidef_set_network_device_mac lan4 "$maca"
+
+		# ...and per-interface, which is what carries the address into
+		# the /etc/config/network that config_generate() writes: it
+		# stamps an explicit macaddr on the device section of every
+		# port of the bridge it builds for the interface. That is the
+		# configured member address bridge_reset_primary() looks for,
+		# so br-lan adopts maca as well, whichever port comes up first.
+		#
+		ucidef_set_interface_macaddr "lan" "$maca"
+
+		ucidef_set_label_macaddr "$maca"
+		;;
+	esac
+
+	#
+	# WiFi. The country is not cosmetic here: wifi-scripts' mac80211.uc
+	# reads wlan.defaults.country and, when it is empty, nulls the
+	# defaults block for every band except 2g — which comes out as
+	# disabled='1' on the resulting 5 GHz wifi-iface. So leaving this out
+	# brings the 5 GHz radio up and then switches it off. DE matches
+	# where these boxes were sold.
+	#
+	ucidef_set_country "DE"
+
+	#
+	# Naming the two radios by device path pins which one is wl0 and
+	# which is wl1 rather than leaving it to PCI probe order: mac80211.sh
+	# renames each phy to the board.json key whose path it matches. The
+	# order of these two calls is what assigns the index, so 5 GHz first.
+	#
+	# The paths are the sysfs device paths with the leading "platform/"
+	# stripped, which is the shape wifi-detect.uc's phy_path() produces
+	# for PCI-attached phys (note ucidef_set_network_device_path keeps
+	# that prefix — only the wlan one drops it). The domain numbers are
+	# not probe-order artefacts: xrx500.dtsi pins them with
+	# linux,pci-domain, 0 for the root complex at 0x18900000 and 1 for the
+	# one at 0x18400000. The 01:00.0 follows from each bridge having a
+	# single root port at 00:00.0.
+	#
+	# A path that matches no live phy is harmless — wifi-detect.uc leaves
+	# the entry without .info, mac80211.uc skips it, and the phy picks up
+	# an auto-generated entry as it would have anyway.
+	#
+	ucidef_add_wlan 18900000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0
+	ucidef_add_wlan 18400000.pcie/pci0001:00/0001:00:00.0/0001:01:00.0
+	;;
+avm,fritz7580|avm,fritz7590)
+	#
+	# Unlike the 7560, these boards have a dedicated WAN jack, so they
+	# can declare a real lan/wan split rather than shipping every socket
+	# as LAN and asking the user to nominate an uplink at runtime. Both
+	# wire it the same way, which is why one arm serves them: it is the
+	# GRX550 die's fifth port, and everything below follows from that
+	# rather than from either chassis.
+	#
+	# The names are DSA port labels out of the device tree, so they are
+	# the same five names on both boards and on every boot.
+	#
+	# The LAN four are chassis order left to right, because the dtsi
+	# already undoes the board's reversed wiring: front-panel LAN-N goes
+	# to GPHY-(6-N) on the LAN macro's port (6-N) — LAN1 to phy@5, LAN4
+	# to phy@2 — and each port node carries the label of the socket it
+	# actually reaches.
+	#
+	# wan is the WAN jack, and it is a port of the second switch macro
+	# rather than the first. That macro is a switch tree of its own with
+	# its own conduit, and wan is the only port whose PHY answers on its
+	# management bus.
+	#
+	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"
+
+	#
+	# MAC addresses, read out of the AVM TFFS partition through
+	# fritz_tffs_mac() — see its comment, and the 7560 arm for the
+	# label-lookup rationale.
+	#
+	# These boards need two keys rather than one. AVM tags all four LAN
+	# nodes avm,macname = "maca" and the WAN node avm,macname = "macdsl",
+	# so the WAN port carries an address of its own. The distance between
+	# the two keys is a per-unit fact and not a rule to derive one from
+	# the other, which is why both are read out of TFFS. Giving the WAN
+	# port its own address is not cosmetic either: it is the address the
+	# ISP has seen from that unit.
+	#
+	tffsdev=$(find_mtd_chardev "nand-tffs")
+	maca=$(fritz_tffs_mac "$tffsdev" maca)
+	macdsl=$(fritz_tffs_mac "$tffsdev" macdsl)
+
+	# Each key is validated on its own, so a unit missing one of them
+	# still gets the other rather than falling back to random addresses
+	# on both.
+	case "$maca" in
+	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+		ucidef_set_network_device_mac lan1 "$maca"
+		ucidef_set_network_device_mac lan2 "$maca"
+		ucidef_set_network_device_mac lan3 "$maca"
+		ucidef_set_network_device_mac lan4 "$maca"
+		ucidef_set_interface_macaddr "lan" "$maca"
+		ucidef_set_label_macaddr "$maca"
+		;;
+	esac
+
+	case "$macdsl" in
+	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+		ucidef_set_network_device_mac wan "$macdsl"
+		ucidef_set_interface_macaddr "wan" "$macdsl"
+		;;
+	esac
+
+	#
+	# Same reasoning as the 7560: an empty country nulls the defaults
+	# block for every band above 2.4 GHz, which brings the 5 GHz radio up
+	# and then disables it.
+	#
+	ucidef_set_country "DE"
+
+	#
+	# Both radios are QCA9984 on both boards, so unlike the 7560 — where
+	# the two parts are different silicon — the order of these calls is
+	# the only thing deciding which band gets which index. Domain 0
+	# first, which keeps wl0 the 5 GHz radio across all three devices.
+	# Which blob belongs to which domain is settled in 11-ath10k-caldata.
+	#
+	# Which band sits on which root complex is a board fact rather than a
+	# family convention. AVM's own device tree settles it for both boards:
+	# the 5 GHz part sits on the root complex at 0x18900000 and the
+	# 2.4 GHz one at 0x18400000, which xrx500.dtsi pins to domains 0 and
+	# 1, so both boards want these two lines in the order they already
+	# stand in.
+	#
+	# Paths as on the 7560: the sysfs device path with the leading
+	# "platform/" stripped, and domain numbers that come from
+	# linux,pci-domain in xrx500.dtsi rather than from probe order.
+	#
+	ucidef_add_wlan 18900000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0
+	ucidef_add_wlan 18400000.pcie/pci0001:00/0001:00:00.0/0001:01:00.0
+	;;
+esac
+
+board_config_flush
+
+exit 0

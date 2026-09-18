@@ -1,0 +1,116 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Per-unit WiFi MAC addresses for the AVM FRITZ!Box 7580.
+#
+# Only this board needs it. The 7560 and the 7590 keep their calibration
+# blobs in the urlader, and those blobs already carry the right address at
+# offset 6 — which is why ../firmware/11-ath10k-caldata patches neither of
+# them. The 7580 has no blob at all (see that file for the search that
+# established it), so both of its QCA9984s calibrate from on-chip OTP and take
+# their address from OTP as well. What OTP holds there is not this unit's
+# address but Qualcomm's reference-design test pattern, identical on every
+# 7580 ever built: 12:34:56:78:90:12 on the 5 GHz radio and 00:03:7f:12:34:56
+# — the plain QCA OUI with a counting-pattern tail — on the 2.4 GHz one.
+# Two 7580s in the same room therefore come up with the same BSSIDs, on both
+# bands, and mesh or WDS between them cannot work at all.
+#
+# The unit's real addresses are in TFFS under the names "macwlan" (5 GHz) and
+# "macwlan2" (2.4 GHz). They are read by name, never by arithmetic on another
+# key: the distance between the Ethernet and WiFi addresses is a per-unit fact
+# on these boxes, not a rule, so macaddr_add() on maca would be a guess that
+# happens to work on the units it was tried on.
+#
+# Why a hotplug script and not the device tree: ath10k does not consult the
+# PCI device node for a mac-address property, and there is no board.d route
+# for a phy address either — board.json's wlan entries carry paths and bands,
+# not addresses. Writing wiphy->perm_addr through sysfs is the in-tree
+# mechanism for exactly this case (apm821xx, ipq806x, mpc85xx and econet all
+# do it), enabled by the mac80211 package's
+# patches/subsys/120-cfg80211_allow_perm_addr_change.patch. It is enough on
+# its own here: ath10k never fills in wiphy->addresses, so perm_addr is the
+# single source every later address is derived from — the netdev mac80211
+# creates for each vif, and the per-interface addresses wifi-scripts generates
+# from the phy's "macaddress" file.
+#
+# The 05 in the file name is load-bearing. hotplug-call iterates over
+# /etc/hotplug.d/ieee80211/* in ls order, i.e. bytewise, and the write has to
+# land before wifi-scripts' 10-wifi-detect runs "wifi config" and derives the
+# vif addresses from what the phy reports. Any prefix below 10 does; 05 is the
+# number ipq40xx already uses for its pre-detect hook. Note that a "-" sorts
+# before a "_", so a future 05-something would still run first — nothing here
+# depends on that, but a reader renaming this file should know.
+
+[ "$ACTION" = "add" ] || exit 0
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+. /lib/functions/fritz.sh
+
+case "$(board_name)" in
+avm,fritz7580)
+	#
+	# Which radio this is, keyed on the PCI endpoint rather than on
+	# PHYNBR. The two QCA9984s sit behind two independent PCIe root
+	# complexes, so the phy numbering is ath10k probe order between them
+	# and nothing pins it; the bus address is a board fact. DEVPATH for a
+	# phy is the wiphy device below its parent, so the endpoint is the
+	# component just above the "ieee80211" directory:
+	#
+	#   /devices/platform/18900000.pcie/pci0000:00/0000:00:00.0/0000:01:00.0/ieee80211/phy0
+	#                                                           ^^^^^^^^^^^^
+	#
+	# Domain 0 is the root complex at 0x18900000 and domain 1 the one at
+	# 0x18400000, pinned by linux,pci-domain in xrx500.dtsi rather than
+	# discovered — the same fact the ucidef_add_wlan lines in
+	# ../../board.d/02_network and the firmware names in
+	# ../firmware/11-ath10k-caldata are built on. Which band sits on
+	# which is the board's own answer, read back off this hardware: the
+	# radio at 0000:01:00.0 loads with bmi_id 0:3 and the one at
+	# 0001:01:00.0 with 0:4, and OTP board id 3 is the 5 GHz part, 4 the
+	# 2.4 GHz one.
+	#
+	pcidev="${DEVPATH%/ieee80211/*}"
+	pcidev="${pcidev##*/}"
+
+	case "$pcidev" in
+	0000:01:00.0)
+		tffskey="macwlan"
+		;;
+	0001:01:00.0)
+		tffskey="macwlan2"
+		;;
+	*)
+		# Not one of the two radios this board has. Nothing to say
+		# about it, and guessing a key from the phy index would be
+		# how the wrong address gets written.
+		exit 0
+		;;
+	esac
+
+	#
+	# Same reader and same partition lookup as the Ethernet addresses in
+	# ../../board.d/02_network: by label, because mtd numbering shifts
+	# with the partition table and the label does not. The invocation
+	# details live with fritz_tffs_mac() in /lib/functions/fritz.sh.
+	#
+	tffsdev=$(find_mtd_chardev "nand-tffs")
+	mac=$(fritz_tffs_mac "$tffsdev" "$tffskey")
+
+	#
+	# And the same validation: anything that is not MAC-shaped — an empty
+	# string from a missing key, an error message, a partition that could
+	# not be found — writes nothing at all and leaves the radio on its OTP
+	# address. That degrades silently to today's behaviour, which is
+	# duplicate-but-working BSSIDs; writing a guessed or half-read address
+	# instead would be a radio that does not come up. The kernel would
+	# reject a malformed write anyway (mac_pton in the sysfs store), but
+	# the point is not to attempt it.
+	#
+	case "$mac" in
+	[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F])
+		echo "$mac" > /sys${DEVPATH}/macaddress
+		;;
+	esac
+	;;
+esac

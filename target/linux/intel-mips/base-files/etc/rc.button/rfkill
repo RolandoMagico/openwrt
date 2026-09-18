@@ -1,0 +1,59 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# intel-mips/xrx500 override of the stock /etc/rc.button/rfkill.
+#
+# The FRITZ!Box 7560 has exactly two front-panel buttons, DECT and
+# WLAN/WPS, and no reset button at all. Without a reset path the only
+# way out of a bad configuration would be an EVA TFTP recovery with the
+# case open, so the WLAN button doubles as one: hold it for five
+# seconds or more and releasing it triggers a factory reset, exactly as
+# the stock /etc/rc.button/reset long-press branch does. A short press
+# keeps the stock rfkill behaviour (toggle all wifi-devices).
+#
+# Everything below the factory-reset branch is verbatim stock rfkill.
+
+[ "${ACTION}" = "released" -o -n "${TYPE}" ] || exit 0
+
+. /lib/functions.sh
+
+# Long press: factory reset. Mirrors package/base-files/files/etc/
+# rc.button/reset — only fires with a writable overlay, prints to the
+# console (the serial console is the only feedback channel during
+# early boot) and backgrounds the reset so the hotplug handler can
+# return.
+if [ "${ACTION}" = "released" -a -z "${TYPE}" ] && [ "${SEEN:-0}" -ge 5 ]; then
+	OVERLAY="$( grep ' /overlay ' /proc/mounts )"
+	if [ -n "$OVERLAY" ]; then
+		echo "FACTORY RESET" > /dev/console
+		factoryreset -y && reboot &
+		return 0
+	fi
+fi
+
+rfkill_state=0
+
+wifi_rfkill_set() {
+	uci set wireless.$1.disabled=$rfkill_state
+}
+
+wifi_rfkill_check() {
+	local disabled
+	config_get disabled $1 disabled
+	[ "$disabled" = "1" ] || rfkill_state=1
+}
+
+config_load wireless
+case "${TYPE}" in
+"switch")
+	[ "${ACTION}" = "released" ] && rfkill_state=1
+	;;
+*)
+	config_foreach wifi_rfkill_check wifi-device
+	;;
+esac
+config_foreach wifi_rfkill_set wifi-device
+uci commit wireless
+wifi up
+
+return 0

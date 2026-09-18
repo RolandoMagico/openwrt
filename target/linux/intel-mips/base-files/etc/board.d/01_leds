@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# LED-detection hook for intel-mips.
+#
+# The four status LEDs need nothing here: the generic diag.sh resolves
+# boot/running/failsafe/upgrade from the led-boot/led-running/
+# led-failsafe/led-upgrade aliases in each board's DT and writes to
+# /sys/class/leds by name. Only LEDs that need a uci-level trigger belong
+# in this file.
+#
+# The wifi LED is the one alias diag.sh does not resolve, which is easy to
+# get wrong: it reads those four names and no more, so a led-wifi alias
+# does nothing whatsoever until a board.d file hands it to
+# ucidef_set_led_wlan. The call below is that handover. It sits outside
+# the case, the shape the lantiq target uses, because the alias means the
+# same thing wherever it appears: a board opts in by declaring it in its
+# DT rather than by being named here.
+
+. /lib/functions.sh
+. /lib/functions/leds.sh
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+#
+# The name is read back out of the DT instead of being written out again
+# here. Both ends compose it from the same properties -- the kernel at
+# registration, get_dt_led from /proc/device-tree -- and a mismatch
+# between them is silent, because led_set_attr only writes when the sysfs
+# file already exists. Deriving it from the alias removes the chance of
+# the two drifting apart, and it spans both spellings this target
+# contains without having to know which board uses which: the 7560
+# names its LEDs with a legacy label, the 7580 and 7590 with colour
+# and function.
+#
+# A board with no led-wifi alias yields an empty string, hence the guard.
+# Without it ucidef_set_led_wlan would write a board.json entry keyed on
+# nothing.
+#
+# phy0tpt is the throughput trigger of whichever radio registered first,
+# not of a nominated band: mac80211 builds the trigger name from
+# wiphy_name() at the point the driver creates it, so the index is kernel
+# probe order and owes nothing to the ucidef_add_wlan order in 02_network.
+# On all three boards that first radio is the 5 GHz one -- on the 7580
+# and 7590 because both parts are ath10k and PCI domain 0 enumerates
+# ahead of domain 1, on the 7560 because the QCA9882's ath10k_pci
+# probes well before the AR93xx's ath9k, which comes up as phy1. One lamp
+# cannot follow two radios in any case, and taking the first one leaves
+# it working on whichever radio survives if the other fails to register.
+#
+# Worth knowing before copying this to another target: ath10k only has a
+# tpt trigger because OpenWrt adds one, in
+# 930-ath10k_add_tpt_led_trigger.patch, under CPTCFG_MAC80211_LEDS --
+# which the mac80211 package turns on whenever CONFIG_LEDS_TRIGGERS is
+# set. Mainline ath10k registers no mac80211 LED trigger at all, and
+# writing a name that no trigger answers to fails quietly.
+#
+led_wifi="$(get_dt_led wifi)"
+[ -n "$led_wifi" ] && ucidef_set_led_wlan "wifi" "wifi" "$led_wifi" "phy0tpt"
+
+case "$(board_name)" in
+avm,fritz7560)
+	#
+	# The "Fon" LED follows the wan interface. The panel has no
+	# Internet LED to use for this — AVM's uplink was DSL and its state
+	# shares the Power LED — and Fon is the one front-panel lamp this
+	# port has no use of its own for, since no telephony support is
+	# planned. The 7560 has no WAN jack either, so the shipped
+	# default declares all four front-panel sockets as LAN and no wan
+	# interface exists out of the box; the mapping is therefore inert
+	# until one LAN port is nominated as WAN at runtime, at which point
+	# the LED starts working with no image change. That is intended.
+	#
+	ucidef_set_led_netdev "wan" "WAN" "green:fon" "wan"
+	;;
+avm,fritz7580)
+	#
+	# This board is the one of the three with a lamp that already means
+	# what the trigger says, so it does not borrow Fon the way the other
+	# two do: AVM's device tree gives SSO pin 6 the name "internet", and
+	# an Internet lamp following the wan interface is the mapping the
+	# silkscreen already promises. Fon is left alone here as a result.
+	#
+	# Unlike the 7560 and like the 7590, this board has a real WAN
+	# jack behind the fifth GSWIP port, so 02_network declares a wan
+	# interface out of the box and the lamp is live from first boot
+	# rather than waiting for a LAN port to be nominated at runtime.
+	#
+	# The name is coupled to the DTS: it is composed from the LED node's
+	# colour and function, so this string has to track
+	# seale_avm_fritz7580.dts's SSO pin-6 child. A mismatch is silent —
+	# board.json gets an entry keyed on a LED that does not exist and
+	# nothing ever writes to it.
+	#
+	# The lamp pin 6 drives is named from AVM's own 4.9 board file, which
+	# calls it "internet"; the panel of a 7580 carries such a lamp. The
+	# DTS follows that file and so does this line. Were a name ever to
+	# turn out wrong, the fix is a rename here and in the DTS.
+	#
+	ucidef_set_led_netdev "wan" "WAN" "green:internet" "wan"
+	;;
+avm,fritz7590)
+	#
+	# The wifi lamp is handled above and needs nothing special here even
+	# though it hangs off the SSO controller rather than off a GPIO: a
+	# populated /sys/class/leds/<name>/ is the whole contract, and
+	# leds-lgm-sso registers the same class devices gpio-leds would.
+	#
+	# Fon follows the wan interface, the trigger the 7560 takes above --
+	# and here there is a real WAN jack behind it rather than a LAN port
+	# nominated at runtime, so it works out of the box. Fon is the lamp
+	# this port has no use of its own for, telephony being unsupported on
+	# both boards.
+	#
+	# Which silkscreened lamp this actually is has not been confirmed
+	# against the panel; if it turns out wrong, the fix is a rename here
+	# and in the DTS and nothing more.
+	#
+	ucidef_set_led_netdev "wan" "WAN" "green:fon" "wan"
+	;;
+esac
+
+board_config_flush
+
+exit 0

@@ -1,0 +1,96 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Per-unit ath9k EEPROM for the AVM FRITZ!Box 7560.
+#
+# The 2.4 GHz radio is an AR93xx-family 3x3 part that reports the blank
+# PCI ID 168c:abcd, behind the PCIe root complex at 0x18400000, which
+# xrx500.dtsi pins to PCI domain 1 — hence 0001:01:00.0. The property is
+# on that file's pcie nodes and not in any seale_avm_* file, which this
+# comment used to claim.
+#
+# It binds to ath9k directly. kmod-owl-loader is NOT involved and must
+# not be added: its PCI table covers 168c:ff1c/168c:ff1d only and will
+# never match 0xabcd. What matches is ath9k itself, through OpenWrt's
+# backports patch package/kernel/mac80211/patches/ath9k/513-ath9k_add_pci_ids.patch,
+# and the EEPROM then arrives over ath9k's own DT qca,no-eeprom path.
+#
+# The record is AVM prom_config type 8, AVM_PROM_WLAN2_ZIP — "the second
+# radio's calibration", which on this board is an ath9k EEPROM and not an
+# ath10k blob. See 11-ath10k-caldata's header for the format and for what
+# this project used to miscall "bb8".
+
+[ -e /lib/firmware/$FIRMWARE ] && exit 0
+
+. /lib/functions/caldata.sh
+
+case "$FIRMWARE" in
+"ath9k-eeprom-pci-0001:01:00.0.bin")
+	board=$(board_name)
+
+	case "$board" in
+	avm,fritz7560)
+		#
+		# -t 8 scans for the record rather than seeking to it, for the
+		# reason spelled out in the type 7 arm next door: the offsets
+		# are per-unit and a hardcoded list is a bet. The
+		# three mirrors of the urlader need no arms of their own — a
+		# copy that does not inflate is simply skipped.
+		#
+		# No -c. That flag verifies the 16-bit ones-complement checksum
+		# AVM's ath10k blobs carry at offset 2, and this record has no
+		# such field: it is a struct ar9300_eeprom behind an
+		# AR5416_EEPROM_MAGIC, so -c would reject it. What discriminates
+		# here is the record being a complete zlib stream of exactly the
+		# length its header declares.
+		#
+		# -r, -i 4 and -l 1088 are all load-bearing:
+		#
+		# -r because AVM writes this record backwards. The entry
+		# inflates to 4097 bytes whose forward view starts with
+		# padding (ff 5a a5 ff ...) and whose payload runs downward
+		# from the end; reversing puts it the right way round.
+		#
+		# -i 4 drops the AR9300 compression header that then sits at
+		# the front. Unpacked (ar9300_comp_hdr_unpack) it reads
+		# code=0 (_CompressNone), length=1088 — consistent, but
+		# unusable: ar9003_eeprom.c:3352 discards any block with
+		# length >= 1024 on a non-AR9485 part, so the compressed-block
+		# path can never consume this record. That is precisely why
+		# the DT sets qca,no-eeprom.
+		#
+		# -l 1088 because qca,no-eeprom clears AH_USE_EEPROM, so
+		# ar9300_eeprom_restore_internal() takes the
+		# ath9k_hw_use_flash() fast path: it copies
+		# sizeof(struct ar9300_eeprom) == 1088 bytes straight into the
+		# struct and returns as soon as baseEepHeader.txrxMask is
+		# neither 0x00 nor 0xff. On this board that byte is 0x77
+		# (3x3), so it returns immediately and nothing else is parsed.
+		# The blob checks out as a textbook struct ar9300_eeprom:
+		# eepromVersion 2, templateVersion 5, custData "AVM7560_CAL2_V1".
+		#
+		# On total failure the output file must not survive, for the
+		# reason 11-ath10k-caldata records: fritz_cal_extract creates it
+		# before searching, and a leftover 0-byte file answers every
+		# later boot's firmware request, so extraction is never retried.
+		#
+		urlader=$(find_mtd_chardev "urlader")
+		/usr/bin/fritz_cal_extract -t 8 -r -i 4 -l 1088 -o /lib/firmware/$FIRMWARE "$urlader" || \
+		{ rm -f /lib/firmware/$FIRMWARE; caldata_die "failed to extract ath9k EEPROM from $urlader"; }
+
+		#
+		# No ath9k_patch_mac here, deliberately. struct
+		# ar9300_eeprom.macAddr already holds this radio's own
+		# address — the TFFS "macwlan2" value, one higher than the
+		# 5 GHz radio's "macwlan" — so there is nothing to correct and
+		# patching would only rewrite the checksum over bytes that are
+		# already right. The lantiq/xrx200 AVM scripts skip it for the
+		# same reason.
+		#
+		;;
+	*)
+		caldata_die "board $board is not supported yet"
+		;;
+	esac
+	;;
+esac
