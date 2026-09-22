@@ -56,7 +56,14 @@ dl_pack/unknown=$(error ERROR: Unknown pack format for file $(1))
 define dl_pack
 	$(if $(dl_pack/$(call ext,$(1))),$(dl_pack/$(call ext,$(1))),$(dl_pack/unknown))
 endef
+# The packed permission bits must not depend on the invoking umask, nor on
+# whether the download runs as root.  Normalise the checkout to 0644 for
+# regular files and 0755 for directories and executables before packing.
+# Symbolic links are left alone, both because chmod skips them during
+# recursive traversals and because their mode does not vary in the first
+# place.
 define dl_tar_pack
+	chmod -R a=rX,u+w $(2) && \
 	$(TAR) --numeric-owner --owner=0 --group=0 --mode=a-s --sort=name \
 		$$$${TAR_TIMESTAMP:+--mtime="$$$$TAR_TIMESTAMP"} -c $(2) | $(call dl_pack,$(1))
 endef
