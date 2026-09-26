@@ -1,0 +1,67 @@
+From: Grische <opensource@grische.xyz>
+Date: Fri, 25 Sep 2026 20:21:10 +0200
+Subject: wifi: ath10k: store the HTT tx queue state map as little endian
+
+The host exposes its queue state to the firmware through struct
+htt_q_state, a buffer the firmware fetches by DMA in push-pull mode.
+Every field in it is either a byte or __le32, except the per TID peer
+bitmap, which is a native u32 updated with plain bit operations. On a
+big-endian host the firmware therefore sees each map word byte-swapped
+and looks up the wrong peers when it decides which host queues to fetch.
+
+Within each 32-bit word host peer n lands on firmware bit
+(3 - n % 32 / 8) * 8 + n % 8, so peers 0-7 swap with 24-31 and 8-15
+with 16-23. Once the firmware switches a radio to push-pull, a station
+is only fetched while its swap partner has frames queued. On a QCA9984
+in a big-endian MIPS router this stalled unicast to most clients and
+mesh peers on the affected radio, while broadcast and multicast kept
+working through the vdev peers. Clients still associated and got a DHCP
+lease, but reached nothing.
+
+Declare the map as __le32 and convert the bit with cpu_to_le32() before
+setting or clearing it.
+
+Tested-on: QCA9984 hw1.0 PCI 10.4-3.9.0.2-00157
+
+Fixes: c1a43d9720d8 ("ath10k: implement updating shared htt txq state")
+Assisted-by: LLM sparse
+Signed-off-by: Grische <opensource@grische.xyz>
+---
+ drivers/net/wireless/ath/ath10k/htt.h    | 5 +++--
+ drivers/net/wireless/ath/ath10k/htt_tx.c | 4 ++--
+ 2 files changed, 5 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath10k/htt.h
++++ b/drivers/net/wireless/ath/ath10k/htt.h
+@@ -1540,7 +1540,8 @@ struct htt_frag_desc_bank_cfg64 {
+  *	HTT_Q_DEPTH_TYPE_MSDUS the number of packets is scaled by 2 **
+  *	record_multiplier (see htt_q_state_conf).
+  * @map: Used by firmware to quickly check which host queues are not empty. It
+- *	is a bitmap simply saying.
++ *	is a bitmap simply saying. The firmware reads each word as little
++ *	endian, so peer n is bit n % 32 of word n / 32 in that byte order.
+  * @seq: Used by firmware to quickly check if the host queues were updated
+  *	since it last checked.
+  *
+@@ -1548,7 +1549,7 @@ struct htt_frag_desc_bank_cfg64 {
+  */
+ struct htt_q_state {
+ 	u8 count[HTT_TX_Q_STATE_NUM_TIDS][HTT_TX_Q_STATE_NUM_PEERS];
+-	u32 map[HTT_TX_Q_STATE_NUM_TIDS][(HTT_TX_Q_STATE_NUM_PEERS + 31) / 32];
++	__le32 map[HTT_TX_Q_STATE_NUM_TIDS][(HTT_TX_Q_STATE_NUM_PEERS + 31) / 32];
+ 	__le32 seq;
+ } __packed;
+ 
+--- a/drivers/net/wireless/ath/ath10k/htt_tx.c
++++ b/drivers/net/wireless/ath/ath10k/htt_tx.c
+@@ -79,8 +79,8 @@ static void __ath10k_htt_tx_txq_recalc(s
+ 	}
+ 
+ 	ar->htt.tx_q_state.vaddr->count[tid][peer_id] = count;
+-	ar->htt.tx_q_state.vaddr->map[tid][idx] &= ~bit;
+-	ar->htt.tx_q_state.vaddr->map[tid][idx] |= count ? bit : 0;
++	ar->htt.tx_q_state.vaddr->map[tid][idx] &= ~cpu_to_le32(bit);
++	ar->htt.tx_q_state.vaddr->map[tid][idx] |= count ? cpu_to_le32(bit) : 0;
+ 
+ 	ath10k_dbg(ar, ATH10K_DBG_HTT, "htt tx txq state update peer_id %u tid %u count %u\n",
+ 		   peer_id, tid, count);
